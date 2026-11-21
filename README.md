@@ -1,0 +1,64 @@
+# Inkling 2 Mini on Strix Halo with GUFO
+
+Work in progress: a [GUFO](https://github.com/gufo-org/gufo) extension (`gufo-extension`) that runs
+Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on AMD
+Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`, 128 GB unified memory) at native weight
+precision.
+
+**Status: no GUFO runner exists yet.** What exists today is the baseline, the tooling and the plan.
+
+## Goal
+
+- Run Inkling 2 Mini inside GUFO, so it gets GUFO's serving, scheduling and prompt caching.
+- Keep the weights at the precision they were released in: the routed experts stay NVFP4, everything
+  else stays BF16. No requantization.
+- Match the reference implementation (llama.cpp) on output before making any speed claim.
+
+## Why this needs an extension
+
+Inkling 2 Mini is a looped mixture-of-experts transformer (GGUF architecture `inkling2_loop`):
+24 layers, with layers 6-17 run three times per token, so each token makes 48 layer visits. GUFO has
+no provider for that architecture. A GUFO extension owns loading, tokenization, chat template and
+all GPU execution for its model, so this is a new runner, not a configuration change.
+
+## Baseline (llama.cpp on the same machine)
+
+Measured 2026-11-20/21 with `llama-bench`, all layers on the GPU, no speculative drafter.
+Details and caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| Weights | Backend | Prompt 512 (t/s) | Prompt 4096 (t/s) | Generation (t/s) |
+|---|---|---:|---:|---:|
+| Native precision (NVFP4 experts + BF16), 21.3 GiB | HIP / ROCm 10.1 | 520 | 346 | 19.5 |
+| Native precision (NVFP4 experts + BF16), 21.3 GiB | Vulkan / RADV | 344 | 296 | 15.3 |
+| UD-Q4_K_XL, 16.4 GiB | HIP / ROCm 10.1 | 509 | 343 | 24.3 |
+| UD-Q4_K_XL, 16.4 GiB | Vulkan / RADV | 421 | 351 | 21.7 |
+
+These numbers are the floor the extension has to beat, not a prediction of GUFO performance.
+
+## Milestones
+
+- [x] Baseline: llama.cpp Vulkan and HIP builds and benchmarks on the target machine
+- [x] Native-precision GGUF identified (mainline `inkling2_loop` layout, NVFP4 experts kept as-is)
+- [x] Extension build loop proven: `gufo extension install <dir>` builds and loads a module in seconds
+- [ ] M1: probe and loader — accept only Inkling 2 Mini `inkling2_loop` files, map all tensors
+- [ ] M2: tokenizer and chat template, checked against the reference
+- [ ] M3: single-token forward pass on HIP, logits compared with llama.cpp on the same file
+- [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
+- [ ] M5: continuation cache, so conversations resume without reprocessing
+- [ ] M6: kernel work on the hot path, each change checked against M3's logit comparison
+- [ ] Later: vision (mmproj), DSpark speculative decoding, tool calls, multi-session serving
+
+## Repository layout
+
+- `docs/` — benchmarks and notes
+- `scripts/` — reproducible builds of the llama.cpp baselines and the benchmark run
+- `extension/` — the GUFO extension (not started)
+
+## Related work
+
+- [hrisheekeshr/inkling2-mini-gufo-extension](https://github.com/hrisheekeshr/inkling2-mini-gufo-extension)
+  — a community scaffold and design doc for the same model, targeting requantized GGUFs
+  ([gufo-org/gufo#1306](https://github.com/gufo-org/gufo/issues/1306)). This project differs in
+  keeping the native NVFP4 experts.
+- llama.cpp support: [ggml-org/llama.cpp#32694](https://github.com/ggml-org/llama.cpp/pull/32694)
+  plus the loop fix [#32704](https://github.com/ggml-org/llama.cpp/pull/32704).
