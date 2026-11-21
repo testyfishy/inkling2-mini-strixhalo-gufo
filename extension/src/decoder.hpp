@@ -83,6 +83,41 @@ public:
 
   void FakeContext(std::uint32_t session, std::uint32_t position);
 
+  /// Where a session's state lives on the device, for a cache that copies it
+  /// piece by piece (the continuation cache of `gufo serve`).
+  struct StateLayout {
+    std::uint32_t visits{0};
+    std::vector<bool> ring;  // per visit: a sliding-window visit
+    std::uint32_t heads{0};  // key/value heads
+    /// The convolution histories of all visits, one block per session.
+    std::size_t history_bytes{0};
+    /// The keys, and equally the values, of one sliding-window visit: a ring
+    /// that is copied whole.
+    std::size_t ring_bytes{0};
+    /// A full-attention visit, per head: keys are one row per position,
+    /// values one block per 1,024 positions.
+    std::uint32_t full_capacity{0};  // positions
+    std::size_t key_row_bytes{0};
+    std::size_t value_chunk_bytes{0};
+  };
+  [[nodiscard]] StateLayout Layout() const;
+  [[nodiscard]] void* History(std::uint32_t session) const;
+  /// A sliding-window visit's key ring or value ring.
+  [[nodiscard]] void* Ring(std::uint32_t session, std::uint32_t visit,
+                           bool values) const;
+  /// A full-attention visit's keys (first row) or values (first block) of one
+  /// head.
+  [[nodiscard]] void* Full(std::uint32_t session, std::uint32_t visit,
+                           std::uint32_t head, bool values) const;
+  /// Declares that the session's state now is that of `position` tokens: the
+  /// caller has put every piece in place.
+  void SetPosition(std::uint32_t session, std::uint32_t position);
+  /// Waits until the device has finished everything submitted so far.
+  void Synchronize();
+  [[nodiscard]] std::uint32_t context() const;
+  [[nodiscard]] std::uint32_t max_batch() const;
+  [[nodiscard]] std::uint32_t sessions() const;
+
   /// Raw logits (before the soft cap) of run `i` of the last step, one per
   /// vocabulary entry.
   [[nodiscard]] const float* logits(std::size_t i) const;

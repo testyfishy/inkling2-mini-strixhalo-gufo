@@ -25,6 +25,7 @@
 #include "gpu.hpp"
 #include "model.hpp"
 #include "reference.hpp"
+#include "serve.hpp"
 #include "tokenizer.hpp"
 
 namespace {
@@ -1003,6 +1004,15 @@ int Prompt(const gufo::ext::TextPromptOptions&,
   return ReportOnly(reader);
 }
 
+bool DevelopmentMode() {
+  for (const char* name :
+       {"INKLING2_REF_TOKENS", "INKLING2_KLD", "INKLING2_TOKENIZE",
+        "INKLING2_CHAT", "INKLING2_REPORT"})
+    if (std::getenv(name))
+      return true;
+  return false;
+}
+
 }  // namespace
 
 void inkling2_native_provider_register(gufo::ext::Registry& registry) {
@@ -1012,10 +1022,13 @@ void inkling2_native_provider_register(gufo::ext::Registry& registry) {
       .id = "inkling2-mini-native",
       .probe = nullptr,
       .probe_gguf = &inkling2::Probe,
-      .create = nullptr,
+      .create = &inkling2::CreateTextRunner,
       .bench_driver = nullptr,
-      .prompt_driver = &Prompt,
+      // The development modes (INKLING2_* settings) keep their own driver;
+      // without one, `gufo prompt` runs through the runner like `gufo serve`.
+      .prompt_driver = DevelopmentMode() ? &Prompt : nullptr,
       .chat_driver = nullptr,
+      .sampling_defaults = &inkling2::SamplingDefaults,
       // The NVFP4 expert tensors are a storage type GUFO's core reader does
       // not size; this provider reads them from their reserved bytes.
       .accepts_unsized_tensors = true,

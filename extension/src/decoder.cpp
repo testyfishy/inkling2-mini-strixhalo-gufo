@@ -1778,6 +1778,73 @@ void GpuEngine::Restore(std::uint32_t session,
   impl_->Restore(session, saved.data(), saved.size());
 }
 
+GpuEngine::StateLayout GpuEngine::Layout() const {
+  const Impl& impl = *impl_;
+  StateLayout layout;
+  layout.visits = impl.c.visits();
+  layout.heads = kNKV;
+  layout.history_bytes = Impl::kHistFloats * impl.c.visits() * 4;
+  layout.key_row_bytes = std::size_t(gpu::kHD) * 2;
+  layout.value_chunk_bytes = std::size_t(gpu::kHD) * 1024 * 2;
+  const Impl::Session& session = impl.sessions.at(0);
+  for (std::uint32_t s = 0; s < impl.c.visits(); ++s) {
+    const bool ring = impl.c.is_swa[impl.Physical(s)];
+    layout.ring.push_back(ring);
+    if (ring)
+      layout.ring_bytes = std::size_t(session.slots[s].cap) * kHK * 2;
+    else
+      layout.full_capacity = static_cast<std::uint32_t>(session.slots[s].cap);
+  }
+  return layout;
+}
+
+void* GpuEngine::History(std::uint32_t session) const {
+  return impl_->sessions.at(session).hist;
+}
+
+void* GpuEngine::Ring(std::uint32_t session, std::uint32_t visit,
+                      bool values) const {
+  const auto& slot = impl_->sessions.at(session).slots.at(visit);
+  return values ? slot.vh : slot.kh;
+}
+
+void* GpuEngine::Full(std::uint32_t session, std::uint32_t visit,
+                      std::uint32_t head, bool values) const {
+  const auto& slot = impl_->sessions.at(session).slots.at(visit);
+  // Keys: [head][position][dim]. Values: [head][block][dim][position in block].
+  return values ? static_cast<void*>(slot.vh + std::size_t(head) * slot.cap *
+                                                   gpu::kHD)
+                : static_cast<void*>(slot.kh + std::size_t(head) * slot.cap *
+                                                   gpu::kHD);
+}
+
+void GpuEngine::SetPosition(std::uint32_t session, std::uint32_t position) {
+  if (impl_->keep_f32)
+    throw std::runtime_error(
+        "inkling2 gpu: state cannot be put in place with the F32 cache kept");
+  auto& state = impl_->sessions.at(session);
+  if (position > impl_->opt.context)
+    throw std::runtime_error("inkling2 gpu: position beyond the context");
+  state.pos = position;
+  state.pending_first = -1;
+}
+
+void GpuEngine::Synchronize() {
+  Check(hipStreamSynchronize(impl_->stream), "synchronize");
+}
+
+std::uint32_t GpuEngine::context() const {
+  return impl_->opt.context;
+}
+
+std::uint32_t GpuEngine::max_batch() const {
+  return impl_->opt.max_batch;
+}
+
+std::uint32_t GpuEngine::sessions() const {
+  return impl_->opt.sessions;
+}
+
 void GpuEngine::FakeContext(std::uint32_t session, std::uint32_t position) {
   impl_->FakeContext(session, position);
 }

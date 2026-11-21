@@ -28,6 +28,7 @@ gufo_extension_target(
     src/drafter.cpp
     src/gpu.cpp
     src/provider.cpp
+    src/serve.cpp
   LINK_LIBRARIES
     gufo_inkling2_native
     gufo_ext_runtime
