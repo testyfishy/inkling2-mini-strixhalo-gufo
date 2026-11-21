@@ -360,6 +360,33 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
         engine.SetProfile(false);
       }
     }
+    // INKLING2_SNAPSHOT_TEST: save session 0 to host memory, overwrite it by
+    // processing other tokens from position 0, and restore it; what follows
+    // must then be what a run without this gives.
+    if (EnvInt("INKLING2_SNAPSHOT_TEST", 0) != 0 && sessions == 1) {
+      auto t0 = std::chrono::steady_clock::now();
+      const std::vector<std::uint8_t> saved = engine.Save(0);
+      const double save_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+              .count();
+      engine.Reset(0);
+      const std::size_t scramble = std::min<std::size_t>(n, 4096);
+      for (std::size_t i = 0; i < scramble; i += prompt_batch) {
+        std::vector<inkling2::GpuEngine::Row> rows;
+        for (std::size_t j = i; j < std::min(scramble, i + prompt_batch); ++j)
+          rows.push_back({0, prompt_token(0, n - 1 - j)});  // the prompt backwards
+        engine.Step(rows, false);
+      }
+      t0 = std::chrono::steady_clock::now();
+      engine.Restore(0, saved);
+      const double restore_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+              .count();
+      std::printf("snapshot: %u positions, %.2f GB, saved in %.2f s, restored "
+                  "in %.2f s after the session was overwritten",
+                  engine.position(0), saved.size() / 1e9, save_s, restore_s);
+      std::printf("%c", 10);
+    }
     if (generate > 0) {
       std::vector<std::vector<std::uint32_t>> out(sessions);
       const std::size_t launches_before = engine.launches();

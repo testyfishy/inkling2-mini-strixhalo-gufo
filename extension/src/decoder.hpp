@@ -74,6 +74,13 @@ public:
   /// `position` tokens by repeating the keys and values it has. The output
   /// that follows is meaningless; the cost of attending over that much
   /// context is real.
+  /// A session as bytes (position, caches, histories), and back: a restored
+  /// session continues exactly where it was saved, without processing its
+  /// tokens again. The engine that restores must have the same max_batch as
+  /// the one that saved. Not while a tentative step is pending.
+  [[nodiscard]] std::vector<std::uint8_t> Save(std::uint32_t session);
+  void Restore(std::uint32_t session, const std::vector<std::uint8_t>& saved);
+
   void FakeContext(std::uint32_t session, std::uint32_t position);
 
   /// Raw logits (before the soft cap) of run `i` of the last step, one per

@@ -1356,6 +1356,88 @@ struct GpuEngine::Impl {
     Check(hipStreamSynchronize(stream), "synchronize");
   }
 
+  // A session as bytes: position, the sliding-window rings whole, and of the
+  // full-attention caches the positions in use. It can be restored into a
+  // session of an engine with the same ring size (same max_batch).
+  std::vector<std::uint8_t> Save(std::uint32_t index) {
+    const Session& session = sessions.at(index);
+    if (session.pending_first >= 0)
+      throw std::runtime_error("inkling2 gpu: a tentative step is pending");
+    Check(hipStreamSynchronize(stream), "synchronize");
+    const std::size_t block = std::size_t(gpu::kHD) * 1024 * 2;  // bytes
+    const std::size_t chunks = (session.pos + 1023) / 1024;
+    std::vector<std::uint8_t> out(16);
+    const std::uint32_t header[4] = {
+        0x32494e4bu, session.pos,
+        static_cast<std::uint32_t>(session.slots[0].cap),
+        static_cast<std::uint32_t>(c.visits())};
+    std::memcpy(out.data(), header, 16);
+    auto take = [&](const void* device, std::size_t bytes) {
+      const std::size_t at = out.size();
+      out.resize(at + bytes);
+      if (bytes > 0)
+        Check(hipMemcpy(out.data() + at, device, bytes, hipMemcpyDeviceToHost),
+              "save");
+    };
+    take(session.hist, kHistFloats * c.visits() * 4);
+    for (std::uint32_t s = 0; s < c.visits(); ++s) {
+      const Slot& slot = session.slots[s];
+      if (c.is_swa[Physical(s)]) {
+        take(slot.kh, std::size_t(slot.cap) * kHK * 2);
+        take(slot.vh, std::size_t(slot.cap) * kHK * 2);
+        continue;
+      }
+      const std::size_t per_head = std::size_t(slot.cap) * gpu::kHD;
+      for (std::size_t head = 0; head < kNKV; ++head) {
+        take(slot.kh + head * per_head, std::size_t(session.pos) * gpu::kHD * 2);
+        take(slot.vh + head * per_head, chunks * block);
+      }
+    }
+    return out;
+  }
+
+  void Restore(std::uint32_t index, const std::uint8_t* data, std::size_t size) {
+    Session& session = sessions.at(index);
+    std::uint32_t header[4];
+    if (size < 16)
+      throw std::runtime_error("inkling2 gpu: not a saved session");
+    std::memcpy(header, data, 16);
+    const std::uint32_t pos = header[1];
+    if (header[0] != 0x32494e4bu || keep_f32 ||
+        header[2] != static_cast<std::uint32_t>(session.slots[0].cap) ||
+        header[3] != c.visits() || pos > opt.context)
+      throw std::runtime_error(
+          "inkling2 gpu: the saved session does not fit this engine");
+    Check(hipStreamSynchronize(stream), "synchronize");
+    const std::size_t block = std::size_t(gpu::kHD) * 1024 * 2;
+    const std::size_t chunks = (pos + 1023) / 1024;
+    std::size_t at = 16;
+    auto put = [&](void* device, std::size_t bytes) {
+      if (at + bytes > size)
+        throw std::runtime_error("inkling2 gpu: the saved session is cut short");
+      if (bytes > 0)
+        Check(hipMemcpy(device, data + at, bytes, hipMemcpyHostToDevice),
+              "restore");
+      at += bytes;
+    };
+    put(session.hist, kHistFloats * c.visits() * 4);
+    for (std::uint32_t s = 0; s < c.visits(); ++s) {
+      Slot& slot = session.slots[s];
+      if (c.is_swa[Physical(s)]) {
+        put(slot.kh, std::size_t(slot.cap) * kHK * 2);
+        put(slot.vh, std::size_t(slot.cap) * kHK * 2);
+        continue;
+      }
+      const std::size_t per_head = std::size_t(slot.cap) * gpu::kHD;
+      for (std::size_t head = 0; head < kNKV; ++head) {
+        put(slot.kh + head * per_head, std::size_t(pos) * gpu::kHD * 2);
+        put(slot.vh + head * per_head, chunks * block);
+      }
+    }
+    session.pos = pos;
+    session.pending_first = -1;
+  }
+
   void FakeContext(std::uint32_t index, std::uint32_t position) {
     Session& session = sessions.at(index);
     const std::uint32_t have = session.pos;
@@ -1685,6 +1767,15 @@ void GpuEngine::Accept(std::uint32_t session, std::uint32_t rows_kept) {
 
 void GpuEngine::Reset(std::uint32_t session) {
   impl_->Reset(session);
+}
+
+std::vector<std::uint8_t> GpuEngine::Save(std::uint32_t session) {
+  return impl_->Save(session);
+}
+
+void GpuEngine::Restore(std::uint32_t session,
+                        const std::vector<std::uint8_t>& saved) {
+  impl_->Restore(session, saved.data(), saved.size());
 }
 
 void GpuEngine::FakeContext(std::uint32_t session, std::uint32_t position) {
