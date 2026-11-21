@@ -314,6 +314,9 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
     // INKLING2_DEEP_PROMPT: after faking the context, time that many more
     // prompt tokens for session 0, to see prompt speed at depth.
     if (const int deep = EnvInt("INKLING2_DEEP_PROMPT", 0); deep > 0) {
+      const bool profile_deep = std::getenv("INKLING2_PROFILE_DEEP") != nullptr;
+      const auto phases_before = engine.phases();
+      engine.SetProfile(profile_deep);
       const auto deep_start = std::chrono::steady_clock::now();
       for (int i = 0; i < deep; i += prompt_batch) {
         std::vector<inkling2::GpuEngine::Row> rows;
@@ -330,6 +333,16 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                   deep, engine.position(0) - deep, deep_seconds,
                   deep / deep_seconds, prompt_batch);
       std::printf("%c", 10);
+      if (profile_deep) {
+        const auto phases_after = engine.phases();
+        const double steps = std::ceil(double(deep) / prompt_batch);
+        for (std::size_t p = 0; p < phases_after.size(); ++p)
+          std::printf("  %-34s %8.3f ms per step%c", phases_after[p].first.c_str(),
+                      (phases_after[p].second - phases_before[p].second) /
+                          steps * 1e3,
+                      10);
+        engine.SetProfile(false);
+      }
     }
     if (generate > 0) {
       std::vector<std::vector<std::uint32_t>> out(sessions);

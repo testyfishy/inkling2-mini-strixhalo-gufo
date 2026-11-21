@@ -93,6 +93,8 @@ struct GpuEngine::Impl {
   struct Slot {
     float *k, *v;
     int cap;
+    // FP16 copies of a full-attention cache (gpu::RowState::kh), or null.
+    std::uint16_t *kh{}, *vh{};
   };
   struct Session {
     std::vector<Slot> slots;
@@ -146,6 +148,21 @@ struct GpuEngine::Impl {
   int gemm_variant{0}, expert_variant{0};
   int single_threads{128}, head_threads{64};
   bool attention_window{true};
+  // Steps with at least this many rows per session on average run full
+  // attention through the batched FP16 kernel, which reads the cache once
+  // per group of rows (0 = never). Steps of one row per session are faster
+  // with the per-row kernel. INKLING2_WMMA_ATTN_MIN_ROWS.
+  int attn_batched_min{EnvOr("INKLING2_WMMA_ATTN_MIN_ROWS", 4)};
+  std::uint16_t* qh{};
+  const gpu::AttnGroup* dev_groups{};
+  std::size_t off_groups{0};
+  int n_groups{0};
+  // INKLING2_ATTN_AB=1: run both attention kernels on every such visit and
+  // report how far apart their outputs are.
+  bool attn_ab{EnvOr("INKLING2_ATTN_AB", 0) != 0};
+  std::vector<float> ab_old, ab_new;
+  double ab_max_diff{0}, ab_max_abs{0}, ab_sq_diff{0}, ab_sq{0};
+  std::size_t ab_bad{0}, ab_visits{0};
   int max_chunks{1};
   float *chunk_max{}, *chunk_sum{}, *chunk_out{};
   std::uint32_t max_pos{0};  // the highest position in the current step
@@ -381,10 +398,18 @@ struct GpuEngine::Impl {
       session.slots.resize(c.visits());
       for (std::uint32_t s = 0; s < c.visits(); ++s) {
         Slot& slot = session.slots[s];
-        slot.cap =
-            c.is_swa[Physical(s)] ? swa_cap : static_cast<int>(opt.context);
+        // Full-attention caches are laid out in chunks of 1,024 positions.
+        const bool ring = c.is_swa[Physical(s)];
+        slot.cap = ring ? swa_cap
+                        : static_cast<int>((opt.context + 1023) / 1024 * 1024);
         slot.k = Floats(std::size_t(slot.cap) * kHK, true);
         slot.v = Floats(std::size_t(slot.cap) * kHK, true);
+        if (!ring && attn_batched_min > 0) {
+          slot.kh = static_cast<std::uint16_t*>(
+              Alloc(std::size_t(slot.cap) * kHK * 2, true));
+          slot.vh = static_cast<std::uint16_t*>(
+              Alloc(std::size_t(slot.cap) * kHK * 2, true));
+        }
       }
     }
 
@@ -420,6 +445,7 @@ struct GpuEngine::Impl {
     xt_in = Floats(groups * 3 * kE * gpu::kGemmGroup);
     xt_attn = Floats(groups * kHQ * gpu::kGemmGroup);
     xh_x = static_cast<std::uint16_t*>(Alloc(B * kE * 2));
+    qh = static_cast<std::uint16_t*>(Alloc(B * kHQ * 2));
     acth = static_cast<std::uint16_t*>(Alloc(B * kTopK * gpu::kFF * 2));
     if (wmma_min_batch > 0) {
       xh_in = static_cast<std::uint16_t*>(Alloc(B * 3 * kE * 2));
@@ -468,7 +494,8 @@ struct GpuEngine::Impl {
     off_tokens = sizeof(gpu::RowState) * c.visits() * B;
     off_heads = off_tokens + 4 * B;
     off_identity = off_heads + 4 * heads_cap;
-    host_staging.resize(off_identity + 4 * B);
+    off_groups = off_identity + 4 * B;
+    host_staging.resize(off_groups + sizeof(gpu::AttnGroup) * B);
     for (std::size_t b = 0; b < B; ++b) {
       const std::int32_t index = static_cast<std::int32_t>(b);
       std::memcpy(host_staging.data() + off_identity + 4 * b, &index, 4);
@@ -487,6 +514,8 @@ struct GpuEngine::Impl {
         static_cast<const std::uint8_t*>(staging) + off_heads);
     dev_identity = reinterpret_cast<const std::int32_t*>(
         static_cast<const std::uint8_t*>(staging) + off_identity);
+    dev_groups = reinterpret_cast<const gpu::AttnGroup*>(
+        static_cast<const std::uint8_t*>(staging) + off_groups);
     if (std::getenv("INKLING2_DOTBENCH"))
       DotBench();
   }
@@ -542,6 +571,13 @@ struct GpuEngine::Impl {
   ~Impl() {
     if (stream)
       (void)hipStreamSynchronize(stream);
+    if (ab_visits > 0)
+      std::fprintf(stderr,
+                   "inkling2 gpu: attention A/B over %zu visits: max |old - "
+                   "new| %.3g (max |old| %.3g), rms difference / rms %.3g, "
+                   "%zu values not finite\n",
+                   ab_visits, ab_max_diff, ab_max_abs,
+                   ab_sq > 0 ? std::sqrt(ab_sq_diff / ab_sq) : 0.0, ab_bad);
     for (void* p : owned)
       (void)hipFree(p);
     if (stream)
@@ -694,7 +730,50 @@ struct GpuEngine::Impl {
     at.chunk_max = chunk_max;
     at.chunk_sum = chunk_sum;
     at.chunk_out = chunk_out;
-    gpu::Attention(at, stream);
+    const bool batched =
+        !swa && attn_batched_min > 0 && batch >= attn_batched_min * n_groups;
+    if (batched) {
+      gpu::ToHalfArgs h{};
+      h.x = q;
+      h.x_stride = kHQ;
+      h.out = qh;
+      h.cols = kHQ;
+      h.batch = batch;
+      gpu::ToHalf(h, stream);
+      at.qh = qh;
+      at.groups = dev_groups;
+      at.group_count = n_groups;
+    }
+    if (batched && attn_ab) {
+      const std::size_t n = std::size_t(batch) * kHQ;
+      ab_old.resize(n);
+      ab_new.resize(n);
+      gpu::Attention(at, stream);
+      Check(hipMemcpyAsync(ab_old.data(), attn, n * 4, hipMemcpyDeviceToHost,
+                           stream),
+            "copy attention");
+      at.batched = true;
+      gpu::Attention(at, stream);
+      Check(hipMemcpyAsync(ab_new.data(), attn, n * 4, hipMemcpyDeviceToHost,
+                           stream),
+            "copy attention");
+      Check(hipStreamSynchronize(stream), "synchronize");
+      for (std::size_t i = 0; i < n; ++i) {
+        const double o = ab_old[i], d = double(ab_new[i]) - o;
+        if (!std::isfinite(ab_new[i])) {
+          ++ab_bad;
+          continue;
+        }
+        ab_max_diff = std::max(ab_max_diff, std::fabs(d));
+        ab_max_abs = std::max(ab_max_abs, std::fabs(o));
+        ab_sq_diff += d * d;
+        ab_sq += o * o;
+      }
+      ++ab_visits;
+    } else {
+      at.batched = batched;
+      gpu::Attention(at, stream);
+    }
     Mark(3);
 
     gpu::GemmArgs o{};
@@ -834,6 +913,7 @@ struct GpuEngine::Impl {
       throw std::runtime_error("inkling2 gpu: cannot fake that context");
     const std::size_t chunk_floats = std::size_t(gpu::kHD) * 1024;
     const std::uint32_t chunks = (position + 1023) / 1024;
+    std::vector<std::pair<const float*, std::uint16_t*>> fake_values;
     for (std::uint32_t s = 0; s < c.visits(); ++s) {
       if (c.is_swa[Physical(s)])
         continue;  // sliding-window layers only keep their window
@@ -857,9 +937,41 @@ struct GpuEngine::Impl {
                 "copy values");
           filled += count;
         }
+        if (!slot.kh)
+          continue;
+        // The FP16 copies must hold what the F32 caches hold. Keys are
+        // position-major there: every later chunk copies the first.
+        std::uint16_t* kh = slot.kh + head * std::size_t(slot.cap) * gpu::kHD;
+        for (std::uint32_t chunk = 1; chunk < chunks; ++chunk)
+          Check(hipMemcpyAsync(kh + chunk * chunk_floats, kh, chunk_floats * 2,
+                               hipMemcpyDeviceToDevice, stream),
+                "copy keys");
+        fake_values.push_back({values, slot.vh + head * chunk_cap * chunk_floats});
       }
     }
     Check(hipStreamSynchronize(stream), "synchronize");
+    // FP16 values are dimension-major in chunks: rebuilt on the host from the
+    // F32 values, which the doubling above has filled.
+    if (!fake_values.empty()) {
+      std::vector<float> wide(std::size_t(position) * gpu::kHD);
+      std::vector<std::uint16_t> half(std::size_t(chunks) * chunk_floats);
+      for (const auto& [src, dst] : fake_values) {
+        Check(hipMemcpy(wide.data(), src, wide.size() * 4,
+                        hipMemcpyDeviceToHost),
+              "read values");
+        for (std::size_t p = 0; p < position; ++p)
+          for (std::size_t d = 0; d < gpu::kHD; ++d) {
+            bool exact;
+            const float v =
+                std::clamp(wide[p * gpu::kHD + d], -65504.0f, 65504.0f);
+            half[((p / 1024) * gpu::kHD + d) * 1024 + p % 1024] =
+                HalfBits(v, &exact);
+          }
+        Check(hipMemcpy(dst, half.data(), half.size() * 2,
+                        hipMemcpyHostToDevice),
+              "write values");
+      }
+    }
     session.pos = position;
   }
 
@@ -970,10 +1082,26 @@ struct GpuEngine::Impl {
         state.tau = swa ? 1.0f : tau;
         state.layout = swa ? 0 : 1;
         state.chunk_cap = slot.cap / 1024;
+        state.kh = slot.kh;
+        state.vh = slot.vh;
       }
     }
     for (std::size_t i = 0; i < heads.size(); ++i)
       head_rows[i] = heads[i];
+    // Groups for the batched attention kernel: runs cut into pieces of at
+    // most kAttnRows rows.
+    auto* groups =
+        reinterpret_cast<gpu::AttnGroup*>(host_staging.data() + off_groups);
+    n_groups = 0;
+    for (std::size_t b = 0; b < rows.size();) {
+      std::size_t end = b + 1;
+      while (end < rows.size() && end - b < std::size_t(gpu::kAttnRows) &&
+             rows[end].session == rows[b].session)
+        ++end;
+      groups[n_groups++] = {static_cast<std::int32_t>(b),
+                            static_cast<std::int32_t>(end - b)};
+      b = end;
+    }
     Check(hipMemcpyAsync(staging, host_staging.data(), host_staging.size(),
                          hipMemcpyHostToDevice, stream),
           "copy step inputs");

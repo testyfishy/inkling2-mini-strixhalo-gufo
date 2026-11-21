@@ -60,6 +60,14 @@ struct RowState {
   //     kv_v[(head * cap + pos) * kHD + dim]
   int layout;
   int chunk_cap;  // cap / 1024, for layout 1
+  // Optional FP16 copies of a layout 1 cache for the batched attention
+  // kernel, laid out the other way round, as the matrix instruction wants
+  // them: keys position-major per head,
+  //     kh[(head * cap + pos) * kHD + dim]
+  // and values dimension-major inside chunks of 1,024 positions,
+  //     vh[((head * chunk_cap + pos / 1024) * kHD + dim) * 1024 + pos % 1024]
+  std::uint16_t* kh;
+  std::uint16_t* vh;
 };
 
 /// Token embedding rows, normalized, into cur (stride kE).
@@ -202,6 +210,13 @@ struct GlueBArgs {
 };
 void GlueB(const GlueBArgs& args, hipStream_t stream);
 
+/// Up to kAttnRows consecutive batch rows of one session, for the batched
+/// attention kernel.
+inline constexpr int kAttnRows = 32;
+struct AttnGroup {
+  std::int32_t row0, count;
+};
+
 /// Attention of each row over its session's cached rows [first, pos], with the
 /// relative-position bias, the zero sink and the output gate.
 struct AttnArgs {
@@ -230,6 +245,15 @@ struct AttnArgs {
   float* chunk_max;  // batch * kNH * max_chunks
   float* chunk_sum;  // batch * kNH * max_chunks
   float* chunk_out;  // batch * kNH * max_chunks * kHD
+  // With `chunked`: one block per (group of rows, key head, chunk) instead of
+  // per (row, key head, chunk). It reads the chunk's FP16 keys and values
+  // once for all of the group's rows and multiplies with the 16x16x16 FP16
+  // matrix instruction (FP32 sums). Needs RowState::kh / vh, an FP16 copy of
+  // q, and the groups.
+  bool batched;
+  const std::uint16_t* qh;  // stride kHQ
+  const AttnGroup* groups;
+  int group_count;
 };
 void Attention(const AttnArgs& args, hipStream_t stream);
 

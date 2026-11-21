@@ -621,6 +621,10 @@ __launch_bounds__(Threads) __global__ void GemvKernel(GemmArgs a) {
     a.jobs[j].y[r] = shared[0];
 }
 
+__device__ __forceinline__ _Float16 ClampHalf(float v) {
+  return static_cast<_Float16>(fminf(fmaxf(v, -65504.0f), 65504.0f));
+}
+
 // One block per row.
 __launch_bounds__(kT) __global__ void GlueBKernel(GlueBArgs a) {
   // Group factors: Q heads 0..23, K 24..31, V 32..39, R 40..63.
@@ -682,6 +686,17 @@ __launch_bounds__(kT) __global__ void GlueBKernel(GlueBArgs a) {
           k_new[c] * factor[kNH + c / kHD];
       row.kv_v[(head * row.cap + row.pos) * kHD + dim] =
           v_new[c] * factor[kNH + kNKV + c / kHD];
+    }
+    if (row.kh) {
+      _Float16* kh = reinterpret_cast<_Float16*>(row.kh);
+      _Float16* vh = reinterpret_cast<_Float16*>(row.vh);
+      for (int c = t; c < kHK; c += kT) {
+        const std::size_t head = c / kHD, dim = c % kHD;
+        kh[(head * row.cap + row.pos) * kHD + dim] =
+            ClampHalf(k_new[c] * factor[kNH + c / kHD]);
+        vh[((head * row.chunk_cap + chunk) * kHD + dim) * kT + within] =
+            ClampHalf(v_new[c] * factor[kNH + kNKV + c / kHD]);
+      }
     }
   } else {
     float* k_row = row.kv_k + static_cast<std::size_t>(row.pos % row.cap) * kHK;
@@ -960,6 +975,238 @@ __launch_bounds__(kT) __global__ void AttentionChunkKernel(AttnArgs a) {
       a.chunk_out[((b * kNH + kv_head * kShare + s) * a.max_chunks + chunk) *
                       kHD +
                   t] = sum;
+    }
+}
+
+// ---- the same per chunk, for many rows of one session at once ---------------
+//
+// One block per (group of up to 32 consecutive rows, key head, chunk of 1,024
+// positions): 96 queries. The block walks the chunk 64 positions at a time:
+//   1. all threads copy the slice's keys into shared memory;
+//   2. scores = Q K^T with the matrix instruction (a wave owns one tile of 16
+//      positions and three tiles of 16 queries), then the relative bias, the
+//      sink and each row's causal limit;
+//   3. the softmax is kept online: per query a running maximum M; the slice's
+//      weights exp(score - M) go to shared memory as FP16, and what was summed
+//      before is rescaled by exp(M_old - M). Meanwhile all threads copy the
+//      slice's values into shared memory;
+//   4. out += P V with the matrix instruction (a wave owns 16 output
+//      dimensions for all six query tiles).
+// It leaves the same per-chunk maximum, sum and weighted values as
+// AttentionChunkKernel, for AttentionCombineKernel.
+//
+// Weights are stored times 2^15 so that FP16 keeps 11 significant bits down to
+// 2e-9 of the running maximum and only drops what is below 1e-12 of it.
+constexpr int kAQ = kAttnRows * kShare;  // queries of a block
+constexpr int kAP = 64;                  // positions of a slice
+constexpr float kProbScale = 32768.0f;
+
+__launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
+  __shared__ std::uint32_t s_q[kAQ][kHD / 2];
+  __shared__ std::uint32_t s_kv[kAP * kHD / 2];
+  __shared__ _Float16 s_p[kAQ][kAP];
+  __shared__ float s_red[8][kAQ];
+  __shared__ float s_sum[8][kAQ];
+  __shared__ float s_f[kAQ];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, wave = tid >> 5;
+  const int sl = lane & 15, hi = lane >> 4;
+  const int chunk = blockIdx.x % a.max_chunks;
+  const int kv_head = (blockIdx.x / a.max_chunks) % kNKV;
+  const AttnGroup group = a.groups[blockIdx.x / (a.max_chunks * kNKV)];
+  const RowState row0 = a.rows[group.row0];
+  // The group's rows are at consecutive positions pos0, pos0 + 1, ...
+  const int pos0 = row0.pos, pos_last = pos0 + group.count - 1;
+  if (chunk * kT > pos_last)
+    return;
+
+  // Queries: index s * 32 + row for query head kv_head * 3 + s.
+  for (int p = 0; p < kAQ * (kHD / 2) / 256; ++p) {
+    const int unit = p * 256 + tid, qi = unit / (kHD / 2), dw = unit % (kHD / 2);
+    const int s = qi / kAttnRows, row = qi % kAttnRows;
+    std::uint32_t v = 0;
+    if (row < group.count)
+      v = reinterpret_cast<const std::uint32_t*>(
+          a.qh + static_cast<std::size_t>(group.row0 + row) * kHQ +
+          (kv_head * kShare + s) * kHD)[dw];
+    s_q[qi][dw] = v;
+  }
+
+  // Score role: position tile pt, query tiles qt0 .. qt0 + 2; this lane's
+  // queries are entry sl of each.
+  const int pt = wave & 3, qt0 = (wave >> 2) * 3;
+  const int red_slot = pt * 2 + hi;
+  int q_index[3], q_pos[3];
+  float q_sink[3], run_max[3], run_sum[3];
+  const float* q_rel[3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int qt = qt0 + i, s = qt >> 1, row = (qt & 1) * 16 + sl;
+    const int h = kv_head * kShare + s;
+    q_index[i] = qt * 16 + sl;
+    q_pos[i] = row < group.count ? pos0 + row : -1;  // -1: no such row
+    const std::size_t b = group.row0 + (row < group.count ? row : 0);
+    q_sink[i] = a.sink[b * kNH + h];
+    q_rel[i] = a.r + b * kNR + h * kNRel;
+    run_max[i] = kLowest;
+    run_sum[i] = 0.0f;
+  }
+  const std::uint16_t* keys =
+      row0.kh + (static_cast<std::size_t>(kv_head) * row0.cap + chunk * kT) * kHD;
+  const std::uint16_t* values =
+      row0.vh +
+      (static_cast<std::size_t>(kv_head) * row0.chunk_cap + chunk) * kHD * kT;
+  Float8 out[2 * kShare] = {};
+
+  for (int base = 0; base < kT && chunk * kT + base <= pos_last; base += kAP) {
+    // 1. Keys: s_kv[(position * 8 + step) * 8 ..] = 16 dimensions.
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int unit = p * 256 + tid;
+      const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
+          keys + static_cast<std::size_t>(base + unit / 8) * kHD + (unit % 8) * 16);
+      std::uint32_t* dst = s_kv + unit * 8;
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dst[i] = src[i];
+    }
+    __syncthreads();
+
+    // 2. Scores.
+    Float8 acc[3] = {};
+#pragma unroll
+    for (int ks = 0; ks < kHD / 16; ++ks) {
+      Half16 xb;
+      __builtin_memcpy(&xb, s_kv + ((pt * 16 + sl) * 8 + ks) * 8, 32);
+#pragma unroll
+      for (int i = 0; i < 3; ++i) {
+        Half16 wa;
+        __builtin_memcpy(&wa, &s_q[q_index[i]][ks * 8], 32);
+        acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[i]);
+      }
+    }
+    const int j0 = chunk * kT + base + pt * 16 + hi;  // position of element 0
+    // Whether any row of the group is within the bias extent of this slice.
+    const bool near = pos0 - (chunk * kT + base + kAP - 1) < a.extent;
+    float val[3][8];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      float local = kLowest;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int j = j0 + 2 * e;
+        float v = kLowest;
+        if (j <= q_pos[i]) {
+          v = acc[i][e] * a.scale - q_sink[i];
+          const int distance = q_pos[i] - j;
+          if (near && distance < a.extent) {
+            const float* table =
+                a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
+            float bias = 0.0f;
+            for (int x = 0; x < kNRel; ++x)
+              bias += table[x] * q_rel[i][x];
+            v += bias;
+          }
+        }
+        val[i][e] = v;
+        local = fmaxf(local, v);
+      }
+      s_red[red_slot][q_index[i]] = local;
+    }
+    __syncthreads();
+
+    // 3. Weights, and the values: s_kv[(tile * 128 + dim) * 8 ..] = 16
+    // positions.
+    float factor[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      float m = run_max[i];
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        m = fmaxf(m, s_red[k][q_index[i]]);
+      factor[i] = __expf(run_max[i] - m);
+      run_max[i] = m;
+      if (red_slot == 0)
+        s_f[q_index[i]] = factor[i];
+      float part = 0.0f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float p =
+            val[i][e] > 0.5f * kLowest ? __expf(val[i][e] - m) * kProbScale : 0.0f;
+        const _Float16 h = static_cast<_Float16>(p);
+        s_p[q_index[i]][pt * 16 + 2 * e + hi] = h;
+        part += static_cast<float>(h);
+      }
+      s_sum[red_slot][q_index[i]] = part;
+    }
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int unit = p * 256 + tid, dim = unit / 4, tile = unit % 4;
+      const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
+          values + static_cast<std::size_t>(dim) * kT + base + tile * 16);
+      std::uint32_t* dst = s_kv + (tile * kHD + dim) * 8;
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dst[i] = src[i];
+    }
+    __syncthreads();
+
+    // 4. Weighted values; this wave owns dimensions wave * 16 .. + 15.
+#pragma unroll
+    for (int qt = 0; qt < 2 * kShare; ++qt)
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        out[qt][e] *= s_f[qt * 16 + 2 * e + hi];
+#pragma unroll
+    for (int tile = 0; tile < kAP / 16; ++tile) {
+      Half16 wa;
+      __builtin_memcpy(&wa, s_kv + (tile * kHD + wave * 16 + sl) * 8, 32);
+#pragma unroll
+      for (int qt = 0; qt < 2 * kShare; ++qt) {
+        Half16 xb;
+        __builtin_memcpy(&xb, &s_p[qt * 16 + sl][tile * 16], 32);
+        out[qt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, out[qt]);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        sum += s_sum[k][q_index[i]];
+      run_sum[i] = run_sum[i] * factor[i] + sum;
+    }
+    __syncthreads();
+  }
+
+  constexpr float kUnscale = 1.0f / kProbScale;
+#pragma unroll
+  for (int qt = 0; qt < 2 * kShare; ++qt)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int row = (qt & 1) * 16 + 2 * e + hi;
+      if (row >= group.count)
+        continue;
+      const std::size_t slot =
+          (static_cast<std::size_t>(group.row0 + row) * kNH + kv_head * kShare +
+           (qt >> 1)) *
+              a.max_chunks +
+          chunk;
+      a.chunk_out[slot * kHD + wave * 16 + sl] = out[qt][e] * kUnscale;
+    }
+  if (red_slot == 0)
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      if (q_pos[i] < 0)
+        continue;
+      const int qt = qt0 + i, row = (qt & 1) * 16 + sl;
+      const std::size_t slot =
+          (static_cast<std::size_t>(group.row0 + row) * kNH + kv_head * kShare +
+           (qt >> 1)) *
+              a.max_chunks +
+          chunk;
+      a.chunk_max[slot] = run_max[i];
+      a.chunk_sum[slot] = run_sum[i] * kUnscale;
     }
 }
 
@@ -2281,6 +2528,12 @@ void GlueB(const GlueBArgs& args, hipStream_t stream) {
 }
 
 void Attention(const AttnArgs& args, hipStream_t stream) {
+  if (args.chunked && args.batched) {
+    AttentionBatchKernel<<<args.group_count * kNKV * args.max_chunks, 256, 0,
+                           stream>>>(args);
+    AttentionCombineKernel<<<args.batch * kNH, kHD, 0, stream>>>(args);
+    return;
+  }
   if (args.chunked) {
     AttentionChunkKernel<<<args.batch * kNKV * args.max_chunks, kT, 0,
                            stream>>>(args);
