@@ -49,6 +49,17 @@ struct RowState {
   int run;    // index of this row within its session's run in the batch
   int last;   // 1 on the last row of its session's run
   float tau;  // log-scaled position factor (1 on sliding-window layers)
+  // How kv_k and kv_v are laid out.
+  // 0 (sliding-window layers): one row of kHK values per position, a ring of
+  //   `cap` rows.
+  // 1 (full-attention layers): per key/value head, so that a block of threads
+  //   reads contiguous memory over a long context. Keys are dimension-major
+  //   inside chunks of 1,024 positions:
+  //     kv_k[((head * chunk_cap + pos / 1024) * kHD + dim) * 1024 + pos % 1024]
+  //   and values are position-major per head:
+  //     kv_v[(head * cap + pos) * kHD + dim]
+  int layout;
+  int chunk_cap;  // cap / 1024, for layout 1
 };
 
 /// Token embedding rows, normalized, into cur (stride kE).
@@ -187,6 +198,15 @@ struct AttnArgs {
   // every position its own thread and keeps the probabilities in fast local
   // memory.
   bool window;
+  // Set for long contexts: the positions are cut into chunks of 1,024, each
+  // (row, key head, chunk) is one block that reads its keys and values once
+  // for the three query heads sharing them, and a second kernel combines the
+  // chunks. Needs the chunk scratch below.
+  bool chunked;
+  int max_chunks;
+  float* chunk_max;  // batch * kNH * max_chunks
+  float* chunk_sum;  // batch * kNH * max_chunks
+  float* chunk_out;  // batch * kNH * max_chunks * kHD
 };
 void Attention(const AttnArgs& args, hipStream_t stream);
 

@@ -227,7 +227,7 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
     options.sessions = static_cast<std::uint32_t>(sessions);
     options.max_batch =
         static_cast<std::uint32_t>(std::max(sessions, prompt_batch));
-    options.context = 8192;
+    options.context = static_cast<std::uint32_t>(EnvInt("INKLING2_CONTEXT", 8192));
     options.int8_experts = EnvInt("INKLING2_INT8_EXPERTS", 1) != 0;
     options.int8_single = EnvInt("INKLING2_INT8_SINGLE", 1) != 0;
     inkling2::GpuEngine engine(model, options);
@@ -288,6 +288,37 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                   order[i], first_logits[order[i]],
                   first_logits[order[i]] - log_norm);
 
+    // INKLING2_FAKE_CONTEXT: time generation as if each session already held
+    // that many tokens (see GpuEngine::FakeContext). The tokens generated
+    // afterwards are meaningless.
+    if (const int fake = EnvInt("INKLING2_FAKE_CONTEXT", 0); fake > 0) {
+      for (int s = 0; s < sessions; ++s)
+        engine.FakeContext(static_cast<std::uint32_t>(s),
+                           static_cast<std::uint32_t>(fake));
+      std::printf("context faked to about %d tokens per session (position %u)",
+                  fake, engine.position(0));
+      std::printf("%c", 10);
+    }
+    // INKLING2_DEEP_PROMPT: after faking the context, time that many more
+    // prompt tokens for session 0, to see prompt speed at depth.
+    if (const int deep = EnvInt("INKLING2_DEEP_PROMPT", 0); deep > 0) {
+      const auto deep_start = std::chrono::steady_clock::now();
+      for (int i = 0; i < deep; i += prompt_batch) {
+        std::vector<inkling2::GpuEngine::Row> rows;
+        for (int j = i; j < std::min(deep, i + prompt_batch); ++j)
+          rows.push_back({0, prompt_token(0, static_cast<std::size_t>(j) % n)});
+        engine.Step(rows, false);
+      }
+      const double deep_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        deep_start)
+              .count();
+      std::printf("deep prompt: %d tokens at position %u in %.2f s (%.1f "
+                  "tokens/s, %d row(s) per step)",
+                  deep, engine.position(0) - deep, deep_seconds,
+                  deep / deep_seconds, prompt_batch);
+      std::printf("%c", 10);
+    }
     if (generate > 0) {
       std::vector<std::vector<std::uint32_t>> out(sessions);
       const std::size_t launches_before = engine.launches();

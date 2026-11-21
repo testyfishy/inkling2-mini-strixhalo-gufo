@@ -52,6 +52,21 @@ of about 0.44 here), so this measurement shows no quality cost. It is a small sa
 one could show a difference this one cannot. `INKLING2_INT8_EXPERTS=0` (or `INT8_EXPERTS=0` for
 `scripts/quality.sh`) selects the float products.
 
+## Longer context
+
+One chunk of 4,096 tokens, 2,047 scored positions (2,048 to 4,095), 64 rows per step. This
+exercises attention beyond 1,024 positions, the sliding-window ring wrapping, and the chunked
+long-context kernel:
+
+| Measure | This engine | llama.cpp |
+|---|---:|---:|
+| Perplexity | 7.4962 | 7.4828 |
+| Mean KLD from llama.cpp | 0.0017 | |
+| Same top token | 97.56% to 98.05% across two runs | |
+
+Agreement is as close as at 512 tokens. Nothing beyond 4,096 tokens has been checked against a
+reference.
+
 ## What the remaining difference is, and is not, known to be
 
 - The two implementations use different arithmetic. llama.cpp's GPU path keeps its KV cache in
@@ -71,6 +86,6 @@ one could show a difference this one cannot. `INKLING2_INT8_EXPERTS=0` (or `INT8
 ## Limits of this measurement
 
 - 2,040 positions is a small sample; perplexity on it has a standard error of about 0.44.
-- Contexts stop at 512 tokens, so the 1,024-token sliding-window wrap and the log-scaled positions
-  past 8,192 tokens are not exercised.
+- Contexts are checked to 4,096 tokens. The log-scaled positions past 8,192 tokens and anything
+  near the depths of real use (100,000 tokens and more) are not exercised.
 - Text only. Image input, sampling, tool calls and chat formatting are not covered.

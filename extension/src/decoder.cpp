@@ -83,6 +83,8 @@ struct GpuEngine::Impl {
   int gemm_variant{0}, expert_variant{0};
   int single_threads{128}, head_threads{64};
   bool attention_window{true};
+  int max_chunks{1};
+  float *chunk_max{}, *chunk_sum{}, *chunk_out{};
   std::uint32_t max_pos{0};  // the highest position in the current step
   std::uint32_t* sel_ids{};
   // Per-step staging: the row states of every visit, the tokens, the head rows.
@@ -171,6 +173,8 @@ struct GpuEngine::Impl {
 
   Impl(const Model& model, const Options& options)
       : m(model), c(model.c), opt(options) {
+    // Full-attention caches are laid out in chunks of 1,024 positions.
+    opt.context = (opt.context + 1023) / 1024 * 1024;
     const bool shape_ok =
         c.n_embd == kE && c.head_dim == gpu::kHD && c.n_head == kNH &&
         c.n_head_kv == kNKV && c.n_rel == gpu::kNRel && c.n_conv == kNC &&
@@ -306,6 +310,10 @@ struct GpuEngine::Impl {
       head_threads = std::atoi(v);
     if (const char* v = std::getenv("INKLING2_ATTN_WINDOW"); v && *v == '0')
       attention_window = false;
+    max_chunks = static_cast<int>((opt.context + 1023) / 1024);
+    chunk_max = Floats(B * kNH * std::size_t(max_chunks));
+    chunk_sum = Floats(B * kNH * std::size_t(max_chunks));
+    chunk_out = Floats(B * kNH * std::size_t(max_chunks) * gpu::kHD);
     contrib = Floats(B * kTopK * kE);
     if (opt.int8_experts) {
       xq = static_cast<std::uint32_t*>(Alloc(B * kE));
@@ -512,7 +520,14 @@ struct GpuEngine::Impl {
     at.scale = 1.0f / std::sqrt(static_cast<float>(gpu::kHD));
     at.rows = rows;
     at.batch = batch;
-    at.window = attention_window && (swa || max_pos < 1024);
+    // Sliding-window layers read at most 1,024 positions from their ring;
+    // full-attention layers always use the chunked kernel and its layout.
+    at.window = swa && attention_window;
+    at.chunked = !swa;
+    at.max_chunks = static_cast<int>(max_pos / 1024 + 1);
+    at.chunk_max = chunk_max;
+    at.chunk_sum = chunk_sum;
+    at.chunk_out = chunk_out;
     gpu::Attention(at, stream);
     Mark(3);
 
@@ -644,6 +659,42 @@ struct GpuEngine::Impl {
     Check(hipStreamSynchronize(stream), "synchronize");
   }
 
+  void FakeContext(std::uint32_t index, std::uint32_t position) {
+    Session& session = sessions.at(index);
+    const std::uint32_t have = session.pos;
+    if (have == 0 || position <= have || position > opt.context)
+      throw std::runtime_error("inkling2 gpu: cannot fake that context");
+    const std::size_t chunk_floats = std::size_t(gpu::kHD) * 1024;
+    const std::uint32_t chunks = (position + 1023) / 1024;
+    for (std::uint32_t s = 0; s < c.visits(); ++s) {
+      if (c.is_swa[Physical(s)])
+        continue;  // sliding-window layers only keep their window
+      Slot& slot = session.slots[s];
+      const std::size_t chunk_cap = std::size_t(slot.cap) / 1024;
+      for (std::size_t head = 0; head < kNKV; ++head) {
+        // Keys: every later chunk becomes a copy of the head's first chunk.
+        float* keys = slot.k + head * chunk_cap * chunk_floats;
+        for (std::uint32_t chunk = 1; chunk < chunks; ++chunk)
+          Check(hipMemcpyAsync(keys + chunk * chunk_floats, keys,
+                               chunk_floats * 4, hipMemcpyDeviceToDevice,
+                               stream),
+                "copy keys");
+        // Values: double the filled positions until they reach `position`.
+        float* values = slot.v + head * std::size_t(slot.cap) * gpu::kHD;
+        for (std::uint32_t filled = have; filled < position;) {
+          const std::uint32_t count = std::min(filled, position - filled);
+          Check(hipMemcpyAsync(values + std::size_t(filled) * gpu::kHD, values,
+                               std::size_t(count) * gpu::kHD * 4,
+                               hipMemcpyDeviceToDevice, stream),
+                "copy values");
+          filled += count;
+        }
+      }
+    }
+    Check(hipStreamSynchronize(stream), "synchronize");
+    session.pos = position;
+  }
+
   void Step(const std::vector<Row>& rows, Head head) {
     if (rows.empty() || rows.size() > opt.max_batch)
       throw std::runtime_error("inkling2 gpu: batch size out of range");
@@ -704,6 +755,8 @@ struct GpuEngine::Impl {
         state.run = run[b];
         state.last = last[b];
         state.tau = swa ? 1.0f : tau;
+        state.layout = swa ? 0 : 1;
+        state.chunk_cap = slot.cap / 1024;
       }
     }
     for (std::size_t i = 0; i < heads.size(); ++i)
@@ -817,6 +870,10 @@ void GpuEngine::Step(const std::vector<Row>& rows, Head head) {
 
 void GpuEngine::Reset(std::uint32_t session) {
   impl_->Reset(session);
+}
+
+void GpuEngine::FakeContext(std::uint32_t session, std::uint32_t position) {
+  impl_->FakeContext(session, position);
 }
 
 const float* GpuEngine::logits(std::size_t i) const {

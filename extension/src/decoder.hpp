@@ -59,6 +59,12 @@ public:
   /// Forgets a session's context: its next row is position 0 again.
   void Reset(std::uint32_t session);
 
+  /// Timing aid, not for real use: pretends the session already holds
+  /// `position` tokens by repeating the keys and values it has. The output
+  /// that follows is meaningless; the cost of attending over that much
+  /// context is real.
+  void FakeContext(std::uint32_t session, std::uint32_t position);
+
   /// Raw logits (before the soft cap) of run `i` of the last step, one per
   /// vocabulary entry.
   [[nodiscard]] const float* logits(std::size_t i) const;

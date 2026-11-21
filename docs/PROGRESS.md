@@ -23,7 +23,8 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 9 | `bf62ba6` | Expert-major kernels for the BF16 expert layers | 18.5 | 109 | 49.0 | identical logits |
 | 10 | `7aa53c5` | 8-bit integer products for NVFP4 experts in batched steps | 18.5 | 130 | 56.2 | PPL 7.799, KLD 0.0020, top token 97.99% |
 | 11 | `1144caa` | Single-row matrix kernel; integer NVFP4 experts with bitwise decode for small steps | 23.7 | 133 | | one row per step: PPL 6.592 vs 6.573, KLD 0.0021, 98.43% (510 positions) |
-| 12 | this commit | Attention kernel for up to 1,024 positions: a thread per position | 25.0 (short context), 23.3 (448 tokens of context; was 18.7) | 145 | | equals the previous kernel to 1e-5 on the float path |
+| 12 | `93172b8` | Attention kernel for up to 1,024 positions: a thread per position | 25.0 (short context), 23.3 (448 tokens of context; was 18.7) | 145 | | equals the previous kernel to 1e-5 on the float path |
+| 13 | this commit | Attention over long contexts: chunked kernel, full-attention cache laid out per head | 25.0 short; 21.3 / 19.6 / 16.4 / 13.3 at 4K / 16K / 50K / 100K (was 2.0 at 100K) | 145 short; 115 / 78 / 27 at 4K / 16K / 100K | | 4,096-token context vs llama.cpp: PPL 7.496 vs 7.483, KLD 0.0017, top token 97.56% |
 
 Notes on reading this table:
 
@@ -34,6 +35,5 @@ Notes on reading this table:
   16. `INKLING2_INT8_EXPERTS=0` restores float products everywhere. With them on, small
   differences elsewhere in the computation can move a logit by about 0.05, where float paths
   agree to about 0.00001.
-- Context length matters and most rows above are at short context. Contexts beyond 1,024
-  positions still use the old, slow attention kernel, and nothing beyond 512 tokens has been
-  verified against a reference. That is the next step.
+- Context length matters and most rows above are at short context. Step 13 is the first with
+  numbers at depth; see "Context depth" in BENCHMARKS.md, including the comparison with Qwen.

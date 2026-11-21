@@ -498,13 +498,24 @@ __launch_bounds__(kT) __global__ void GlueBKernel(GlueBArgs a) {
   }
   __syncthreads();
 
-  float* k_row = row.kv_k + static_cast<std::size_t>(row.pos % row.cap) * kHK;
-  float* v_row = row.kv_v + static_cast<std::size_t>(row.pos % row.cap) * kHK;
   for (int i = t; i < kHQ; i += kT)
     q[i] = q[i] * a.q_clip[i] * factor[i / kHD];
-  for (int c = t; c < kHK; c += kT) {
-    k_row[c] = k_new[c] * factor[kNH + c / kHD];
-    v_row[c] = v_new[c] * factor[kNH + kNKV + c / kHD];
+  if (row.layout == 1) {
+    const int chunk = row.pos / kT, within = row.pos % kT;
+    for (int c = t; c < kHK; c += kT) {
+      const std::size_t head = c / kHD, dim = c % kHD;
+      row.kv_k[((head * row.chunk_cap + chunk) * kHD + dim) * kT + within] =
+          k_new[c] * factor[kNH + c / kHD];
+      row.kv_v[(head * row.cap + row.pos) * kHD + dim] =
+          v_new[c] * factor[kNH + kNKV + c / kHD];
+    }
+  } else {
+    float* k_row = row.kv_k + static_cast<std::size_t>(row.pos % row.cap) * kHK;
+    float* v_row = row.kv_v + static_cast<std::size_t>(row.pos % row.cap) * kHK;
+    for (int c = t; c < kHK; c += kT) {
+      k_row[c] = k_new[c] * factor[kNH + c / kHD];
+      v_row[c] = v_new[c] * factor[kNH + kNKV + c / kHD];
+    }
   }
   for (int i = t; i < kNR; i += kT)
     r[i] = r[i] * a.rel_clip[i] * factor[kNH + 2 * kNKV + i / kNRel];
@@ -655,6 +666,151 @@ __launch_bounds__(kT) __global__ void AttentionWindowKernel(AttnArgs a) {
     a.out[b * kHQ + h * kHD + t] =
         sum / total * Sigmoid(a.gate[b * kHQ + h * kHD + t]);
   }
+}
+
+// ---- attention over long contexts ----------------------------------------
+
+constexpr int kShare = kNH / kNKV;  // query heads per key/value head
+constexpr float kLowest = -3.0e38f;
+
+// One block per (row, key head, chunk of kT positions). For each of the query
+// heads that share this key head: the scores of the chunk's positions, their
+// maximum, the sum of exp(score - maximum), and the values weighted by
+// exp(score - maximum). Keys and values are read once for all of them.
+__launch_bounds__(kT) __global__ void AttentionChunkKernel(AttnArgs a) {
+  __shared__ float prob[kShare][kT];
+  __shared__ float red[kShare][kT];
+  const int t = threadIdx.x;
+  const int chunk = blockIdx.x % a.max_chunks;
+  const int kv_head = (blockIdx.x / a.max_chunks) % kNKV;
+  const std::size_t b = blockIdx.x / (a.max_chunks * kNKV);
+  const RowState row = a.rows[b];
+  const int n = row.pos - row.first + 1;
+  if (chunk * kT >= n)
+    return;  // this row has no positions here; the combine skips the chunk
+  const int idx = chunk * kT + t;
+  const bool live = idx < n;
+  // Full-attention layers: positions start at 0 and the cache is laid out per
+  // head (RowState::layout 1).
+  const float* keys =
+      row.kv_k +
+      (static_cast<std::size_t>(kv_head) * row.chunk_cap + chunk) * kHD * kT;
+  const float* values =
+      row.kv_v + (static_cast<std::size_t>(kv_head) * row.cap + chunk * kT) * kHD;
+
+  float value[kShare];
+  for (int s = 0; s < kShare; ++s)
+    value[s] = kLowest;
+  if (live) {
+    const float* q = a.q + b * kHQ + kv_head * kShare * kHD;
+    float dot[kShare];
+    for (int s = 0; s < kShare; ++s)
+      dot[s] = 0.0f;
+    for (int i = 0; i < kHD; ++i) {
+      // Neighbouring threads read neighbouring positions of dimension i.
+      const float key = keys[static_cast<std::size_t>(i) * kT + t];
+      for (int s = 0; s < kShare; ++s)
+        dot[s] += q[s * kHD + i] * key;
+    }
+    const int distance = n - 1 - idx;
+    for (int s = 0; s < kShare; ++s) {
+      const int h = kv_head * kShare + s;
+      float bias = 0.0f;
+      if (distance < a.extent) {
+        const float* r = a.r + b * kNR + h * kNRel;
+        const float* table =
+            a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
+        for (int x = 0; x < kNRel; ++x)
+          bias += table[x] * r[x];
+      }
+      value[s] = dot[s] * a.scale + bias - a.sink[b * kNH + h];
+    }
+  }
+  for (int s = 0; s < kShare; ++s) {
+    prob[s][t] = value[s];
+    red[s][t] = value[s];
+  }
+  __syncthreads();
+  for (int step = kT / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int s = 0; s < kShare; ++s)
+        red[s][t] = fmaxf(red[s][t], red[s][t + step]);
+    __syncthreads();
+  }
+  float max[kShare];
+  for (int s = 0; s < kShare; ++s)
+    max[s] = red[s][0];
+  __syncthreads();
+
+  for (int s = 0; s < kShare; ++s) {
+    const float e = live ? __expf(prob[s][t] - max[s]) : 0.0f;
+    prob[s][t] = e;
+    red[s][t] = e;
+  }
+  __syncthreads();
+  for (int step = kT / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int s = 0; s < kShare; ++s)
+        red[s][t] += red[s][t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    for (int s = 0; s < kShare; ++s) {
+      const std::size_t slot =
+          (b * kNH + kv_head * kShare + s) * a.max_chunks + chunk;
+      a.chunk_max[slot] = max[s];
+      a.chunk_sum[slot] = red[s][0];
+    }
+  __syncthreads();
+
+  // The weighted values: eight threads per output dimension.
+  constexpr int kParts = kT / kHD;
+  const int dim = t % kHD, part = t / kHD;
+  const int count = n - chunk * kT < kT ? n - chunk * kT : kT;
+  float acc[kShare];
+  for (int s = 0; s < kShare; ++s)
+    acc[s] = 0.0f;
+  for (int j = part; j < count; j += kParts) {
+    const float v = values[static_cast<std::size_t>(j) * kHD + dim];
+    for (int s = 0; s < kShare; ++s)
+      acc[s] += prob[s][j] * v;
+  }
+  for (int s = 0; s < kShare; ++s)
+    red[s][t] = acc[s];
+  __syncthreads();
+  if (t < kHD)
+    for (int s = 0; s < kShare; ++s) {
+      float sum = 0.0f;
+      for (int p = 0; p < kParts; ++p)
+        sum += red[s][t + p * kHD];
+      a.chunk_out[((b * kNH + kv_head * kShare + s) * a.max_chunks + chunk) *
+                      kHD +
+                  t] = sum;
+    }
+}
+
+// One block per (row, query head): the chunks combined against the overall
+// maximum, with the zero sink and the output gate.
+__launch_bounds__(kHD) __global__ void AttentionCombineKernel(AttnArgs a) {
+  const int t = threadIdx.x;
+  const int h = blockIdx.x % kNH;
+  const std::size_t b = blockIdx.x / kNH;
+  const RowState row = a.rows[b];
+  const int n = row.pos - row.first + 1;
+  const int chunks = (n + kT - 1) / kT;
+  const std::size_t base = (b * kNH + h) * a.max_chunks;
+  float max = 0.0f;  // the zero sink's logit
+  for (int c = 0; c < chunks; ++c)
+    max = fmaxf(max, a.chunk_max[base + c]);
+  float total = __expf(0.0f - max);
+  float acc = 0.0f;
+  for (int c = 0; c < chunks; ++c) {
+    const float weight = __expf(a.chunk_max[base + c] - max);
+    total += a.chunk_sum[base + c] * weight;
+    acc += a.chunk_out[(base + c) * kHD + t] * weight;
+  }
+  a.out[b * kHQ + h * kHD + t] =
+      acc / total * Sigmoid(a.gate[b * kHQ + h * kHD + t]);
 }
 
 // One block per row.
@@ -1746,6 +1902,12 @@ void GlueB(const GlueBArgs& args, hipStream_t stream) {
 }
 
 void Attention(const AttnArgs& args, hipStream_t stream) {
+  if (args.chunked) {
+    AttentionChunkKernel<<<args.batch * kNKV * args.max_chunks, kT, 0,
+                           stream>>>(args);
+    AttentionCombineKernel<<<args.batch * kNH, kHD, 0, stream>>>(args);
+    return;
+  }
   if (args.window) {
     AttentionWindowKernel<<<args.batch * kNH, kT, 0, stream>>>(args);
     return;

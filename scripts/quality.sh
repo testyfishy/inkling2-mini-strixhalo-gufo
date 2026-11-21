@@ -32,7 +32,8 @@ if [ -z "$SKIP_BASE" ]; then
 fi
 
 # INT8_EXPERTS=0 turns off the engine's 8-bit expert products (on by default).
+# ENGINE_ENV passes further settings to the engine, as "-e NAME=VALUE ...".
 podman run $COMMON -v inkling-gufo-ext:/home/gufo/.local/share/gufo/extensions -v "$OUT":/out:ro \
-  -e INKLING2_INT8_EXPERTS="${INT8_EXPERTS:-1}" \
+  -e INKLING2_INT8_EXPERTS="${INT8_EXPERTS:-1}" $ENGINE_ENV \
   -e INKLING2_KLD=/out/kld-base.bin -e INKLING2_KLD_CHUNKS="$CHUNKS" -e INKLING2_BATCH="$BATCH" \
   ghcr.io/gufo-org/toolboxes/gufo-runtime:edge gufo prompt --model "$MODEL" --prompt x

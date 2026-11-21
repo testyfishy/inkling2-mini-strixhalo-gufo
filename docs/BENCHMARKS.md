@@ -288,6 +288,60 @@ tiles of weights and inputs in fast local memory and use the integer and half-fl
 instructions throughout), so the remaining gap is kernel engineering of that kind, not a limit
 of the machine.
 
+## Context depth, 2026-11-21
+
+The target use is sessions holding 100,000 tokens or more, so speed has to be measured there.
+
+How the depth numbers were taken: a session is given a real 64-token prompt, then its
+full-attention caches are filled to the stated depth by repeating the keys and values it has
+(`INKLING2_FAKE_CONTEXT`). The tokens generated afterwards are meaningless, but the work of
+attending over that much context is real. Correctness at depth is checked separately, against
+llama.cpp on real text, and so far only to 4,096 tokens (see QUALITY.md).
+
+### This extension
+
+| Context depth | Generation, one session (t/s) | Prompt, 64 rows per step (t/s) |
+|---:|---:|---:|
+| short | 25.0 | 145 |
+| 4,000 | 21.3 | 115 |
+| 16,000 | 19.6 | 78 |
+| 50,000 | 16.4 | |
+| 100,000 | 13.3 | 27 |
+
+Before this step, contexts past 1,024 positions used the original attention kernel and
+generation at 100,000 tokens ran at 2.0 tokens/s. Two changes fixed that: a kernel that cuts the
+context into chunks of 1,024 positions and reads each chunk's keys and values once for the three
+query heads that share them, and a cache layout for the full-attention layers in which a block
+of threads reads contiguous memory. Attention at 100,000 tokens now costs 36.7 ms per generated
+token, which is about what reading that cache at this machine's memory bandwidth costs.
+
+### Qwen3.8 Flash-Next on GUFO, same machine, same depths
+
+Measured over HTTP against the production server, one request per depth, MTP drafting on:
+
+| Prompt tokens | Prompt (t/s) | Generation (t/s) |
+|---:|---:|---:|
+| 4,002 | 1,662 | 33.0 |
+| 15,837 | 1,706 | 35.8 |
+| 98,883 | 1,549 | 40.4 |
+
+Qwen's speed is flat with depth. Inkling 2 Mini's is not, and part of that is the model rather
+than this code:
+
+- Inkling 2 Mini has 8 full-attention layer visits per token, each over every earlier position
+  with 8 key/value heads of 128 dimensions. With the cache in F32, generating one token at
+  100,000 tokens of context reads about 6.4 GB of keys and values; at F16 it would be 3.2 GB.
+  At this machine's bandwidth that is roughly 32 ms or 16 ms per token before anything else, so
+  one-token-at-a-time generation at that depth cannot reach Qwen's 40 tokens/s on this hardware.
+  Speculative decoding can share one cache read among several tokens and may recover part of it.
+- Prompt processing at depth costs about 49,000 multiply-adds per earlier token for each new
+  token (4.9 billion at 100,000). Rows of one prompt step can share the cache read, which this
+  code does not do yet (each row reads it again, hence 27 tokens/s), but the arithmetic remains,
+  so matching 1,549 tokens/s at that depth needs kernels several times faster than these.
+
+Memory at depth: the full-attention caches take about 65 KB per token per session in F32
+(6.6 GB at 100,000 tokens), next to about 21 GB of weights.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
