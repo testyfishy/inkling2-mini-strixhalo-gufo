@@ -130,6 +130,7 @@ struct GemmArgs {
   GemmJob jobs[9];
   int count;
   int batch;
+  int variant;  // 0: a block per output row; 1: a thread per output row
 };
 /// Every job's y[b] = W x[b] for every row, in one launch.
 void Gemm(const GemmArgs& args, hipStream_t stream);
@@ -231,6 +232,18 @@ struct BatchExpertArgs {
   float situ_beta, situ_linear_beta;
   bool nvfp4;                   // NVFP4 storage, otherwise BF16
   int batch;
+  // 0: a block per (row, output value); 1: a thread per output value;
+  // 2: expert-major, where each expert's weights are decoded once and applied
+  //    to every row that selected it (NVFP4 only; BF16 uses 0).
+  int variant;
+  // Expert-major scratch: for each expert, the (row * kTopK + slot) pairs that
+  // selected it (group_list, max_batch entries per expert) and how many
+  // (group_count), and each pair's weighted down projection (contrib, kE per
+  // pair).
+  std::int32_t* group_list;
+  std::int32_t* group_count;
+  float* contrib;
+  int max_batch;
 };
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream);
 
@@ -269,5 +282,14 @@ struct CopyArgs {
   int batch;
 };
 void Copy(const CopyArgs& args, hipStream_t stream);
+
+/// Tuning aid: y[r][b] = sum over 4 * words bytes of w[r] * x[b] with 8-bit
+/// integer dot products, the inputs column-major as for Gemm (one 32-bit word
+/// of four values per row, kGemmGroup rows per column).
+void Dot4Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
+               int words, int batch, int* y, hipStream_t stream);
+/// The same shape in F32: y[r][b] = sum of w[r][c] * x[b][c].
+void FloatBench(const float* w, const float* xt, int rows, int cols, int batch,
+                float* y, hipStream_t stream);
 
 }  // namespace inkling2::gpu

@@ -62,8 +62,12 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       prompts at 49 tokens/s
 - [x] Quality harness: perplexity 7.793 vs 7.778, mean KLD 0.0021 and 98.19% top-token
       agreement against llama.cpp on wikitext-2 (see [docs/QUALITY.md](docs/QUALITY.md))
-- [ ] M4b: expert kernels that share work across rows and decode NVFP4 faster (70% of a
-      batched step), then prompt processing at a competitive rate
+- [x] M4b: expert-major kernels: each expert's weights are decoded once per step for all the
+      rows that selected it. On real text, 8 sessions reach 46.5 tokens/s total (was 37.9) and
+      prompts 76 to 83 tokens/s (was 47 to 49), with identical output
+- [ ] M4b2: prompt processing at a competitive rate (llama.cpp: 346 to 520 tokens/s). Next
+      candidate: 8-bit integer dot products in the expert kernels, measured at 2.7 times the
+      float rate, judged by the quality harness
 - [ ] M4c: speculative decoding with the model's DSpark drafter
 - [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)

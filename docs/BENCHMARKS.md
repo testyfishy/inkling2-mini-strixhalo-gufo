@@ -175,6 +175,61 @@ about 190 billion in the experts. Both are well below what this GPU can do. The 
 70% of a batched step and are the next target: rows that select the same expert should share
 one decode of its weights, and the decode itself needs to be cheaper.
 
+## Extension, expert-major kernels, 2026-11-21
+
+Each expert's NVFP4 weights are now decoded once per step and applied to every row that selected
+that expert, instead of each row decoding its own eight experts. Used from 4 rows up.
+
+These runs use real text: each session's prompt is a different 64-token chunk of wikitext-2
+(test), then 48 greedy tokens. The earlier tables used a repeating 5-token prompt, which makes
+sessions pick the same experts and flatters any kernel that shares work between rows; that
+prompt gave 71.6 tokens/s for 16 sessions here, and is not a fair figure.
+
+### Several sessions decoded together (real text)
+
+| Sessions | Total (t/s) | Per session (t/s) | Without expert-major |
+|---:|---:|---:|---:|
+| 1 | 18.5 | 18.5 | same kernels |
+| 4 | 34.7 | 8.7 | |
+| 8 | 46.5 | 5.8 | 37.9 |
+| 16 (8 distinct chunks, each used twice) | 62.2 | 3.9 | |
+
+The 16-session row repeats prompts, so it overstates what 16 unrelated sessions would get.
+
+### Prompt processing (real text)
+
+| Feeding | Prompt (t/s) | Without expert-major |
+|---|---:|---:|
+| 64-token prompt, 16 rows per step | 76 | 49 |
+| 500-token prompt, 64 rows per step | 83 | 47 |
+| llama.cpp HIP, same file (baseline) | 346 to 520 | |
+
+Output is unchanged: the logits and greedy tokens are identical with and without the new
+kernels, and the quality harness gives the same result (perplexity 7.7928, mean KLD 0.0021,
+98.19% same top token).
+
+### What was tried and rejected
+
+One GPU thread per output value, with no shared-memory reduction and far fewer thread blocks,
+was 2 to 25 times slower than one block per output value (correct output, so it is still in the
+code behind `INKLING2_EXPERT_VARIANT=1` and `INKLING2_GEMM_VARIANT=1`). On this GPU adjacent
+threads need to read adjacent memory.
+
+### Integer dot products
+
+A micro-benchmark in the shape of the batched matrix kernel (`INKLING2_DOTBENCH=1`):
+
+| Arithmetic | 1 row | 4 rows | 16 rows |
+|---|---:|---:|---:|
+| F32 multiply-add | 49 | 182 | 420 |
+| 8-bit integer dot product (4 values per instruction) | 123 | 552 | 1,137 |
+
+Billions of multiply-adds per second. The integer instruction gives about 2.7 times the float
+rate at 16 rows. Using it means quantizing activations to 8 bits inside the expert products,
+which is what llama.cpp's fast path does; the weights would stay exact (NVFP4 values are small
+integers times a scale). That is not built; it is the next candidate for prompt speed and would
+be judged by the quality harness.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

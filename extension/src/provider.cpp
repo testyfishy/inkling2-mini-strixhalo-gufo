@@ -184,8 +184,39 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
   std::vector<std::uint32_t> tokens;
   for (int r = 0; r < repeat; ++r)
     tokens.insert(tokens.end(), base.begin(), base.end());
-  const std::size_t n = tokens.size();
-  auto prompt_token = [&](int session, std::size_t i) {
+  // INKLING2_TEXT names a llama-perplexity logits file; its token chunks then
+  // serve as prompts, a different chunk per session, INKLING2_PROMPT_LEN
+  // tokens each. That gives sessions real, different text.
+  std::vector<std::int32_t> text;
+  std::int32_t text_ctx = 0, text_chunks = 0;
+  if (const char* path = std::getenv("INKLING2_TEXT")) {
+    std::FILE* file = std::fopen(path, "rb");
+    char magic[8];
+    std::int32_t vocab = 0;
+    const bool ok = file && std::fread(magic, 1, 8, file) == 8 &&
+                    std::fread(&text_ctx, 4, 1, file) == 1 &&
+                    std::fread(&vocab, 4, 1, file) == 1 &&
+                    std::fread(&text_chunks, 4, 1, file) == 1;
+    if (ok) {
+      text.resize(std::size_t(text_ctx) * text_chunks);
+      if (std::fread(text.data(), 4, text.size(), file) != text.size())
+        text.clear();
+    }
+    if (file)
+      std::fclose(file);
+    if (text.empty()) {
+      std::fprintf(stderr, "inkling2: cannot read prompts from %s\n", path);
+      return 1;
+    }
+  }
+  const std::size_t n =
+      text.empty() ? tokens.size()
+                   : static_cast<std::size_t>(std::min<int>(
+                         text_ctx, EnvInt("INKLING2_PROMPT_LEN", 64)));
+  auto prompt_token = [&](int session, std::size_t i) -> std::uint32_t {
+    if (!text.empty())
+      return static_cast<std::uint32_t>(
+          text[std::size_t((session + rotate) % text_chunks) * text_ctx + i]);
     return tokens[(i + static_cast<std::size_t>(session + rotate)) % n];
   };
 

@@ -64,6 +64,36 @@ __device__ inline float DotNvfp4Block(const std::uint8_t* block,
   return sum;
 }
 
+// E2M1 values, doubled, indexed by the 4-bit code.
+constexpr float kFp4Table[16] = {0.0f,  1.0f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                 8.0f,  12.0f, -0.0f, -1.0f, -2.0f, -3.0f,
+                                 -4.0f, -6.0f, -8.0f, -12.0f};
+
+// Dot product of one 64-value NVFP4 block with x, reading the block as nine
+// 32-bit words (blocks are 36 bytes, so they stay 4-byte aligned) and
+// decoding the codes through the table.
+__device__ inline float DotNvfp4Words(const std::uint8_t* block,
+                                      const float* x) {
+  const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(block);
+  const std::uint32_t scales = w[0];
+  float sum = 0.0f;
+  for (int s = 0; s < 4; ++s) {
+    const float d = Ue4m3((scales >> (8 * s)) & 0xFFu);
+    const float* xs = x + s * 16;
+    float part = 0.0f;
+    for (int half = 0; half < 2; ++half) {
+      const std::uint32_t word = w[1 + 2 * s + half];
+      for (int j = 0; j < 4; ++j) {
+        const std::uint32_t q = (word >> (8 * j)) & 0xFFu;
+        part += kFp4Table[q & 15u] * xs[half * 4 + j] +
+                kFp4Table[q >> 4] * xs[half * 4 + j + 8];
+      }
+    }
+    sum += part * d;
+  }
+  return sum;
+}
+
 __device__ inline float Situ(float gate, float up, float beta, float lb) {
   return beta * tanhf(gate / beta) * Sigmoid(gate) * lb * tanhf(up / lb);
 }
@@ -722,6 +752,306 @@ __launch_bounds__(64) __global__ void ExpertDownBf16Kernel(BatchExpertArgs a) {
     a.out[b * kE + i] = shared[0];
 }
 
+// ---- expert-major variant --------------------------------------------------
+
+// One 64-value NVFP4 block as F32, each value already times its sub-block
+// scale.
+__device__ inline void DecodeNvfp4(const std::uint8_t* block, float* out) {
+  const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(block);
+  const std::uint32_t scales = w[0];
+  for (int s = 0; s < 4; ++s) {
+    const float d = Ue4m3((scales >> (8 * s)) & 0xFFu);
+    for (int half = 0; half < 2; ++half) {
+      const std::uint32_t word = w[1 + 2 * s + half];
+      for (int j = 0; j < 4; ++j) {
+        const std::uint32_t q = (word >> (8 * j)) & 0xFFu;
+        out[s * 16 + half * 4 + j] = Fp4(q & 15u) * d;
+        out[s * 16 + half * 4 + j + 8] = Fp4(q >> 4) * d;
+      }
+    }
+  }
+}
+
+// For each expert, the pairs (row * kTopK + slot) that selected it. One block,
+// one thread per expert.
+__launch_bounds__(kNX) __global__ void ExpertGroupKernel(BatchExpertArgs a) {
+  const int e = threadIdx.x;
+  const int pairs = a.batch * kTopK;
+  std::int32_t* list = a.group_list + static_cast<std::size_t>(e) * a.max_batch;
+  int n = 0;
+  for (int p = 0; p < pairs; ++p)
+    if (a.ids[p] == static_cast<std::uint32_t>(e))
+      list[n++] = p;
+  a.group_count[e] = n;
+}
+
+constexpr int kMajorRows = 16;  // rows sharing one decode per pass
+
+// One block per (expert, hidden unit): the gate row and the up row are decoded
+// once, then applied to every row that selected the expert.
+__launch_bounds__(64) __global__ void ExpertUpNvfp4MajorKernel(
+    BatchExpertArgs a) {
+  constexpr int kThreads = 64;
+  __shared__ float sg[kMajorRows][kThreads];
+  __shared__ float su[kMajorRows][kThreads];
+  const int t = threadIdx.x;
+  const int k = blockIdx.x % kFF;
+  const int e = blockIdx.x / kFF;
+  const int n = a.group_count[e];
+  if (n == 0)
+    return;
+  const std::int32_t* list =
+      a.group_list + static_cast<std::size_t>(e) * a.max_batch;
+  constexpr int kBlocks = kE / kNvfp4Values;
+  constexpr std::size_t kRowBytes = static_cast<std::size_t>(kBlocks) * kNvfp4Bytes;
+  const std::uint8_t* base =
+      a.gate_up + static_cast<std::size_t>(e) * 2 * kFF * kRowBytes;
+  const bool active = t < kBlocks;
+  float wg[kNvfp4Values], wu[kNvfp4Values];
+  if (active) {
+    DecodeNvfp4(base + k * kRowBytes + t * kNvfp4Bytes, wg);
+    DecodeNvfp4(base + (kFF + k) * kRowBytes + t * kNvfp4Bytes, wu);
+  }
+  for (int r0 = 0; r0 < n; r0 += kMajorRows) {
+    const int nr = n - r0 < kMajorRows ? n - r0 : kMajorRows;
+    for (int r = 0; r < nr; ++r) {
+      float g = 0.0f, u = 0.0f;
+      if (active) {
+        const float* x = a.x +
+                         static_cast<std::size_t>(list[r0 + r] / kTopK) * kE +
+                         t * kNvfp4Values;
+        for (int i = 0; i < kNvfp4Values; ++i) {
+          g += wg[i] * x[i];
+          u += wu[i] * x[i];
+        }
+      }
+      sg[r][t] = g;
+      su[r][t] = u;
+    }
+    __syncthreads();
+    for (int step = kThreads / 2; step > 0; step >>= 1) {
+      if (t < step)
+        for (int r = 0; r < nr; ++r) {
+          sg[r][t] += sg[r][t + step];
+          su[r][t] += su[r][t + step];
+        }
+      __syncthreads();
+    }
+    if (t == 0)
+      for (int r = 0; r < nr; ++r) {
+        const int pair = list[r0 + r];
+        const float scale = a.up_scale[pair];
+        a.act[static_cast<std::size_t>(pair) * kFF + k] = Situ(
+            sg[r][0] * scale, su[r][0] * scale, a.situ_beta, a.situ_linear_beta);
+      }
+    __syncthreads();
+  }
+}
+
+// One block per (expert, output value): the down row is decoded once, then
+// applied to every row that selected the expert.
+__launch_bounds__(32) __global__ void ExpertDownNvfp4MajorKernel(
+    BatchExpertArgs a) {
+  constexpr int kThreads = 32;
+  __shared__ float sh[kMajorRows][kThreads];
+  const int t = threadIdx.x;
+  const int i = blockIdx.x % kE;
+  const int e = blockIdx.x / kE;
+  const int n = a.group_count[e];
+  if (n == 0)
+    return;
+  const std::int32_t* list =
+      a.group_list + static_cast<std::size_t>(e) * a.max_batch;
+  constexpr int kBlocks = kFF / kNvfp4Values;
+  constexpr std::size_t kRowBytes = static_cast<std::size_t>(kBlocks) * kNvfp4Bytes;
+  const bool active = t < kBlocks;
+  float w[kNvfp4Values];
+  if (active)
+    DecodeNvfp4(a.down + (static_cast<std::size_t>(e) * kE + i) * kRowBytes +
+                    t * kNvfp4Bytes,
+                w);
+  for (int r0 = 0; r0 < n; r0 += kMajorRows) {
+    const int nr = n - r0 < kMajorRows ? n - r0 : kMajorRows;
+    for (int r = 0; r < nr; ++r) {
+      float acc = 0.0f;
+      if (active) {
+        const float* act = a.act +
+                           static_cast<std::size_t>(list[r0 + r]) * kFF +
+                           t * kNvfp4Values;
+        for (int j = 0; j < kNvfp4Values; ++j)
+          acc += w[j] * act[j];
+      }
+      sh[r][t] = acc;
+    }
+    __syncthreads();
+    for (int step = kThreads / 2; step > 0; step >>= 1) {
+      if (t < step)
+        for (int r = 0; r < nr; ++r)
+          sh[r][t] += sh[r][t + step];
+      __syncthreads();
+    }
+    if (t == 0)
+      for (int r = 0; r < nr; ++r) {
+        const int pair = list[r0 + r];
+        a.contrib[static_cast<std::size_t>(pair) * kE + i] =
+            a.coef[pair] * sh[r][0];
+      }
+    __syncthreads();
+  }
+}
+
+// out = the sum of a row's kTopK contributions. One thread per (row, value).
+__global__ void ExpertSumKernel(BatchExpertArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int i = static_cast<int>(idx % kE);
+  const std::size_t b = idx / kE;
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  float acc = 0.0f;
+  for (int j = 0; j < kTopK; ++j)
+    acc += a.contrib[(b * kTopK + j) * kE + i];
+  a.out[idx] = acc;
+}
+
+// ---- thread-per-output variants: no shared memory, no reductions ----------
+
+// One thread per (row, expert, hidden unit).
+__global__ void ExpertUpNvfp4RowKernel(BatchExpertArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int k = static_cast<int>(idx % kFF);
+  const int e = static_cast<int>((idx / kFF) % kTopK);
+  const std::size_t b = idx / (kFF * kTopK);
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  constexpr int kBlocks = kE / kNvfp4Values;
+  constexpr std::size_t kRowBytes = static_cast<std::size_t>(kBlocks) * kNvfp4Bytes;
+  const std::uint8_t* base =
+      a.gate_up + static_cast<std::size_t>(a.ids[b * kTopK + e]) * 2 * kFF * kRowBytes;
+  const std::uint8_t* gate_row = base + k * kRowBytes;
+  const std::uint8_t* up_row = base + (kFF + k) * kRowBytes;
+  const float* x = a.x + b * kE;
+  float g = 0.0f, u = 0.0f;
+  for (int blk = 0; blk < kBlocks; ++blk) {
+    const float* xb = x + blk * kNvfp4Values;
+    g += DotNvfp4Words(gate_row + blk * kNvfp4Bytes, xb);
+    u += DotNvfp4Words(up_row + blk * kNvfp4Bytes, xb);
+  }
+  const float scale = a.up_scale[b * kTopK + e];
+  a.act[(b * kTopK + e) * kFF + k] =
+      Situ(g * scale, u * scale, a.situ_beta, a.situ_linear_beta);
+}
+
+// One thread per (row, output value).
+__global__ void ExpertDownNvfp4RowKernel(BatchExpertArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int i = static_cast<int>(idx % kE);
+  const std::size_t b = idx / kE;
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  constexpr int kBlocks = kFF / kNvfp4Values;
+  constexpr std::size_t kRowBytes = static_cast<std::size_t>(kBlocks) * kNvfp4Bytes;
+  float acc = 0.0f;
+  for (int e = 0; e < kTopK; ++e) {
+    const std::uint8_t* row =
+        a.down +
+        (static_cast<std::size_t>(a.ids[b * kTopK + e]) * kE + i) * kRowBytes;
+    const float* act = a.act + (b * kTopK + e) * kFF;
+    float part = 0.0f;
+    for (int blk = 0; blk < kBlocks; ++blk)
+      part += DotNvfp4Words(row + blk * kNvfp4Bytes, act + blk * kNvfp4Values);
+    acc += a.coef[b * kTopK + e] * part;
+  }
+  a.out[idx] = acc;
+}
+
+__global__ void ExpertUpBf16RowKernel(BatchExpertArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int k = static_cast<int>(idx % kFF);
+  const int e = static_cast<int>((idx / kFF) % kTopK);
+  const std::size_t b = idx / (kFF * kTopK);
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  const std::uint16_t* base =
+      reinterpret_cast<const std::uint16_t*>(a.gate_up) +
+      static_cast<std::size_t>(a.ids[b * kTopK + e]) * 2 * kFF * kE;
+  const std::uint16_t* gate_row = base + static_cast<std::size_t>(k) * kE;
+  const std::uint16_t* up_row = base + static_cast<std::size_t>(kFF + k) * kE;
+  const float* x = a.x + b * kE;
+  float g = 0.0f, u = 0.0f;
+  for (int c = 0; c < kE; ++c) {
+    g += Bf16(gate_row[c]) * x[c];
+    u += Bf16(up_row[c]) * x[c];
+  }
+  const float scale = a.up_scale[b * kTopK + e];
+  a.act[(b * kTopK + e) * kFF + k] =
+      Situ(g * scale, u * scale, a.situ_beta, a.situ_linear_beta);
+}
+
+__global__ void ExpertDownBf16RowKernel(BatchExpertArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int i = static_cast<int>(idx % kE);
+  const std::size_t b = idx / kE;
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  const std::uint16_t* down = reinterpret_cast<const std::uint16_t*>(a.down);
+  float acc = 0.0f;
+  for (int e = 0; e < kTopK; ++e) {
+    const std::uint16_t* row =
+        down + (static_cast<std::size_t>(a.ids[b * kTopK + e]) * kE + i) * kFF;
+    const float* act = a.act + (b * kTopK + e) * kFF;
+    float part = 0.0f;
+    for (int c = 0; c < kFF; ++c)
+      part += Bf16(row[c]) * act[c];
+    acc += a.coef[b * kTopK + e] * part;
+  }
+  a.out[idx] = acc;
+}
+
+// One thread per (output row, group of batch rows).
+__global__ void GemmRowKernel(GemmArgs a, int total_rows) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int groups = (a.batch + kGemmGroup - 1) / kGemmGroup;
+  const int group = static_cast<int>(idx % groups);
+  int r = static_cast<int>(idx / groups), j = 0;
+  if (r >= total_rows)
+    return;
+  while (r >= a.jobs[j].rows) {
+    r -= a.jobs[j].rows;
+    ++j;
+  }
+  const GemmJob job = a.jobs[j];
+  const int b0 = group * kGemmGroup;
+  const int nb = a.batch - b0 < kGemmGroup ? a.batch - b0 : kGemmGroup;
+  const std::uint16_t* row = job.w + static_cast<std::size_t>(r) * job.cols;
+  float acc[kGemmGroup];
+  for (int b = 0; b < nb; ++b)
+    acc[b] = 0.0f;
+  if (job.xt) {
+    const float* xt = job.xt + static_cast<std::size_t>(group) * job.xt_group_stride;
+    for (int c = 0; c < job.cols; ++c) {
+      const float w = Bf16(row[c]);
+      const float* column = xt + static_cast<std::size_t>(c) * kGemmGroup;
+      for (int b = 0; b < nb; ++b)
+        acc[b] += w * column[b];
+    }
+  } else {
+    const float* x = job.x + static_cast<std::size_t>(b0) * job.x_stride;
+    for (int c = 0; c < job.cols; ++c) {
+      const float w = Bf16(row[c]);
+      for (int b = 0; b < nb; ++b)
+        acc[b] += w * x[static_cast<std::size_t>(b) * job.x_stride + c];
+    }
+  }
+  for (int b = 0; b < nb; ++b)
+    job.y[static_cast<std::size_t>(b0 + b) * job.y_stride + r] = acc[b];
+}
+
 // One thread per (row, channel).
 __global__ void GlueDKernel(GlueDArgs a) {
   const std::size_t idx =
@@ -762,11 +1092,82 @@ __global__ void CopyKernel(CopyArgs a) {
     a.dst[k][b * a.dst_stride[k] + i] = value[k];
 }
 
+constexpr int kBenchThreads = 128;
+__launch_bounds__(kBenchThreads) __global__ void Dot4BenchKernel(
+    const std::uint32_t* __restrict__ w, const std::uint32_t* __restrict__ xt,
+    int words, int batch, int* __restrict__ y) {
+  __shared__ int sh[kGemmGroup][kBenchThreads];
+  const int t = threadIdx.x;
+  const std::uint32_t* row = w + static_cast<std::size_t>(blockIdx.x) * words;
+  int acc[kGemmGroup];
+  for (int b = 0; b < batch; ++b)
+    acc[b] = 0;
+  for (int c = t; c < words; c += kBenchThreads) {
+    const int wv = static_cast<int>(row[c]);
+    const std::uint32_t* column = xt + static_cast<std::size_t>(c) * kGemmGroup;
+    for (int b = 0; b < batch; ++b)
+      acc[b] = __builtin_amdgcn_sudot4(true, wv, true,
+                                       static_cast<int>(column[b]), acc[b],
+                                       false);
+  }
+  for (int b = 0; b < batch; ++b)
+    sh[b][t] = acc[b];
+  __syncthreads();
+  for (int step = kBenchThreads / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int b = 0; b < batch; ++b)
+        sh[b][t] += sh[b][t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    for (int b = 0; b < batch; ++b)
+      y[static_cast<std::size_t>(blockIdx.x) * kGemmGroup + b] = sh[b][0];
+}
+
+__launch_bounds__(kBenchThreads) __global__ void FloatBenchKernel(
+    const float* __restrict__ w, const float* __restrict__ xt, int cols,
+    int batch, float* __restrict__ y) {
+  __shared__ float sh[kGemmGroup][kBenchThreads];
+  const int t = threadIdx.x;
+  const float* row = w + static_cast<std::size_t>(blockIdx.x) * cols;
+  float acc[kGemmGroup];
+  for (int b = 0; b < batch; ++b)
+    acc[b] = 0.0f;
+  for (int c = t; c < cols; c += kBenchThreads) {
+    const float wv = row[c];
+    const float* column = xt + static_cast<std::size_t>(c) * kGemmGroup;
+    for (int b = 0; b < batch; ++b)
+      acc[b] += wv * column[b];
+  }
+  for (int b = 0; b < batch; ++b)
+    sh[b][t] = acc[b];
+  __syncthreads();
+  for (int step = kBenchThreads / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int b = 0; b < batch; ++b)
+        sh[b][t] += sh[b][t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    for (int b = 0; b < batch; ++b)
+      y[static_cast<std::size_t>(blockIdx.x) * kGemmGroup + b] = sh[b][0];
+}
+
 inline int Blocks(std::size_t items, int per_block) {
   return static_cast<int>((items + per_block - 1) / per_block);
 }
 
 }  // namespace
+
+void Dot4Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
+               int words, int batch, int* y, hipStream_t stream) {
+  Dot4BenchKernel<<<rows, kBenchThreads, 0, stream>>>(w, xt, words, batch, y);
+}
+
+void FloatBench(const float* w, const float* xt, int rows, int cols, int batch,
+                float* y, hipStream_t stream) {
+  FloatBenchKernel<<<rows, kBenchThreads, 0, stream>>>(w, xt, cols, batch, y);
+}
 
 void Embed(const EmbedArgs& args, hipStream_t stream) {
   EmbedKernel<<<args.batch, kT, 0, stream>>>(args);
@@ -795,6 +1196,11 @@ void Gemm(const GemmArgs& args, hipStream_t stream) {
   for (int j = 0; j < args.count; ++j)
     rows += args.jobs[j].rows;
   const int groups = (args.batch + kGemmGroup - 1) / kGemmGroup;
+  if (args.variant == 1) {
+    GemmRowKernel<<<Blocks(std::size_t(rows) * groups, 256), 256, 0, stream>>>(
+        args, rows);
+    return;
+  }
   GemmKernel<<<rows * groups, kGemmThreads, 0, stream>>>(args);
 }
 
@@ -821,6 +1227,26 @@ void Router(const RouterArgs& args, hipStream_t stream) {
 }
 
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream) {
+  if (args.variant == 2 && args.nvfp4) {
+    ExpertGroupKernel<<<1, kNX, 0, stream>>>(args);
+    ExpertUpNvfp4MajorKernel<<<kNX * kFF, 64, 0, stream>>>(args);
+    ExpertDownNvfp4MajorKernel<<<kNX * kE, 32, 0, stream>>>(args);
+    ExpertSumKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0,
+                      stream>>>(args);
+    return;
+  }
+  if (args.variant == 1) {
+    const int up = Blocks(std::size_t(args.batch) * kTopK * kFF, 256);
+    const int down = Blocks(std::size_t(args.batch) * kE, 256);
+    if (args.nvfp4) {
+      ExpertUpNvfp4RowKernel<<<up, 256, 0, stream>>>(args);
+      ExpertDownNvfp4RowKernel<<<down, 256, 0, stream>>>(args);
+    } else {
+      ExpertUpBf16RowKernel<<<up, 256, 0, stream>>>(args);
+      ExpertDownBf16RowKernel<<<down, 256, 0, stream>>>(args);
+    }
+    return;
+  }
   if (args.nvfp4) {
     ExpertUpNvfp4Kernel<<<args.batch * kTopK * kFF, 64, 0, stream>>>(args);
     ExpertDownNvfp4Kernel<<<args.batch * kE, 32, 0, stream>>>(args);

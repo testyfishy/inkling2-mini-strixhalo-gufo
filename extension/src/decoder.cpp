@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -73,8 +74,11 @@ struct GpuEngine::Impl {
       *bank_out{}, *q{}, *r{}, *gate{}, *sink{}, *k_raw{}, *v_raw{}, *k_taps{},
       *v_taps{}, *attn{}, *proj{}, *xn{}, *sel_up{}, *sel_coef{}, *act{},
       *moe{}, *scratch{}, *final_x{}, *logits{}, *low{}, *router_logits{},
-      *xt_in{}, *xt_attn{};
+      *xt_in{}, *xt_attn{}, *contrib{};
+  std::int32_t *group_list{}, *group_count{};
+  int major_min_batch{4};
   bool transpose{true};
+  int gemm_variant{0}, expert_variant{0};
   std::uint32_t* sel_ids{};
   // Per-step staging: the row states of every visit, the tokens, the head rows.
   void* staging{};
@@ -287,6 +291,15 @@ struct GpuEngine::Impl {
     xt_attn = Floats(groups * kHQ * gpu::kGemmGroup);
     if (const char* v = std::getenv("INKLING2_NO_TRANSPOSE"); v && *v == '1')
       transpose = false;
+    if (const char* v = std::getenv("INKLING2_GEMM_VARIANT"))
+      gemm_variant = std::atoi(v);
+    if (const char* v = std::getenv("INKLING2_EXPERT_VARIANT"))
+      expert_variant = std::atoi(v);
+    contrib = Floats(B * kTopK * kE);
+    group_list = static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * B * 4));
+    group_count = static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * 4));
+    if (const char* v = std::getenv("INKLING2_MAJOR_MIN_BATCH"))
+      major_min_batch = std::atoi(v);
     low = Floats(B * 3 * kRank);
     router_logits = Floats(B * kNX);
     const std::size_t heads_cap = std::max<std::size_t>(opt.sessions, B);
@@ -303,6 +316,49 @@ struct GpuEngine::Impl {
         static_cast<const std::uint8_t*>(staging) + off_tokens);
     dev_heads = reinterpret_cast<const std::int32_t*>(
         static_cast<const std::uint8_t*>(staging) + off_heads);
+    if (std::getenv("INKLING2_DOTBENCH"))
+      DotBench();
+  }
+
+  // Tuning aid: throughput of 8-bit integer dot products against F32
+  // multiply-adds, in the shape of the batched matrix kernel.
+  void DotBench() {
+    const int rows = 32768, cols = 2304, words = cols / 4;
+    auto* w8 = static_cast<std::uint32_t*>(Alloc(std::size_t(rows) * words * 4));
+    auto* x8 = static_cast<std::uint32_t*>(
+        Alloc(std::size_t(words) * gpu::kGemmGroup * 4));
+    auto* y8 = static_cast<int*>(Alloc(std::size_t(rows) * gpu::kGemmGroup * 4));
+    float* wf = Floats(std::size_t(rows) * cols);
+    float* xf = Floats(std::size_t(cols) * gpu::kGemmGroup);
+    float* yf = Floats(std::size_t(rows) * gpu::kGemmGroup);
+    Check(hipMemset(w8, 3, std::size_t(rows) * words * 4), "fill");
+    Check(hipMemset(x8, 5, std::size_t(words) * gpu::kGemmGroup * 4), "fill");
+    Check(hipMemset(wf, 0, std::size_t(rows) * cols * 4), "fill");
+    Check(hipMemset(xf, 0, std::size_t(cols) * gpu::kGemmGroup * 4), "fill");
+    for (const int rows_in_batch : {1, 4, 16}) {
+      for (int kind = 0; kind < 2; ++kind) {
+        const int repeats = 20;
+        Check(hipStreamSynchronize(stream), "synchronize");
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i) {
+          if (kind == 0)
+            gpu::Dot4Bench(w8, x8, rows, words, rows_in_batch, y8, stream);
+          else
+            gpu::FloatBench(wf, xf, rows, cols, rows_in_batch, yf, stream);
+        }
+        Check(hipStreamSynchronize(stream), "synchronize");
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        const double macs = double(rows) * cols * rows_in_batch * repeats;
+        const double bytes = double(rows) * cols * (kind == 0 ? 1 : 4) * repeats;
+        std::fprintf(stderr,
+                     "dot bench: %-5s %2d row(s): %7.1f G multiply-adds/s, "
+                     "%6.1f GB/s of weights\n",
+                     kind == 0 ? "int8" : "f32", rows_in_batch,
+                     macs / seconds / 1e9, bytes / seconds / 1e9);
+      }
+    }
   }
 
   ~Impl() {
@@ -379,6 +435,7 @@ struct GpuEngine::Impl {
       g.count = 8;
     }
     g.batch = batch;
+    g.variant = gemm_variant;
     // Above one row, the kernel reads a column-major copy of the inputs.
     const bool use_xt = transpose && batch > 1;
     if (use_xt) {
@@ -437,6 +494,7 @@ struct GpuEngine::Impl {
     o.jobs[0] = {l.wo, attn, kHQ, proj, kE, kE, kHQ};
     o.count = 1;
     o.batch = batch;
+    o.variant = gemm_variant;
     if (use_xt) {
       gpu::TransposeArgs tr{};
       tr.x = attn;
@@ -517,6 +575,14 @@ struct GpuEngine::Impl {
     e.situ_linear_beta = c.situ_linear_beta;
     e.nvfp4 = l.nvfp4;
     e.batch = batch;
+    // Expert-major pays off once rows share experts; alone, a row's eight
+    // experts are cheaper to visit directly.
+    e.variant = expert_variant == 0 && batch >= major_min_batch ? 2
+                                                               : expert_variant;
+    e.group_list = group_list;
+    e.group_count = group_count;
+    e.contrib = contrib;
+    e.max_batch = static_cast<int>(opt.max_batch);
     gpu::BatchExperts(e, stream);
     Mark(l.nvfp4 ? 6 : 7);
 
