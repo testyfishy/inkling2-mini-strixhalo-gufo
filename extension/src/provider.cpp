@@ -446,6 +446,96 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                     replay == truth ? "EQUALS" : "DIFFERS FROM");
         std::printf("%c", 10);
       }
+      if (const int k = std::min(EnvInt("INKLING2_LOOKUP", 0), 15);
+          k > 0 && sessions == 1) {
+        // Generate again from scratch with drafts copied from the context:
+        // when the last tokens also occur earlier, what followed them there
+        // is proposed, and the model verifies the proposals in one step.
+        const int min_match = std::max(1, EnvInt("INKLING2_LOOKUP_MIN", 3));
+        engine.Reset(0);
+        std::vector<std::uint32_t> ctx;
+        for (std::size_t i = 0; i < n; i += prompt_batch) {
+          std::vector<inkling2::GpuEngine::Row> rows;
+          for (std::size_t j = i; j < std::min(n, i + prompt_batch); ++j) {
+            rows.push_back({0, prompt_token(0, j)});
+            ctx.push_back(rows.back().token);
+          }
+          engine.Step(rows, i + prompt_batch >= n);
+        }
+        const std::vector<std::uint32_t>& truth = out[0];
+        std::vector<std::uint32_t> replay;
+        std::uint32_t current = engine.argmax(0);
+        int steps = 0, kept = 0, proposed = 0, plain_steps = 0;
+        // How many drafts to risk: it grows while every draft is kept and
+        // falls back when one is refused; after a step that kept none, a few
+        // steps go without drafts unless the match is long.
+        int budget = std::min(k, 3), cooldown = 0;
+        const auto lookup_start = std::chrono::steady_clock::now();
+        while (replay.size() < truth.size()) {
+          replay.push_back(current);
+          ctx.push_back(current);
+          // The most recent earlier place where the longest suffix (up to 16
+          // tokens, at least min_match) occurs.
+          std::size_t follow = 0;
+          const std::size_t size = ctx.size();
+          int best = 0;
+          for (std::size_t end = size - 1; end-- > 0 && best < 16;) {
+            int m = 0;
+            while (m < 16 && static_cast<std::size_t>(m) <= end &&
+                   ctx[end - m] == ctx[size - 1 - m])
+              ++m;
+            if (m > best) {
+              best = m;
+              follow = end + 1;
+            }
+          }
+          std::vector<inkling2::GpuEngine::Row> rows{{0, current}};
+          if (best >= min_match && (cooldown == 0 || best >= 8))
+            for (int d = 0; d < budget && follow + d < size; ++d)
+              rows.push_back({0, ctx[follow + d]});
+          proposed += static_cast<int>(rows.size()) - 1;
+          plain_steps += rows.size() == 1 ? 1 : 0;
+          engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
+          std::size_t good = 0;
+          while (good + 1 < rows.size() &&
+                 engine.argmax(good) == rows[good + 1].token)
+            ++good;
+          current = engine.argmax(good);
+          for (std::size_t i = 1; i <= good && replay.size() < truth.size(); ++i) {
+            replay.push_back(rows[i].token);
+            ctx.push_back(rows[i].token);
+          }
+          engine.Accept(0, static_cast<std::uint32_t>(good + 1));
+          kept += static_cast<int>(good);
+          ++steps;
+          if (rows.size() == 1) {
+            cooldown = std::max(0, cooldown - 1);
+          } else if (good + 1 == rows.size()) {
+            budget = std::min(k, 2 * budget + 1);
+            cooldown = 0;
+          } else {
+            budget = std::max<int>(1, static_cast<int>(good));
+            cooldown = good == 0 ? 4 : 0;
+          }
+        }
+        replay.resize(truth.size());
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          lookup_start)
+                .count();
+        std::size_t same = 0;
+        while (same < truth.size() && replay[same] == truth[same])
+          ++same;
+        std::printf("lookup drafting: %zu tokens in %d steps (%d without a "
+                    "draft) in %.2f s: %.1f tokens/s; %d of %d drafts kept; "
+                    "output %s plain generation",
+                    truth.size(), steps, plain_steps, seconds,
+                    truth.size() / seconds, kept, proposed,
+                    same == truth.size() ? "EQUALS" : "DIFFERS FROM");
+        if (same < truth.size())
+          std::printf(" (from token %zu)", same);
+        std::printf("%c", 10);
+      }
       if (dspark) {
         // Generate the same tokens again, this time with the drafter
         // proposing tokens and the model verifying them in one step.
