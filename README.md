@@ -84,11 +84,13 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [x] M4c2: drafts copied from the context (prompt lookup), in the development driver: 81
       tokens/s on text the model copies (75 at 30K context), 30 on an article continuation,
       23 where nothing repeats (plain: 23.6)
-- [ ] M4b6: speed at depth is set by the 33 KB every generated token reads per token of
-      context; on encyclopedia text the attention weights are too spread out to skip any of
-      it (docs/BENCHMARKS.md; code and agent logs not measured yet). What is left: a single-pass generation kernel at the memory's rate,
-      drafts verified several per read, drafts copied from the context, and saved contexts so
-      that no prefix is processed twice
+- [x] M4d: a session can be saved and restored (32,768 tokens: 0.06 s to restore instead of
+      39 s to process again). A prefix cache on top of it is not built
+- [ ] M4b6: what is left for speed with the weights as they are: the batched attention kernel
+      at depth (368 tokens/s for prompts at 100K; its matrix instructions run at half the rate
+      of the projection kernel's, cause unknown), fewer small kernels per token (about 8 of
+      40 ms), a prefix cache, and a serving runner (tokenizer, chat template, API) so that all
+      of this is usable outside the development driver
 - [ ] M4c: speculative decoding with the model's DSpark drafter. Done so far: tentative steps
       in the engine, and a CPU prototype of the drafter whose acceptance matches llama.cpp's
       (2.0 to 4.4 tokens per step depending on the text; [docs/DSPARK.md](docs/DSPARK.md)).
