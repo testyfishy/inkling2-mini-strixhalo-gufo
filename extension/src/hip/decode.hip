@@ -412,6 +412,180 @@ __launch_bounds__(kGemmThreads) __global__ void GemmKernel(GemmArgs a) {
 }
 
 // One thread per (row, column).
+__global__ void ToHalfKernel(ToHalfArgs a) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t b = i / a.cols, c = i % a.cols;
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  float v = a.x[b * a.x_stride + c];
+  v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+  reinterpret_cast<_Float16*>(a.out)[i] = static_cast<_Float16>(v);
+}
+
+// The projections with the 16x16x16 FP16 matrix instruction, FP32 sums.
+// A block is 8 waves; each wave owns 16 output rows of one job and WTS tiles
+// of 16 batch rows, and walks the inputs 16 columns at a time. Lane l (and
+// lane l + 16, which mirrors it) holds weight row l and batch row l of each
+// tile; in the result, lane l holds output row l, and element e of lane
+// l + 16 * h is batch row 2 * e + h.
+using Half16 = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using Float8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+template <int WTS>
+__launch_bounds__(256) __global__ void WmmaGemmKernel(GemmArgs a) {
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  const int sl = lane & 15, hi = lane >> 4;
+  int tile = blockIdx.x * 8 + wave, j = 0;
+  for (;;) {
+    const int tiles = (a.jobs[j].rows + 15) >> 4;
+    if (tile < tiles)
+      break;
+    tile -= tiles;
+    if (++j == a.count)
+      return;
+  }
+  const GemmJob job = a.jobs[j];
+  const int r = tile * 16 + sl;
+  const _Float16* w = reinterpret_cast<const _Float16*>(job.wh) +
+                      static_cast<std::size_t>(r < job.rows ? r : job.rows - 1) *
+                          job.cols;
+  const int t0 = blockIdx.y * 16 * WTS;
+  const _Float16* x[WTS];
+#pragma unroll
+  for (int g = 0; g < WTS; ++g) {
+    const int t = t0 + g * 16 + sl;
+    x[g] = reinterpret_cast<const _Float16*>(job.xh) +
+           static_cast<std::size_t>(t < a.batch ? t : a.batch - 1) *
+               job.xh_stride;
+  }
+  Float8 acc[WTS] = {};
+  for (int k = 0; k < job.cols; k += 16) {
+    Half16 wa;
+    __builtin_memcpy(&wa, w + k, 32);
+#pragma unroll
+    for (int g = 0; g < WTS; ++g) {
+      Half16 xb;
+      __builtin_memcpy(&xb, x[g] + k, 32);
+      acc[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[g]);
+    }
+  }
+  if (r >= job.rows)
+    return;
+#pragma unroll
+  for (int g = 0; g < WTS; ++g)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int t = t0 + g * 16 + 2 * e + hi;
+      if (t < a.batch)
+        job.y[static_cast<std::size_t>(t) * job.y_stride + r] = acc[g][e];
+    }
+}
+
+// The same product for larger steps: a block owns 128 output rows of one job
+// and 32 * WTS batch rows. It walks the inputs 64 columns at a time: all
+// threads first copy that slice of the weights and of the inputs into shared
+// memory, then each of the 8 waves multiplies 2 row tiles by WTS batch tiles
+// out of shared memory. Every weight and input value is read from global
+// memory once per block.
+template <int WTS>
+__launch_bounds__(256) __global__ void WmmaGemmBlockKernel(GemmArgs a) {
+  constexpr int BM = 128, BN = 32 * WTS, BK = 4;
+  __shared__ std::uint32_t s_a[BK][BM][8];
+  __shared__ std::uint32_t s_b[BK][BN][8];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, wave = tid >> 5;
+  const int sl = lane & 15, hi = lane >> 4;
+  const int wr = wave >> 1, wt = wave & 1;
+  int block = blockIdx.x, j = 0;
+  for (;;) {
+    const int blocks = (a.jobs[j].rows + BM - 1) / BM;
+    if (block < blocks)
+      break;
+    block -= blocks;
+    if (++j == a.count)
+      return;
+  }
+  const GemmJob job = a.jobs[j];
+  const int r_block = block * BM, t_block = blockIdx.y * BN;
+  // The slices this thread copies: units of 16 values, 4 per row.
+  constexpr int UA = BM * BK / 256;
+  constexpr int UB = (BN * BK + 255) / 256;
+  const std::uint32_t* w_src[UA];
+  const std::uint32_t* x_src[UB];
+#pragma unroll
+  for (int p = 0; p < UA; ++p) {
+    const int unit = p * 256 + tid, r = r_block + unit / BK;
+    w_src[p] = reinterpret_cast<const std::uint32_t*>(
+        job.wh + static_cast<std::size_t>(r < job.rows ? r : job.rows - 1) *
+                     job.cols +
+        (unit % BK) * 16);
+  }
+#pragma unroll
+  for (int p = 0; p < UB; ++p) {
+    const int unit = p * 256 + tid, t = t_block + unit / BK;
+    x_src[p] = reinterpret_cast<const std::uint32_t*>(
+        job.xh + static_cast<std::size_t>(t < a.batch ? t : a.batch - 1) *
+                     job.xh_stride +
+        (unit % BK) * 16);
+  }
+  Float8 acc[2][WTS] = {};
+  for (int k = 0; k < job.cols; k += 16 * BK) {
+#pragma unroll
+    for (int p = 0; p < UA; ++p) {
+      const int unit = p * 256 + tid;
+      const std::uint32_t* src = w_src[p] + k / 2;
+      std::uint32_t* dst = s_a[unit % BK][unit / BK];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dst[i] = src[i];
+    }
+#pragma unroll
+    for (int p = 0; p < UB; ++p) {
+      const int unit = p * 256 + tid;
+      if (unit < BN * BK) {
+        const std::uint32_t* src = x_src[p] + k / 2;
+        std::uint32_t* dst = s_b[unit % BK][unit / BK];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          dst[i] = src[i];
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int ks = 0; ks < BK; ++ks) {
+      Half16 wa[2];
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        __builtin_memcpy(&wa[i], s_a[ks][(wr * 2 + i) * 16 + sl], 32);
+#pragma unroll
+      for (int g = 0; g < WTS; ++g) {
+        Half16 xb;
+        __builtin_memcpy(&xb, s_b[ks][(wt * WTS + g) * 16 + sl], 32);
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+          acc[i][g] =
+              __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa[i], acc[i][g]);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r = r_block + (wr * 2 + i) * 16 + sl;
+    if (r >= job.rows)
+      continue;
+#pragma unroll
+    for (int g = 0; g < WTS; ++g)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int t = t_block + (wt * WTS + g) * 16 + 2 * e + hi;
+        if (t < a.batch)
+          job.y[static_cast<std::size_t>(t) * job.y_stride + r] = acc[i][g][e];
+      }
+  }
+}
+
 __global__ void TransposeKernel(TransposeArgs a) {
   const std::size_t idx =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1541,6 +1715,166 @@ __launch_bounds__(64) __global__ void ExpertDownBf16MajorKernel(
   }
 }
 
+// ---- expert-major with the FP16 matrix instruction --------------------------
+
+// Sixteen consecutive NVFP4 weights of a row (sub-block `kk` of 16) as FP16.
+// A code times its sub-block scale has at most 6 significant bits, so the
+// conversion is exact.
+__device__ __forceinline__ void LoadHalfNvfp4(const std::uint8_t* row, int kk,
+                                              std::uint32_t* out) {
+  const std::uint8_t* block = row + (kk >> 2) * kNvfp4Bytes;
+  const int sub = kk & 3;
+  const float d = Ue4m3(block[sub]);
+  std::uint32_t w[2];
+  __builtin_memcpy(w, block + 4 + sub * 8, 8);
+  union {
+    Half16 f;
+    std::uint32_t u[8];
+  } v;
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const std::uint32_t lo = DecodeCodes(w[half] & 0x0F0F0F0Fu);
+    const std::uint32_t hi = DecodeCodes((w[half] >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      v.f[half * 4 + j] = static_cast<_Float16>(
+          d * static_cast<float>(static_cast<signed char>(lo >> (8 * j))));
+      v.f[8 + half * 4 + j] = static_cast<_Float16>(
+          d * static_cast<float>(static_cast<signed char>(hi >> (8 * j))));
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    out[i] = v.u[i];
+}
+
+// The same for BF16 weights.
+__device__ __forceinline__ void LoadHalfBf16(const std::uint16_t* w,
+                                             std::uint32_t* out) {
+  union {
+    Half16 f;
+    std::uint32_t u[8];
+  } v;
+#pragma unroll
+  for (int i = 0; i < 16; ++i)
+    v.f[i] = static_cast<_Float16>(Bf16(w[i]));
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    out[i] = v.u[i];
+}
+
+// A block owns one expert, 128 weight rows and up to 32 of the pairs that
+// selected the expert; it works like WmmaGemmBlockKernel, with the weights
+// converted to FP16 as they are copied into shared memory.
+//   Up:   the rows are 64 hidden units' gate rows and up rows, the inputs are
+//         the pairs' x; a wave holds gate and up of the same units and stores
+//         the activation.
+//   Down: the rows are 128 outputs, the inputs are the pairs' activations.
+template <bool Up, bool Nvfp4>
+__launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
+  constexpr int BM = 128, BN = 32, BK = 4;
+  constexpr int kCols = Up ? kE : kFF;
+  constexpr int kPerExpert = Up ? kFF / 64 : kE / BM;
+  __shared__ std::uint32_t s_a[BK][BM][8];
+  __shared__ std::uint32_t s_b[BK][BN][8];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, wave = tid >> 5;
+  const int sl = lane & 15, hi = lane >> 4;
+  const int wr = wave >> 1, wt = wave & 1;
+  const int e = blockIdx.x / kPerExpert, rb = blockIdx.x % kPerExpert;
+  const int n = a.group_count[e];
+  const int t_block = blockIdx.y * BN;
+  if (t_block >= n)
+    return;
+  const std::int32_t* list =
+      a.group_list + static_cast<std::size_t>(e) * a.max_batch;
+  constexpr std::size_t kRowBytes =
+      Nvfp4 ? static_cast<std::size_t>(kCols / kNvfp4Values) * kNvfp4Bytes
+            : static_cast<std::size_t>(kCols) * 2;
+  const std::uint8_t* base = (Up ? a.gate_up : a.down) +
+                             static_cast<std::size_t>(e) * (Up ? 2 * kFF : kE) *
+                                 kRowBytes;
+  constexpr int UA = BM * BK / 256;
+  const std::uint8_t* w_row[UA];
+#pragma unroll
+  for (int p = 0; p < UA; ++p) {
+    const int pr = (p * 256 + tid) / BK;
+    const int row = Up ? ((pr & 16) ? kFF : 0) + rb * 64 + (pr >> 5) * 16 + (pr & 15)
+                       : rb * BM + pr;
+    w_row[p] = base + static_cast<std::size_t>(row) * kRowBytes;
+  }
+  const std::uint32_t* x_src = nullptr;
+  if (tid < BN * BK) {
+    const int t = t_block + tid / BK;
+    const int pair = list[t < n ? t : n - 1];
+    const std::uint16_t* x =
+        Up ? a.xh + static_cast<std::size_t>(pair / kTopK) * kE
+           : a.acth + static_cast<std::size_t>(pair) * kFF;
+    x_src = reinterpret_cast<const std::uint32_t*>(x + (tid % BK) * 16);
+  }
+  // A wave whose batch tile is past the expert's pairs only helps copying.
+  const bool live = t_block + wt * 16 < n;
+  Float8 acc[2] = {};
+  for (int k = 0; k < kCols; k += 16 * BK) {
+#pragma unroll
+    for (int p = 0; p < UA; ++p) {
+      const int unit = p * 256 + tid, ks = unit % BK;
+      std::uint32_t* dst = s_a[ks][unit / BK];
+      if constexpr (Nvfp4)
+        LoadHalfNvfp4(w_row[p], k / 16 + ks, dst);
+      else
+        LoadHalfBf16(reinterpret_cast<const std::uint16_t*>(w_row[p]) + k +
+                         ks * 16,
+                     dst);
+    }
+    if (tid < BN * BK) {
+      const std::uint32_t* src = x_src + k / 2;
+      std::uint32_t* dst = s_b[tid % BK][tid / BK];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dst[i] = src[i];
+    }
+    __syncthreads();
+    if (live) {
+#pragma unroll
+      for (int ks = 0; ks < BK; ++ks) {
+        Half16 xb;
+        __builtin_memcpy(&xb, s_b[ks][wt * 16 + sl], 32);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          Half16 wa;
+          __builtin_memcpy(&wa, s_a[ks][(wr * 2 + i) * 16 + sl], 32);
+          acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[i]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (!live)
+    return;
+#pragma unroll
+  for (int el = 0; el < 8; ++el) {
+    const int t = t_block + wt * 16 + 2 * el + hi;
+    if (t >= n)
+      continue;
+    const int pair = list[t];
+    if constexpr (Up) {
+      const float scale = a.up_scale[pair];
+      const float v = Situ(acc[0][el] * scale, acc[1][el] * scale, a.situ_beta,
+                           a.situ_linear_beta);
+      reinterpret_cast<_Float16*>(a.acth)[static_cast<std::size_t>(pair) * kFF +
+                                          rb * 64 + wr * 16 + sl] =
+          static_cast<_Float16>(v);
+    } else {
+      const float coef = a.coef[pair];
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        a.contrib[static_cast<std::size_t>(pair) * kE + rb * BM +
+                  (wr * 2 + i) * 16 + sl] = coef * acc[i][el];
+    }
+  }
+}
+
 // out = the sum of a row's kTopK contributions. One thread per (row, value).
 __global__ void ExpertSumKernel(BatchExpertArgs a) {
   const std::size_t idx =
@@ -1872,10 +2206,45 @@ void Norm(const NormArgs& args, hipStream_t stream) {
   NormKernel<<<args.batch * args.count, kNormThreads, 0, stream>>>(args);
 }
 
+void ToHalf(const ToHalfArgs& args, hipStream_t stream) {
+  ToHalfKernel<<<Blocks(std::size_t(args.batch) * args.cols, 256), 256, 0,
+                 stream>>>(args);
+}
+
 void Gemm(const GemmArgs& args, hipStream_t stream) {
   int rows = 0;
   for (int j = 0; j < args.count; ++j)
     rows += args.jobs[j].rows;
+  if (args.wmma) {
+    // Up to 16 rows: one tile of batch rows per wave, straight from global
+    // memory (the weights are the traffic). Above: blocks staged in shared
+    // memory, 32, 64 or 128 batch rows wide.
+    const int wide = args.wmma_tiles > 0 ? args.wmma_tiles
+                     : args.batch <= 16  ? 0
+                     : args.batch <= 32  ? 1
+                     : args.batch <= 64  ? 2
+                                         : 4;
+    if (wide == 0 || wide > 4) {
+      int tiles = 0;
+      for (int j = 0; j < args.count; ++j)
+        tiles += (args.jobs[j].rows + 15) / 16;
+      const dim3 grid((tiles + 7) / 8, (args.batch + 15) / 16);
+      WmmaGemmKernel<1><<<grid, 256, 0, stream>>>(args);
+      return;
+    }
+    int blocks = 0;
+    for (int j = 0; j < args.count; ++j)
+      blocks += (args.jobs[j].rows + 127) / 128;
+    const int bn = 32 * wide;
+    const dim3 grid(blocks, (args.batch + bn - 1) / bn);
+    if (wide == 1)
+      WmmaGemmBlockKernel<1><<<grid, 256, 0, stream>>>(args);
+    else if (wide == 2)
+      WmmaGemmBlockKernel<2><<<grid, 256, 0, stream>>>(args);
+    else
+      WmmaGemmBlockKernel<4><<<grid, 256, 0, stream>>>(args);
+    return;
+  }
   if (args.batch == 1 && args.variant == 0) {
     if (args.single_threads == 64)
       GemvKernel<64><<<rows, 64, 0, stream>>>(args);
@@ -1925,6 +2294,22 @@ void Router(const RouterArgs& args, hipStream_t stream) {
 }
 
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream) {
+  if (args.variant == 5) {
+    ExpertGroupKernel<<<1, kNX, 0, stream>>>(args);
+    ToHalfArgs h{args.x, kE, args.xh, kE, args.batch};
+    ToHalfKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0, stream>>>(h);
+    const dim3 grid(kNX * 18, (args.batch + 31) / 32);
+    if (args.nvfp4) {
+      ExpertWmmaKernel<true, true><<<grid, 256, 0, stream>>>(args);
+      ExpertWmmaKernel<false, true><<<grid, 256, 0, stream>>>(args);
+    } else {
+      ExpertWmmaKernel<true, false><<<grid, 256, 0, stream>>>(args);
+      ExpertWmmaKernel<false, false><<<grid, 256, 0, stream>>>(args);
+    }
+    ExpertSumKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0,
+                      stream>>>(args);
+    return;
+  }
   if (args.variant == 4 && args.nvfp4) {
     QuantizeArgs qx{args.x, kE, args.batch, kE, args.xq, args.xs};
     QuantizeKernel<<<Blocks(std::size_t(args.batch) * kE / 16, 256), 256, 0,

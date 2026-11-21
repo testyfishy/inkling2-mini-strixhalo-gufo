@@ -65,9 +65,11 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [x] M4b: expert-major kernels: each expert's weights are decoded once per step for all the
       rows that selected it. On real text, 8 sessions reach 49.0 tokens/s total (was 37.9) and
       prompts 109 tokens/s (was 47 to 49), with identical output
-- [ ] M4b2: prompt processing at a competitive rate (llama.cpp: 346 to 520 tokens/s). Next
-      candidate: 8-bit integer dot products in the expert kernels, measured at 2.7 times the
-      float rate, judged by the quality harness
+- [x] M4b2: prompt processing at llama.cpp's rate at short context: 482 tokens/s at 256 rows
+      per step, 553 at 512 (llama.cpp: 346 to 520), with the GPU's FP16 matrix instruction for
+      projections and experts. Quality unchanged in the harness (KLD 0.0021)
+- [ ] M4b3: prompt processing at depth. At 100K tokens of context it is 31 tokens/s, because
+      every row reads the whole attention cache by itself; attention needs the same treatment
 - [ ] M4c: speculative decoding with the model's DSpark drafter. Done so far: tentative steps
       in the engine, and a CPU prototype of the drafter whose acceptance matches llama.cpp's
       (2.0 to 4.4 tokens per step depending on the text; [docs/DSPARK.md](docs/DSPARK.md)).

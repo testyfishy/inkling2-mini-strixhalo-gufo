@@ -342,6 +342,39 @@ than this code:
 Memory at depth: the full-attention caches take about 65 KB per token per session in F32
 (6.6 GB at 100,000 tokens), next to about 21 GB of weights.
 
+## Matrix-instruction kernels, 2026-11-21
+
+The GPU has a 16x16x16 matrix-multiply instruction for FP16 inputs with FP32 sums. GUFO's own
+kernels for other models are built on it; from this step the projections and the experts use it
+in steps of several rows. A block copies a slice of the weights and of the inputs into shared
+memory (converting NVFP4 and BF16 weights to FP16 on the way, which is exact) and its waves
+multiply out of shared memory, so each value is read from main memory once per block.
+
+One step of prompt processing, per batch size (512 tokens of real text, short context), in ms:
+
+| Rows per step | 16 before | 16 | 64 before | 64 | 256 before | 256 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Input projections | 36.1 | 12.2 | 139.8 | 12.9 | 3,831 | 33.0 | 60.7 |
+| Output projection | 15.2 | 5.5 | 49.5 | 11.0 | 1,582 | 19.9 | 20.4 |
+| Experts (NVFP4 + BF16) | 86.8 | 85.6 | 197.7 | 146.1 | 534.7 | 269.5 | 425.6 |
+| Attention | 8.5 | 8.0 | 28.8 | 27.0 | 109.0 | 104.5 | 208.4 |
+| Glue (mixes, norms, router, convolutions) | 12.4 | 11.5 | 30.3 | 28.0 | 107.5 | 99.5 | |
+| Prompt tokens/s | 100 | 130 | 143 | 284 | 42 | 482 | 553 |
+
+The previous projection kernel fell apart above 64 rows; that is why prompts used to be fed 16
+rows at a time. What is left at 256 rows is the experts (about half, close to what reading
+every expert's weights once costs), then attention and the glue kernels, which have not been
+touched yet.
+
+Prompt processing at depth (256 rows per step), tokens/s: 258 at 4K, 126 at 16K, 31 at 100K.
+There the attention kernel is nearly all of the time: every row still reads the whole key and
+value cache by itself.
+
+Steps of 2 to 8 rows (verifying drafts, a few parallel sessions) gain from the projections
+only: 8 sessions reach 63.4 tokens/s in total (was 56.2). The experts of such steps are limited
+by reading weights: rows rarely share an expert, and each row's eight experts are about 2 GB
+across the model.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

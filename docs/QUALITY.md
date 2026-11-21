@@ -52,6 +52,24 @@ of about 0.44 here), so this measurement shows no quality cost. It is a small sa
 one could show a difference this one cannot. `INKLING2_INT8_EXPERTS=0` (or `INT8_EXPERTS=0` for
 `scripts/quality.sh`) selects the float products.
 
+## FP16 matrix-instruction kernels (on by default for steps of several rows)
+
+Steps of several rows round the inputs of the projections and experts to FP16 (weights stay
+exact, sums are FP32; see PROGRESS.md step 16). Same 8 chunks of 512 tokens, against the same
+llama.cpp reference:
+
+| Kernels | Perplexity (llama.cpp 7.7776) | Mean KLD | Median / 99% KLD | Same top token |
+|---|---:|---:|---:|---:|
+| Before (float projections, 8-bit experts), 16 rows per step | 7.8172 | 0.001985 | 0.000772 / 0.0172 | 98.24% |
+| FP16 projections, 8-bit experts, 16 rows per step | 7.7978 | 0.002122 | 0.000817 / 0.0198 | 97.35% |
+| FP16 projections and experts, 16 rows per step | 7.7899 | 0.002158 | 0.000775 / 0.0214 | 98.14% |
+| FP16 projections and experts, 64 rows per step | 7.7958 | 0.002137 | 0.000771 / 0.0214 | 97.99% |
+
+All four sit in the same band around llama.cpp (mean KLD 0.0020 to 0.0022). The differences
+between them are within what this measurement can resolve: a percent of the 4,096 scored
+positions is 41 tokens, and the top-token rate moves by that much between any two arithmetic
+paths because of near-ties.
+
 ## Longer context
 
 One chunk of 4,096 tokens, 2,047 scored positions (2,048 to 4,095), 64 rows per step. This

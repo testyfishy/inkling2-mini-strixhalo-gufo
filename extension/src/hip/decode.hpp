@@ -136,6 +136,12 @@ struct GemmJob {
   // group 0; groups are xt_group_stride floats apart.
   const float* xt;
   int xt_group_stride;
+  // Optional FP16 copies for the matrix-instruction kernel (GemmArgs::wmma):
+  // the weights (BF16 converts to FP16 exactly except for values too small to
+  // matter) and the inputs, row-major, xh_stride values per batch row.
+  const std::uint16_t* wh;
+  const std::uint16_t* xh;
+  int xh_stride;
 };
 struct GemmArgs {
   GemmJob jobs[9];
@@ -144,6 +150,12 @@ struct GemmArgs {
   int variant;  // 0: a block per output row; 1: a thread per output row
   // Threads per output row of the single-row kernel: 64 or 128 (0 = 128).
   int single_threads;
+  // Use the 16x16x16 FP16 matrix instruction with FP32 accumulation. Every
+  // job needs wh and xh, and cols a multiple of 16.
+  bool wmma;
+  // Kernel choice, for experiments: 0 picks by batch; 1, 2, 4 force the
+  // staged kernel 32, 64 or 128 batch rows wide; 8 forces the direct kernel.
+  int wmma_tiles;
 };
 /// Every job's y[b] = W x[b] for every row, in one launch.
 void Gemm(const GemmArgs& args, hipStream_t stream);
@@ -159,6 +171,17 @@ struct TransposeArgs {
   int batch;
 };
 void Transpose(const TransposeArgs& args, hipStream_t stream);
+
+/// FP16 copy of `cols` values per row, row-major, for the matrix-instruction
+/// kernel. Values are rounded to nearest and clamped to the FP16 range.
+struct ToHalfArgs {
+  const float* x;
+  int x_stride;
+  std::uint16_t* out;
+  int cols;
+  int batch;
+};
+void ToHalf(const ToHalfArgs& args, hipStream_t stream);
 
 /// After the projections: K and V short convolutions, the per-head clips and
 /// norms, and the KV cache store.
@@ -265,7 +288,11 @@ struct BatchExpertArgs {
   //    weights stay exact (they are small integers times a scale) while the
   //    inputs are rounded to 8 bits per block of 16. BF16 layers use 2;
   // 4: the 8-bit integer products with a block per (row, output value), for
-  //    steps of few rows. BF16 layers use 0.
+  //    steps of few rows. BF16 layers use 0;
+  // 5: expert-major with the 16x16x16 FP16 matrix instruction: the weights
+  //    are exact as FP16 (NVFP4 always, BF16 except for values too small to
+  //    matter), the inputs are rounded to FP16, sums are FP32. For steps of
+  //    many rows, where experts are shared by many rows.
   int variant;
   // Expert-major scratch: for each expert, the (row * kTopK + slot) pairs that
   // selected it (group_list, max_batch entries per expert) and how many
@@ -281,6 +308,9 @@ struct BatchExpertArgs {
   float* xs;
   std::uint32_t* aq;
   float* as;
+  // Variant 5 scratch: FP16 copies of x (kE per row) and act (kFF per pair).
+  std::uint16_t* xh;
+  std::uint16_t* acth;
 };
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream);
 

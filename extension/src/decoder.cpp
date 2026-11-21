@@ -10,6 +10,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "hip/decode.hpp"
 
@@ -32,6 +35,44 @@ void Check(hipError_t status, const char* what) {
   if (status != hipSuccess)
     throw std::runtime_error(std::string("inkling2 gpu: ") + what + ": " +
                              hipGetErrorString(status));
+}
+
+int EnvOr(const char* name, int fallback) {
+  const char* v = std::getenv(name);
+  return v && *v ? std::atoi(v) : fallback;
+}
+
+// FP32 to FP16 bits, round to nearest even; `exact` is cleared when the value
+// changed.
+std::uint16_t HalfBits(float f, bool* exact) {
+  std::uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const std::uint32_t sign = (x >> 16) & 0x8000u;
+  x &= 0x7fffffffu;
+  if (x >= 0x47800000u) {  // 65536 and above, infinities, NaN
+    *exact = false;
+    return static_cast<std::uint16_t>(sign | (x > 0x7f800000u ? 0x7e00u : 0x7c00u));
+  }
+  if (x < 0x38800000u) {  // below 2^-14: subnormal in FP16
+    if (x < 0x33000000u) {
+      *exact = x == 0;
+      return static_cast<std::uint16_t>(sign);
+    }
+    const int shift = 126 - static_cast<int>(x >> 23);
+    const std::uint32_t m = (x & 0x7fffffu) | 0x800000u;
+    std::uint32_t h = m >> shift;
+    const std::uint32_t rem = m & ((1u << shift) - 1), halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (h & 1)))
+      ++h;
+    *exact = rem == 0;
+    return static_cast<std::uint16_t>(sign | h);
+  }
+  std::uint32_t h = (((x >> 23) - 112) << 10) | ((x >> 13) & 0x3ffu);
+  const std::uint32_t rem = x & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1)))
+    ++h;
+  *exact = rem == 0;
+  return static_cast<std::uint16_t>(sign | h);
 }
 
 }  // namespace
@@ -92,6 +133,16 @@ struct GpuEngine::Impl {
   float *xs{}, *as{};
   int major_min_batch{4};
   bool transpose{true};
+  // Steps of at least this many rows run the projections through the FP16
+  // matrix-instruction kernel (0 = never). INKLING2_WMMA_MIN_BATCH.
+  int wmma_min_batch{EnvOr("INKLING2_WMMA_MIN_BATCH", 2)};
+  int wmma_tiles{EnvOr("INKLING2_WMMA_TILES", 0)};
+  std::unordered_map<const void*, const std::uint16_t*> half_of;
+  std::size_t half_values{0}, half_inexact{0};
+  std::uint16_t *xh_in{}, *xh_attn{}, *xh_head{}, *xh_x{}, *acth{};
+  // Steps of at least this many rows run the experts through the FP16
+  // matrix-instruction kernels (0 = never). INKLING2_WMMA_EXPERT_MIN_BATCH.
+  int wmma_expert_min_batch{EnvOr("INKLING2_WMMA_EXPERT_MIN_BATCH", 16)};
   int gemm_variant{0}, expert_variant{0};
   int single_threads{128}, head_threads{64};
   bool attention_window{true};
@@ -162,11 +213,66 @@ struct GpuEngine::Impl {
     return v.empty() ? nullptr
                      : static_cast<const float*>(Upload(v.data(), v.size() * 4));
   }
-  const std::uint16_t* UpBf16(const Mat& mat) {
+  // `half` also uploads an FP16 copy for the matrix-instruction kernel.
+  const std::uint16_t* UpBf16(const Mat& mat, bool half = false) {
     if (mat.type != kGgmlTypeBf16)
       throw std::runtime_error("inkling2 gpu: projection is not BF16");
-    return static_cast<const std::uint16_t*>(
+    const auto* device = static_cast<const std::uint16_t*>(
         Upload(mat.data, mat.rows * mat.RowBytes()));
+    if (half && wmma_min_batch > 0) {
+      const std::size_t n = mat.rows * mat.cols;
+      const auto* bits = reinterpret_cast<const std::uint16_t*>(mat.data);
+      std::vector<std::uint16_t> h(n);
+      const std::size_t threads = 16, step = (n + threads - 1) / threads;
+      std::vector<std::size_t> inexact(threads, 0);
+      std::vector<std::thread> pool;
+      for (std::size_t t = 0; t < threads; ++t)
+        pool.emplace_back([&, t] {
+          const std::size_t end = std::min(n, (t + 1) * step);
+          for (std::size_t i = t * step; i < end; ++i) {
+            const std::uint32_t wide = std::uint32_t{bits[i]} << 16;
+            float f;
+            std::memcpy(&f, &wide, 4);
+            bool exact = true;
+            h[i] = HalfBits(f, &exact);
+            inexact[t] += exact ? 0 : 1;
+          }
+        });
+      for (auto& th : pool)
+        th.join();
+      for (const std::size_t v : inexact)
+        half_inexact += v;
+      half_values += n;
+      half_of[device] =
+          static_cast<const std::uint16_t*>(Upload(h.data(), n * 2));
+    }
+    return device;
+  }
+
+  // Routes a projection call to the matrix-instruction kernel when the step
+  // is large enough and every weight has an FP16 copy: converts the inputs
+  // (`cols` values per row at x) into `xh` and fills in the jobs.
+  bool Wmma(gpu::GemmArgs& g, const float* x, int cols, std::uint16_t* xh) {
+    if (wmma_min_batch <= 0 || g.batch < wmma_min_batch)
+      return false;
+    for (int j = 0; j < g.count; ++j)
+      if (half_of.find(g.jobs[j].w) == half_of.end())
+        return false;
+    gpu::ToHalfArgs h{};
+    h.x = x;
+    h.x_stride = cols;
+    h.out = xh;
+    h.cols = cols;
+    h.batch = g.batch;
+    gpu::ToHalf(h, stream);
+    for (int j = 0; j < g.count; ++j) {
+      g.jobs[j].wh = half_of[g.jobs[j].w];
+      g.jobs[j].xh = xh + (g.jobs[j].x - x);
+      g.jobs[j].xh_stride = cols;
+    }
+    g.wmma = true;
+    g.wmma_tiles = wmma_tiles;
+    return true;
   }
   // A small matrix as F32 on the device; BF16 storage is widened exactly.
   const float* UpF32(const Mat& mat) {
@@ -210,7 +316,7 @@ struct GpuEngine::Impl {
     Check(hipStreamCreate(&stream), "create stream");
 
     tok_embd = UpBf16(m.tok_embd);
-    output = UpBf16(m.output);
+    output = UpBf16(m.output, true);
     tok_norm = Up(m.tok_norm);
     output_norm = Up(m.output_norm);
     output_res_query = Up(m.output_res_query);
@@ -219,15 +325,15 @@ struct GpuEngine::Impl {
     for (std::uint32_t il = 0; il < c.n_layer; ++il) {
       const LayerWeights& w = m.layers[il];
       Layer& l = layers[il];
-      l.wq = UpBf16(w.wq);
-      l.wk = UpBf16(w.wk);
-      l.wv = UpBf16(w.wv);
-      l.wo = UpBf16(w.wo);
-      l.gate = UpBf16(w.gate);
-      l.sink = UpBf16(w.sink);
-      l.rel = UpBf16(w.rel);
-      l.kcp = w.swa ? nullptr : UpBf16(w.k_conv_proj);
-      l.vcp = w.swa ? nullptr : UpBf16(w.v_conv_proj);
+      l.wq = UpBf16(w.wq, true);
+      l.wk = UpBf16(w.wk, true);
+      l.wv = UpBf16(w.wv, true);
+      l.wo = UpBf16(w.wo, true);
+      l.gate = UpBf16(w.gate, true);
+      l.sink = UpBf16(w.sink, true);
+      l.rel = UpBf16(w.rel, true);
+      l.kcp = w.swa ? nullptr : UpBf16(w.k_conv_proj, true);
+      l.vcp = w.swa ? nullptr : UpBf16(w.v_conv_proj, true);
       l.nvfp4 = w.gate_up.type == kGgmlTypeNvfp4;
       if (w.gate_up.type != w.down.type ||
           (!l.nvfp4 && w.gate_up.type != kGgmlTypeBf16))
@@ -313,6 +419,18 @@ struct GpuEngine::Impl {
     const std::size_t groups = (B + gpu::kGemmGroup - 1) / gpu::kGemmGroup;
     xt_in = Floats(groups * 3 * kE * gpu::kGemmGroup);
     xt_attn = Floats(groups * kHQ * gpu::kGemmGroup);
+    xh_x = static_cast<std::uint16_t*>(Alloc(B * kE * 2));
+    acth = static_cast<std::uint16_t*>(Alloc(B * kTopK * gpu::kFF * 2));
+    if (wmma_min_batch > 0) {
+      xh_in = static_cast<std::uint16_t*>(Alloc(B * 3 * kE * 2));
+      xh_attn = static_cast<std::uint16_t*>(Alloc(B * kHQ * 2));
+      xh_head = static_cast<std::uint16_t*>(
+          Alloc(std::max<std::size_t>(opt.sessions, B) * kE * 2));
+      std::fprintf(stderr,
+                   "inkling2 gpu: %zu projection weights also stored as FP16, "
+                   "%zu not exactly representable\n",
+                   half_values, half_inexact);
+    }
     if (const char* v = std::getenv("INKLING2_NO_TRANSPOSE"); v && *v == '1')
       transpose = false;
     if (const char* v = std::getenv("INKLING2_GEMM_VARIANT"))
@@ -518,7 +636,8 @@ struct GpuEngine::Impl {
     g.single_threads = single_threads;
     // Above one row, the kernel reads a column-major copy of the inputs.
     const bool use_xt = transpose && batch > 1;
-    if (use_xt) {
+    if (Wmma(g, in, 3 * kE, xh_in)) {
+    } else if (use_xt) {
       gpu::TransposeArgs tr{};
       tr.x = in;
       tr.x_stride = 3 * kE;
@@ -584,7 +703,8 @@ struct GpuEngine::Impl {
     o.batch = batch;
     o.variant = gemm_variant;
     o.single_threads = single_threads;
-    if (use_xt) {
+    if (Wmma(o, attn, kHQ, xh_attn)) {
+    } else if (use_xt) {
       gpu::TransposeArgs tr{};
       tr.x = attn;
       tr.x_stride = kHQ;
@@ -667,7 +787,10 @@ struct GpuEngine::Impl {
     // Expert-major pays off once rows share experts; alone, a row's eight
     // experts are cheaper to visit directly.
     e.variant = expert_variant;
-    if (expert_variant == 0 && batch >= major_min_batch)
+    if (expert_variant == 0 && wmma_expert_min_batch > 0 &&
+        batch >= wmma_expert_min_batch)
+      e.variant = 5;
+    else if (expert_variant == 0 && batch >= major_min_batch)
       e.variant = opt.int8_experts ? 3 : 2;
     else if (expert_variant == 0 && opt.int8_experts && opt.int8_single)
       e.variant = 4;
@@ -678,6 +801,8 @@ struct GpuEngine::Impl {
     e.group_list = group_list;
     e.group_count = group_count;
     e.contrib = contrib;
+    e.xh = xh_x;
+    e.acth = acth;
     e.max_batch = static_cast<int>(opt.max_batch);
     gpu::BatchExperts(e, stream);
     Mark(l.nvfp4 ? 6 : 7);
@@ -958,6 +1083,7 @@ struct GpuEngine::Impl {
       g.count = 1;
       g.batch = static_cast<int>(n_heads);
       g.single_threads = head_threads;
+      Wmma(g, final_x, kE, xh_head);
       gpu::Gemm(g, stream);
       Check(hipMemcpyAsync(host_logits.data(), logits,
                            n_heads * c.n_vocab_padded * 4,
