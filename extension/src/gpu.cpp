@@ -100,6 +100,35 @@ public:
     for (std::size_t i = 0; i < count; ++i)
       std::memcpy(jobs[i].y, host_out_.data() + y_at[i],
                   jobs[i].mat->rows * 4);
+
+    // Tuning aid: the same launches back to back with no round trips, to
+    // separate kernel throughput from call overhead. Once per call shape.
+    if (bench_ && (mul_calls_ == 300 || (count == 1 && jobs[0].mat->rows > 100000 &&
+                                         !bench_head_done_))) {
+      if (count == 1 && jobs[0].mat->rows > 100000)
+        bench_head_done_ = true;
+      std::size_t bytes = 0;
+      const int repeats = 50;
+      const auto start = std::chrono::steady_clock::now();
+      for (int r = 0; r < repeats; ++r)
+        for (std::size_t i = 0; i < count; ++i) {
+          const Mat& m = *jobs[i].mat;
+          gpu::GemvBf16(static_cast<const std::uint16_t*>(Device(m, 1)),
+                        Floats(in_) + x_at[i], Floats(out_) + y_at[i],
+                        static_cast<int>(m.rows), static_cast<int>(m.cols),
+                        stream_);
+          bytes += m.rows * m.RowBytes();
+        }
+      Check(hipStreamSynchronize(stream_), "synchronize");
+      const double seconds = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+      std::fprintf(stderr,
+                   "gpu bench: %zu projection(s), %.1f MB per pass, %.3f ms "
+                   "per pass, %.0f GB/s\n",
+                   count, bytes / repeats / 1e6, seconds / repeats * 1e3,
+                   bytes / seconds / 1e9);
+    }
   }
 
   void Experts(const ExpertCall& call) override {
@@ -142,6 +171,27 @@ public:
     Check(hipMemcpyAsync(call.out, out_, e * 4, hipMemcpyDeviceToHost, stream_),
           "copy expert output");
     Check(hipStreamSynchronize(stream_), "synchronize");
+
+    if (bench_ && (expert_calls_ == 150 || (!nvfp4 && !bench_bf16_done_))) {
+      if (!nvfp4)
+        bench_bf16_done_ = true;
+      const int repeats = 50;
+      const auto start = std::chrono::steady_clock::now();
+      for (int r = 0; r < repeats; ++r)
+        gpu::Experts(args, stream_);
+      Check(hipStreamSynchronize(stream_), "synchronize");
+      const double seconds = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+      const double bytes =
+          static_cast<double>(n) * (up.rows * up.RowBytes() +
+                                    down.rows * down.RowBytes());
+      std::fprintf(stderr,
+                   "gpu bench: %zu %s experts, %.1f MB per pass, %.3f ms per "
+                   "pass, %.0f GB/s\n",
+                   n, nvfp4 ? "NVFP4" : "BF16", bytes / 1e6,
+                   seconds / repeats * 1e3, bytes * repeats / seconds / 1e9);
+    }
   }
 
   [[nodiscard]] const char* name() const override { return "hip"; }
@@ -190,6 +240,8 @@ private:
         std::chrono::steady_clock::now()};
   };
 
+  bool bench_{std::getenv("INKLING2_GPU_BENCH") != nullptr};
+  bool bench_head_done_{false}, bench_bf16_done_{false};
   double mul_seconds_{0}, expert_seconds_{0}, upload_seconds_{0};
   std::size_t mul_calls_{0}, expert_calls_{0};
   hipStream_t stream_{};

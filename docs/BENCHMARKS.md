@@ -68,6 +68,27 @@ per visit, the kernel calls average about 90-100 GB/s including that overhead.
 This is a correctness milestone, not a speed result. The next step moves the remaining
 per-visit operations onto the GPU so a token needs one round trip.
 
+### Raw kernel throughput
+
+The same kernels launched 50 times back to back with no round trips in between
+(`INKLING2_GPU_BENCH=1`):
+
+| Kernel | Data per pass | Time per pass | Throughput |
+|---|---:|---:|---:|
+| BF16 projection, output head (201,024 x 2,304) | 926 MB | 4.9 ms | 189 GB/s |
+| BF16 experts, 8 selected (layers 20-23) | 127 MB | 0.64 ms | 199 GB/s |
+| NVFP4 experts, 8 selected (layers 0-19) | 35.8 MB | 0.33 ms | 108 GB/s |
+| BF16 projection, one attention matrix | 14.2 MB | 0.042 ms | not meaningful (repeats hit cache) |
+
+The BF16 kernels already run at about the memory bandwidth of this machine. The NVFP4 expert
+kernel is compute-bound at roughly half of it and has room to improve.
+
+Adding these up for one token (48 visits of about 54 MB of projections, 44 NVFP4 and 4 BF16
+expert calls, one output head) gives about 36 ms of kernel time, or roughly 28 tokens/s if the
+per-call overhead and CPU work were removed entirely, and about 34 tokens/s if the NVFP4 kernel
+also reached bandwidth. That is an estimate from kernel timings, not a measured decode speed; it
+is the ceiling for single-stream decode at native precision without speculative decoding.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
