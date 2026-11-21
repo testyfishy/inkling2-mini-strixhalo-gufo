@@ -82,6 +82,8 @@ struct GpuEngine::Impl {
   bool transpose{true};
   int gemm_variant{0}, expert_variant{0};
   int single_threads{128}, head_threads{64};
+  bool attention_window{true};
+  std::uint32_t max_pos{0};  // the highest position in the current step
   std::uint32_t* sel_ids{};
   // Per-step staging: the row states of every visit, the tokens, the head rows.
   void* staging{};
@@ -302,6 +304,8 @@ struct GpuEngine::Impl {
       single_threads = std::atoi(v);
     if (const char* v = std::getenv("INKLING2_HEAD_THREADS"))
       head_threads = std::atoi(v);
+    if (const char* v = std::getenv("INKLING2_ATTN_WINDOW"); v && *v == '0')
+      attention_window = false;
     contrib = Floats(B * kTopK * kE);
     if (opt.int8_experts) {
       xq = static_cast<std::uint32_t*>(Alloc(B * kE));
@@ -508,6 +512,7 @@ struct GpuEngine::Impl {
     at.scale = 1.0f / std::sqrt(static_cast<float>(gpu::kHD));
     at.rows = rows;
     at.batch = batch;
+    at.window = attention_window && (swa || max_pos < 1024);
     gpu::Attention(at, stream);
     Mark(3);
 
@@ -678,6 +683,7 @@ struct GpuEngine::Impl {
       if (pos >= opt.context)
         throw std::runtime_error("inkling2 gpu: context is full");
       tokens[b] = rows[b].token;
+      max_pos = b == 0 ? pos : std::max(max_pos, pos);
       const float ratio = std::max(
           1.0f, (pos + 1.0f) / static_cast<float>(c.log_scale_floor));
       const float tau = 1.0f + c.log_scale_alpha * std::log(ratio);

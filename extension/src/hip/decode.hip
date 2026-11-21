@@ -577,6 +577,86 @@ __launch_bounds__(kAttnThreads) __global__ void AttentionKernel(AttnArgs a) {
   }
 }
 
+// The same attention for rows that read at most kT positions, which is every
+// sliding-window layer and the full-attention layers of short contexts. One
+// block of kT threads per (row, query head): a thread per position for the
+// scores, then the value sum split eight ways per output dimension, so no
+// thread walks the whole context by itself.
+__launch_bounds__(kT) __global__ void AttentionWindowKernel(AttnArgs a) {
+  __shared__ float prob[kT];
+  __shared__ float red[kT];
+  const int t = threadIdx.x;
+  const int h = blockIdx.x % kNH;
+  const std::size_t b = blockIdx.x / kNH;
+  const RowState row = a.rows[b];
+  const int kv_head = h / (kNH / kNKV);
+  const int n = row.pos - row.first + 1;
+  // Cache rows of positions first, first + 1, ...: the ring wraps once at most.
+  const int base = row.first % row.cap;
+
+  float value = 0.0f;  // the zero sink's logit bounds the maximum from below
+  if (t < n) {
+    int kr = base + t;
+    if (kr >= row.cap)
+      kr -= row.cap;
+    const float* q = a.q + b * kHQ + h * kHD;
+    const float* k = row.kv_k + static_cast<std::size_t>(kr) * kHK + kv_head * kHD;
+    float dot = 0.0f;
+    for (int i = 0; i < kHD; ++i)
+      dot += q[i] * k[i];
+    const int distance = n - 1 - t;
+    float bias = 0.0f;
+    if (distance < a.extent) {
+      const float* r = a.r + b * kNR + h * kNRel;
+      const float* table =
+          a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
+      for (int x = 0; x < kNRel; ++x)
+        bias += table[x] * r[x];
+    }
+    value = dot * a.scale + bias - a.sink[b * kNH + h];
+    prob[t] = value;
+  }
+  red[t] = value > 0.0f ? value : 0.0f;
+  __syncthreads();
+  for (int step = kT / 2; step > 0; step >>= 1) {
+    if (t < step)
+      red[t] = fmaxf(red[t], red[t + step]);
+    __syncthreads();
+  }
+  const float max = red[0];
+  __syncthreads();
+
+  float e = 0.0f;
+  if (t < n) {
+    e = __expf(prob[t] - max);
+    prob[t] = e;
+  }
+  red[t] = e;
+  Reduce(red, kT);
+  const float total = red[0] + __expf(0.0f - max);
+  __syncthreads();
+
+  constexpr int kParts = kT / kHD;
+  const int dim = t % kHD, part = t / kHD;
+  const float* v = row.kv_v + kv_head * kHD + dim;
+  float acc = 0.0f;
+  for (int idx = part; idx < n; idx += kParts) {
+    int kr = base + idx;
+    if (kr >= row.cap)
+      kr -= row.cap;
+    acc += prob[idx] * v[static_cast<std::size_t>(kr) * kHK];
+  }
+  red[t] = acc;
+  __syncthreads();
+  if (t < kHD) {
+    float sum = 0.0f;
+    for (int p = 0; p < kParts; ++p)
+      sum += red[t + p * kHD];
+    a.out[b * kHQ + h * kHD + t] =
+        sum / total * Sigmoid(a.gate[b * kHQ + h * kHD + t]);
+  }
+}
+
 // One block per row.
 __launch_bounds__(kT) __global__ void GlueCKernel(GlueCArgs a) {
   __shared__ float sh[kSums][kT];
@@ -1666,6 +1746,10 @@ void GlueB(const GlueBArgs& args, hipStream_t stream) {
 }
 
 void Attention(const AttnArgs& args, hipStream_t stream) {
+  if (args.window) {
+    AttentionWindowKernel<<<args.batch * kNH, kT, 0, stream>>>(args);
+    return;
+  }
   AttentionKernel<<<args.batch * kNH, kAttnThreads, 0, stream>>>(args);
 }
 

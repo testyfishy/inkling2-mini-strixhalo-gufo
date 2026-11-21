@@ -183,6 +183,10 @@ struct AttnArgs {
   float scale;
   const RowState* rows;
   int batch;
+  // Set when no row reads more than 1,024 positions: the kernel then gives
+  // every position its own thread and keeps the probabilities in fast local
+  // memory.
+  bool window;
 };
 void Attention(const AttnArgs& args, hipStream_t stream);
 
