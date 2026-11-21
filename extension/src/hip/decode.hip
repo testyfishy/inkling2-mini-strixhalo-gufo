@@ -682,10 +682,12 @@ __launch_bounds__(kT) __global__ void GlueBKernel(GlueBArgs a) {
     const int chunk = row.pos / kT, within = row.pos % kT;
     for (int c = t; c < kHK; c += kT) {
       const std::size_t head = c / kHD, dim = c % kHD;
-      row.kv_k[((head * row.chunk_cap + chunk) * kHD + dim) * kT + within] =
-          k_new[c] * factor[kNH + c / kHD];
-      row.kv_v[(head * row.cap + row.pos) * kHD + dim] =
-          v_new[c] * factor[kNH + kNKV + c / kHD];
+      if (row.kv_k) {
+        row.kv_k[((head * row.chunk_cap + chunk) * kHD + dim) * kT + within] =
+            k_new[c] * factor[kNH + c / kHD];
+        row.kv_v[(head * row.cap + row.pos) * kHD + dim] =
+            v_new[c] * factor[kNH + kNKV + c / kHD];
+      }
     }
     if (row.kh) {
       _Float16* kh = reinterpret_cast<_Float16*>(row.kh);
@@ -700,11 +702,13 @@ __launch_bounds__(kT) __global__ void GlueBKernel(GlueBArgs a) {
     }
   } else {
     const std::size_t ring = row.pos % row.cap;
-    float* k_row = row.kv_k + ring * kHK;
-    float* v_row = row.kv_v + ring * kHK;
-    for (int c = t; c < kHK; c += kT) {
-      k_row[c] = k_new[c] * factor[kNH + c / kHD];
-      v_row[c] = v_new[c] * factor[kNH + kNKV + c / kHD];
+    if (row.kv_k) {
+      float* k_row = row.kv_k + ring * kHK;
+      float* v_row = row.kv_v + ring * kHK;
+      for (int c = t; c < kHK; c += kT) {
+        k_row[c] = k_new[c] * factor[kNH + c / kHD];
+        v_row[c] = v_new[c] * factor[kNH + kNKV + c / kHD];
+      }
     }
     if (row.kh) {
       _Float16* kh = reinterpret_cast<_Float16*>(row.kh) + ring * kHK;
@@ -973,6 +977,154 @@ __launch_bounds__(kT) __global__ void AttentionChunkKernel(AttnArgs a) {
     const float v = values[static_cast<std::size_t>(j) * kHD + dim];
     for (int s = 0; s < kShare; ++s)
       acc[s] += prob[s][j] * v;
+  }
+  for (int s = 0; s < kShare; ++s)
+    red[s][t] = acc[s];
+  __syncthreads();
+  if (t < kHD)
+    for (int s = 0; s < kShare; ++s) {
+      float sum = 0.0f;
+      for (int p = 0; p < kParts; ++p)
+        sum += red[s][t + p * kHD];
+      a.chunk_out[((b * kNH + kv_head * kShare + s) * a.max_chunks + chunk) *
+                      kHD +
+                  t] = sum;
+    }
+}
+
+// Eight consecutive FP16 values at a 16-byte boundary, in one load.
+__device__ __forceinline__ void LoadHalf8(const _Float16* p, float* out) {
+  using Half8 = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+  Half8 v;
+  __builtin_memcpy(&v, __builtin_assume_aligned(p, 16), 16);
+#pragma unroll
+  for (int e = 0; e < 8; ++e)
+    out[e] = static_cast<float>(v[e]);
+}
+
+// AttentionChunkKernel on the FP16 cache, for both layouts: half the bytes
+// per position. The queries, the scores, the weights and the sums are F32;
+// only the cached keys and values are FP16. On a sliding-window layer the
+// one chunk is the row's window, read from the ring.
+__launch_bounds__(kT) __global__ void AttentionChunkHalfKernel(AttnArgs a) {
+  __shared__ float prob[kShare][kT];
+  __shared__ float red[kShare][kT];
+  const int t = threadIdx.x;
+  const int chunk = blockIdx.x % a.max_chunks;
+  const int kv_head = (blockIdx.x / a.max_chunks) % kNKV;
+  const std::size_t b = blockIdx.x / (a.max_chunks * kNKV);
+  const RowState row = a.rows[b];
+  const int n = row.pos - row.first + 1;
+  if (chunk * kT >= n)
+    return;
+  const bool ring = row.layout == 0;
+  const int idx = chunk * kT + t;
+  const bool live = idx < n;
+
+  float value[kShare];
+  for (int s = 0; s < kShare; ++s)
+    value[s] = kLowest;
+  if (live) {
+    const std::size_t entry = ring ? (row.first + idx) % row.cap : idx;
+    const _Float16* key = reinterpret_cast<const _Float16*>(
+        ring ? row.kh + (entry * kNKV + kv_head) * kHD
+             : row.kh + (static_cast<std::size_t>(kv_head) * row.cap + entry) * kHD);
+    const float* q = a.q + b * kHQ + kv_head * kShare * kHD;
+    float dot[kShare];
+    for (int s = 0; s < kShare; ++s)
+      dot[s] = 0.0f;
+    // A position's 128 key values are contiguous: 16 bytes per load.
+    for (int i = 0; i < kHD; i += 8) {
+      float k[8];
+      LoadHalf8(key + i, k);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        for (int s = 0; s < kShare; ++s)
+          dot[s] += q[s * kHD + i + e] * k[e];
+    }
+    const int distance = n - 1 - idx;
+    for (int s = 0; s < kShare; ++s) {
+      const int h = kv_head * kShare + s;
+      float bias = 0.0f;
+      if (distance < a.extent) {
+        const float* r = a.r + b * kNR + h * kNRel;
+        const float* table =
+            a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
+        for (int x = 0; x < kNRel; ++x)
+          bias += table[x] * r[x];
+      }
+      value[s] = dot[s] * a.scale + bias - a.sink[b * kNH + h];
+    }
+  }
+  for (int s = 0; s < kShare; ++s) {
+    prob[s][t] = value[s];
+    red[s][t] = value[s];
+  }
+  __syncthreads();
+  for (int step = kT / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int s = 0; s < kShare; ++s)
+        red[s][t] = fmaxf(red[s][t], red[s][t + step]);
+    __syncthreads();
+  }
+  float max[kShare];
+  for (int s = 0; s < kShare; ++s)
+    max[s] = red[s][0];
+  __syncthreads();
+
+  for (int s = 0; s < kShare; ++s) {
+    const float e = live ? __expf(prob[s][t] - max[s]) : 0.0f;
+    prob[s][t] = e;
+    red[s][t] = e;
+  }
+  __syncthreads();
+  for (int step = kT / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int s = 0; s < kShare; ++s)
+        red[s][t] += red[s][t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    for (int s = 0; s < kShare; ++s) {
+      const std::size_t slot =
+          (b * kNH + kv_head * kShare + s) * a.max_chunks + chunk;
+      a.chunk_max[slot] = max[s];
+      a.chunk_sum[slot] = red[s][0];
+    }
+  __syncthreads();
+
+  // The weighted values: eight threads per output dimension, each over an
+  // eighth of the chunk's positions, which are contiguous for a dimension
+  // (16 bytes per load where the entries are aligned).
+  constexpr int kParts = kT / kHD, kSpan = kT / kParts;
+  const int dim = t % kHD, part = t / kHD;
+  const int count = n - chunk * kT < kT ? n - chunk * kT : kT;
+  const _Float16* values = reinterpret_cast<const _Float16*>(
+      ring ? row.vh + (static_cast<std::size_t>(kv_head) * kHD + dim) * row.cap
+           : row.vh + ((static_cast<std::size_t>(kv_head) * row.chunk_cap + chunk) *
+                           kHD +
+                       dim) *
+                          kT);
+  const int end = (part + 1) * kSpan < count ? (part + 1) * kSpan : count;
+  float acc[kShare];
+  for (int s = 0; s < kShare; ++s)
+    acc[s] = 0.0f;
+  for (int j = part * kSpan; j < end;) {
+    const std::size_t entry = ring ? (row.first + j) % row.cap : j;
+    if ((entry & 7) == 0 && j + 8 <= end) {
+      float v[8];
+      LoadHalf8(values + entry, v);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        for (int s = 0; s < kShare; ++s)
+          acc[s] += prob[s][j + e] * v[e];
+      j += 8;
+    } else {
+      const float v = static_cast<float>(values[entry]);
+      for (int s = 0; s < kShare; ++s)
+        acc[s] += prob[s][j] * v;
+      ++j;
+    }
   }
   for (int s = 0; s < kShare; ++s)
     red[s][t] = acc[s];
@@ -2561,6 +2713,12 @@ void Attention(const AttnArgs& args, hipStream_t stream) {
   if (args.batched) {
     AttentionBatchKernel<<<args.group_count * kNKV * args.max_chunks, 256, 0,
                            stream>>>(args);
+    AttentionCombineKernel<<<args.batch * kNH, kHD, 0, stream>>>(args);
+    return;
+  }
+  if (args.half) {
+    AttentionChunkHalfKernel<<<args.batch * kNKV * args.max_chunks, kT, 0,
+                               stream>>>(args);
     AttentionCombineKernel<<<args.batch * kNH, kHD, 0, stream>>>(args);
     return;
   }

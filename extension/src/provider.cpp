@@ -214,6 +214,22 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
       return 1;
     }
   }
+  // INKLING2_TOKENS names a file of raw 32-bit token ids: one long prompt.
+  if (const char* path = std::getenv("INKLING2_TOKENS")) {
+    std::FILE* file = std::fopen(path, "rb");
+    if (file) {
+      std::int32_t id;
+      while (std::fread(&id, 4, 1, file) == 1)
+        text.push_back(id);
+      std::fclose(file);
+    }
+    if (text.empty()) {
+      std::fprintf(stderr, "inkling2: cannot read tokens from %s\n", path);
+      return 1;
+    }
+    text_ctx = static_cast<std::int32_t>(text.size());
+    text_chunks = 1;
+  }
   const std::size_t n =
       text.empty() ? tokens.size()
                    : static_cast<std::size_t>(std::min<int>(

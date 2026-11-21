@@ -36,6 +36,7 @@ inline constexpr int kGemmGroup = 16;  // batch rows sharing one read of a weigh
 
 /// What one row needs from its session for one layer visit.
 struct RowState {
+  // The F32 cache, or null when the session only keeps the FP16 one (kh, vh).
   float* kv_k;  // cap rows of kHK
   float* kv_v;
   // Convolution histories (K, V, attention output, feed-forward output): the
@@ -60,8 +61,8 @@ struct RowState {
   //     kv_v[(head * cap + pos) * kHD + dim]
   int layout;
   int chunk_cap;  // cap / 1024, for layout 1
-  // Optional FP16 copies of the cache for the batched attention kernel, laid
-  // out as the matrix instruction wants them: keys with a position's 128
+  // The FP16 cache, read by the batched and by the per-row FP16 attention
+  // kernels, laid out as the matrix instruction wants it: keys with a position's 128
   // dimensions together, values with a dimension's positions together.
   // Layout 1: keys position-major per head,
   //     kh[(head * cap + pos) * kHD + dim]
@@ -258,6 +259,10 @@ struct AttnArgs {
   // (layout 0) the chunks start at the group's first window position rounded
   // down to 64, and max_chunks must be 2.
   bool batched;
+  // Without `batched`: one block per (row, key head, chunk) that reads the
+  // FP16 cache (queries, weights and sums stay F32). Works on both layouts;
+  // on sliding-window layers max_chunks must be 1. Needs the chunk scratch.
+  bool half;
   const std::uint16_t* qh;  // stride kHQ
   const AttnGroup* groups;
   int group_count;

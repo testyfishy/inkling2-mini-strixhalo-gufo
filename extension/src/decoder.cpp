@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -75,9 +76,25 @@ std::uint16_t HalfBits(float f, bool* exact) {
   return static_cast<std::uint16_t>(sign | h);
 }
 
+float HalfToFloat(std::uint16_t h) {
+  const std::uint32_t sign = std::uint32_t(h & 0x8000u) << 16;
+  const std::uint32_t exponent = (h >> 10) & 0x1fu, mantissa = h & 0x3ffu;
+  float magnitude;
+  if (exponent == 0)
+    magnitude = std::ldexp(static_cast<float>(mantissa), -24);
+  else
+    magnitude = std::ldexp(static_cast<float>(mantissa | 0x400u),
+                           static_cast<int>(exponent) - 25);
+  return sign ? -magnitude : magnitude;
+}
+
 }  // namespace
 
 struct GpuEngine::Impl {
+  static bool attention_window_env() {
+    const char* v = std::getenv("INKLING2_ATTN_WINDOW");
+    return !(v && *v == '0');
+  }
   // Device copies of one physical layer's weights.
   struct Layer {
     const std::uint16_t *wq, *wk, *wv, *wo, *gate, *sink, *rel, *kcp, *vcp;
@@ -91,9 +108,9 @@ struct GpuEngine::Impl {
   // One session's state for one layer visit. The convolution histories are
   // kept twice: a step reads one copy and writes the other.
   struct Slot {
-    float *k, *v;
+    // The F32 cache is only kept with INKLING2_F32_CACHE=1.
+    float *k{}, *v{};
     int cap;
-    // FP16 copies of a full-attention cache (gpu::RowState::kh), or null.
     std::uint16_t *kh{}, *vh{};
   };
   struct Session {
@@ -148,10 +165,17 @@ struct GpuEngine::Impl {
   int gemm_variant{0}, expert_variant{0};
   int single_threads{128}, head_threads{64};
   bool attention_window{true};
-  // Steps with at least this many rows per session on average run full
-  // attention through the batched FP16 kernel, which reads the cache once
-  // per group of rows (0 = never). Steps of one row per session are faster
-  // with the per-row kernel. INKLING2_WMMA_ATTN_MIN_ROWS.
+  // The key and value caches are FP16. INKLING2_F32_CACHE=1 keeps F32 caches
+  // beside them (three times the memory), which the F32 attention kernels
+  // need: they are then used by steps the two switches below leave to them,
+  // and by INKLING2_ATTN_AB as the reference.
+  bool keep_f32{EnvOr("INKLING2_F32_CACHE", 0) != 0};
+  // INKLING2_ATTN_HALF=0 (with the F32 cache): per-row attention on F32.
+  bool attn_half{EnvOr("INKLING2_ATTN_HALF", 1) != 0};
+  // Steps with at least this many rows per session on average run attention
+  // through the batched FP16 kernel, which reads the cache once per group of
+  // rows (0 = never). Steps of one row per session are faster with the
+  // per-row kernel. INKLING2_WMMA_ATTN_MIN_ROWS.
   int attn_batched_min{EnvOr("INKLING2_WMMA_ATTN_MIN_ROWS", 4)};
   // INKLING2_WMMA_ATTN_WINDOW=0 keeps sliding-window layers on the per-row
   // kernel.
@@ -160,10 +184,21 @@ struct GpuEngine::Impl {
   const gpu::AttnGroup* dev_groups{};
   std::size_t off_groups{0};
   int n_groups{0};
-  // INKLING2_ATTN_AB=1: run both attention kernels on every such visit and
-  // report how far apart their outputs are.
+  // INKLING2_ATTN_AB=1 (with the F32 cache): also run the per-row F32 kernels
+  // on every visit and report how far the outputs are from theirs.
   bool attn_ab{EnvOr("INKLING2_ATTN_AB", 0) != 0};
   std::vector<float> ab_old, ab_new;
+  // INKLING2_ATTN_STATS=N: each time a session's position crosses a multiple
+  // of N, measure on the host how concentrated the full-attention layers'
+  // weights are for the step's last row (a diagnostic; it is slow).
+  int attn_stats_every{EnvOr("INKLING2_ATTN_STATS", 0)};
+  bool attn_stats_now{false};
+  std::uint32_t stats_pos{0};
+  struct HeadStats {
+    double sink, last_1024, pos_999, pos_9999, slice_999, slice_9999,
+        slice_99999, chunk_9999;
+  };
+  std::vector<HeadStats> stats;
   double ab_max_diff{0}, ab_max_abs{0}, ab_sq_diff{0}, ab_sq{0};
   std::size_t ab_bad{0}, ab_visits{0};
   int max_chunks{1};
@@ -407,14 +442,14 @@ struct GpuEngine::Impl {
         const bool ring = c.is_swa[Physical(s)];
         slot.cap = ring ? swa_cap
                         : static_cast<int>((opt.context + 1023) / 1024 * 1024);
-        slot.k = Floats(std::size_t(slot.cap) * kHK, true);
-        slot.v = Floats(std::size_t(slot.cap) * kHK, true);
-        if (attn_batched_min > 0) {
-          slot.kh = static_cast<std::uint16_t*>(
-              Alloc(std::size_t(slot.cap) * kHK * 2, true));
-          slot.vh = static_cast<std::uint16_t*>(
-              Alloc(std::size_t(slot.cap) * kHK * 2, true));
+        if (keep_f32) {
+          slot.k = Floats(std::size_t(slot.cap) * kHK, true);
+          slot.v = Floats(std::size_t(slot.cap) * kHK, true);
         }
+        slot.kh = static_cast<std::uint16_t*>(
+            Alloc(std::size_t(slot.cap) * kHK * 2, true));
+        slot.vh = static_cast<std::uint16_t*>(
+            Alloc(std::size_t(slot.cap) * kHK * 2, true));
       }
     }
 
@@ -445,7 +480,8 @@ struct GpuEngine::Impl {
     act = Floats(B * kTopK * gpu::kFF);
     moe = Floats(B * kE);
     max_n = static_cast<int>(std::max<std::uint32_t>(opt.context, c.n_swa));
-    scratch = Floats(B * kNH * std::size_t(max_n));
+    if (keep_f32 && !attention_window_env())
+      scratch = Floats(B * kNH * std::size_t(max_n));
     const std::size_t groups = (B + gpu::kGemmGroup - 1) / gpu::kGemmGroup;
     xt_in = Floats(groups * 3 * kE * gpu::kGemmGroup);
     xt_attn = Floats(groups * kHQ * gpu::kGemmGroup);
@@ -608,6 +644,121 @@ struct GpuEngine::Impl {
     gpu::Copy(copy, stream);
   }
 
+  // How concentrated the attention weights of the step's last row are in
+  // this full-attention visit, computed on the host from the device's q, r,
+  // sink and FP16 keys: one entry per query head.
+  void AttnStats(const gpu::RowState* rows, std::uint32_t il) {
+    Check(hipStreamSynchronize(stream), "synchronize");
+    const std::size_t b = static_cast<std::size_t>(batch) - 1;
+    gpu::RowState row;
+    Check(hipMemcpy(&row, rows + b, sizeof(row), hipMemcpyDeviceToHost), "row");
+    const std::size_t n = static_cast<std::size_t>(row.pos) + 1;
+    std::vector<float> hq(kHQ), hr(kNR), hsink(kNH);
+    Check(hipMemcpy(hq.data(), q + b * kHQ, kHQ * 4, hipMemcpyDeviceToHost), "q");
+    Check(hipMemcpy(hr.data(), r + b * kNR, kNR * 4, hipMemcpyDeviceToHost), "r");
+    Check(hipMemcpy(hsink.data(), sink + b * kNH, kNH * 4, hipMemcpyDeviceToHost),
+          "sink");
+    const Vec& table = m.layers[il].rel_bias;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(gpu::kHD));
+    std::vector<std::uint16_t> keys(n * gpu::kHD);
+    std::vector<float> key(n * gpu::kHD);
+    stats.resize(stats.size() + kNH);
+    HeadStats* out = stats.data() + stats.size() - kNH;
+    for (std::size_t kv = 0; kv < kNKV; ++kv) {
+      Check(hipMemcpy(keys.data(),
+                      row.kh + kv * std::size_t(row.cap) * gpu::kHD,
+                      keys.size() * 2, hipMemcpyDeviceToHost),
+            "keys");
+      for (std::size_t i = 0; i < keys.size(); ++i)
+        key[i] = HalfToFloat(keys[i]);
+      const int share = kNH / kNKV;
+      std::vector<std::thread> pool;
+      for (int s = 0; s < share; ++s)
+        pool.emplace_back([&, s] {
+          const std::size_t h = kv * share + s;
+          std::vector<double> w(n);
+          double max = 0.0;  // the zero sink's logit
+          for (std::size_t j = 0; j < n; ++j) {
+            float dot = 0.0f;
+            for (int i = 0; i < gpu::kHD; ++i)
+              dot += hq[h * gpu::kHD + i] * key[j * gpu::kHD + i];
+            double v = double(dot) * scale - hsink[h];
+            const std::size_t distance = n - 1 - j;
+            if (distance < c.n_rel_extent)
+              for (int x = 0; x < gpu::kNRel; ++x)
+                v += double(table[distance * gpu::kNRel + x]) * hr[h * gpu::kNRel + x];
+            w[j] = v;
+            max = std::max(max, v);
+          }
+          double total = std::exp(-max);
+          for (double& v : w) {
+            v = std::exp(v - max);
+            total += v;
+          }
+          HeadStats& st = out[h];
+          st.sink = std::exp(-max) / total;
+          double recent = 0.0;
+          for (std::size_t j = n > 1024 ? n - 1024 : 0; j < n; ++j)
+            recent += w[j];
+          st.last_1024 = recent / total;
+          // The fewest units (positions, slices of 64, chunks of 1,024) that
+          // hold all but `miss` of the weight given to positions.
+          const double given = total - std::exp(-max);
+          auto fewest = [&](std::size_t unit, double miss) {
+            std::vector<double> mass((n + unit - 1) / unit, 0.0);
+            for (std::size_t j = 0; j < n; ++j)
+              mass[j / unit] += w[j];
+            std::sort(mass.begin(), mass.end(), std::greater<double>());
+            double covered = 0.0;
+            std::size_t count = 0;
+            // `miss` is a share of everything, the sink included.
+            while (count < mass.size() && given - covered > miss * total)
+              covered += mass[count++];
+            return double(count) / double(mass.size());
+          };
+          st.pos_999 = fewest(1, 1e-3);
+          st.pos_9999 = fewest(1, 1e-4);
+          st.slice_999 = fewest(64, 1e-3);
+          st.slice_9999 = fewest(64, 1e-4);
+          st.slice_99999 = fewest(64, 1e-5);
+          st.chunk_9999 = fewest(1024, 1e-4);
+        });
+      for (auto& t : pool)
+        t.join();
+    }
+  }
+
+  // Prints and clears what AttnStats collected in this step.
+  void ReportAttnStats(std::uint32_t pos) {
+    if (stats.empty())
+      return;
+    auto line = [&](const char* name, double HeadStats::*field) {
+      std::vector<double> v;
+      double mean = 0.0;
+      for (const HeadStats& st : stats) {
+        v.push_back(st.*field);
+        mean += st.*field;
+      }
+      std::sort(v.begin(), v.end());
+      std::fprintf(stderr, "  %-46s mean %7.4f  median %7.4f  90%% %7.4f  max %7.4f\n",
+                   name, mean / v.size(), v[v.size() / 2], v[v.size() * 9 / 10],
+                   v.back());
+    };
+    std::fprintf(stderr,
+                 "attention stats at position %u: %zu query heads over the "
+                 "full-attention visits (shares of 1)\n",
+                 pos, stats.size());
+    line("weight on the sink", &HeadStats::sink);
+    line("weight on the last 1,024 positions", &HeadStats::last_1024);
+    line("positions holding all but 1e-3", &HeadStats::pos_999);
+    line("positions holding all but 1e-4", &HeadStats::pos_9999);
+    line("slices of 64 holding all but 1e-3", &HeadStats::slice_999);
+    line("slices of 64 holding all but 1e-4", &HeadStats::slice_9999);
+    line("slices of 64 holding all but 1e-5", &HeadStats::slice_99999);
+    line("chunks of 1,024 holding all but 1e-4", &HeadStats::chunk_9999);
+    stats.clear();
+  }
+
   void Visit(std::uint32_t slot_index, std::uint32_t il, bool looped) {
     const Layer& l = layers[il];
     const bool swa = c.is_swa[il];
@@ -735,11 +886,15 @@ struct GpuEngine::Impl {
     at.chunk_max = chunk_max;
     at.chunk_sum = chunk_sum;
     at.chunk_out = chunk_out;
+    if (!swa && attn_stats_now)
+      AttnStats(rows, il);
+    // Which kernel: the batched FP16 one for steps of several rows per
+    // session, else the per-row FP16 one; the F32 kernels only when the F32
+    // cache is kept and a switch asks for them.
     const bool batched =
         attn_batched_min > 0 && batch >= attn_batched_min * n_groups &&
         (!swa || attn_batched_window);
-    if (batched && swa)
-      at.max_chunks = 2;
+    const bool half = !batched && (attn_half || !keep_f32);
     if (batched) {
       gpu::ToHalfArgs h{};
       h.x = q;
@@ -752,7 +907,7 @@ struct GpuEngine::Impl {
       at.groups = dev_groups;
       at.group_count = n_groups;
     }
-    if (batched && attn_ab) {
+    if ((batched || half) && attn_ab && keep_f32) {
       const std::size_t n = std::size_t(batch) * kHQ;
       ab_old.resize(n);
       ab_new.resize(n);
@@ -760,8 +915,14 @@ struct GpuEngine::Impl {
       Check(hipMemcpyAsync(ab_old.data(), attn, n * 4, hipMemcpyDeviceToHost,
                            stream),
             "copy attention");
-      at.batched = true;
-      gpu::Attention(at, stream);
+    }
+    at.batched = batched;
+    at.half = half;
+    if (swa && (batched || half))
+      at.max_chunks = batched ? 2 : 1;
+    gpu::Attention(at, stream);
+    if ((batched || half) && attn_ab && keep_f32) {
+      const std::size_t n = std::size_t(batch) * kHQ;
       Check(hipMemcpyAsync(ab_new.data(), attn, n * 4, hipMemcpyDeviceToHost,
                            stream),
             "copy attention");
@@ -778,9 +939,6 @@ struct GpuEngine::Impl {
         ab_sq += o * o;
       }
       ++ab_visits;
-    } else {
-      at.batched = batched;
-      gpu::Attention(at, stream);
     }
     Mark(3);
 
@@ -919,67 +1077,35 @@ struct GpuEngine::Impl {
     const std::uint32_t have = session.pos;
     if (have == 0 || position <= have || position > opt.context)
       throw std::runtime_error("inkling2 gpu: cannot fake that context");
-    const std::size_t chunk_floats = std::size_t(gpu::kHD) * 1024;
+    // Every array of a full-attention cache holds, per key/value head, blocks
+    // of 1,024 positions times 128 dimensions (in one order or the other):
+    // every later block becomes a copy of the first, so that position p holds
+    // what position p % 1024 holds.
+    const std::size_t block = std::size_t(gpu::kHD) * 1024;
     const std::uint32_t chunks = (position + 1023) / 1024;
-    std::vector<std::pair<const float*, std::uint16_t*>> fake_values;
     for (std::uint32_t s = 0; s < c.visits(); ++s) {
       if (c.is_swa[Physical(s)])
         continue;  // sliding-window layers only keep their window
       Slot& slot = session.slots[s];
-      const std::size_t chunk_cap = std::size_t(slot.cap) / 1024;
+      const std::size_t per_head = std::size_t(slot.cap) * gpu::kHD;
       for (std::size_t head = 0; head < kNKV; ++head) {
-        // Keys: every later chunk becomes a copy of the head's first chunk.
-        float* keys = slot.k + head * chunk_cap * chunk_floats;
+        float* f32[2] = {slot.k ? slot.k + head * per_head : nullptr,
+                         slot.v ? slot.v + head * per_head : nullptr};
+        std::uint16_t* f16[2] = {slot.kh + head * per_head,
+                                 slot.vh + head * per_head};
         for (std::uint32_t chunk = 1; chunk < chunks; ++chunk)
-          Check(hipMemcpyAsync(keys + chunk * chunk_floats, keys,
-                               chunk_floats * 4, hipMemcpyDeviceToDevice,
-                               stream),
-                "copy keys");
-        // Values: double the filled positions until they reach `position`.
-        float* values = slot.v + head * std::size_t(slot.cap) * gpu::kHD;
-        for (std::uint32_t filled = have; filled < position;) {
-          const std::uint32_t count = std::min(filled, position - filled);
-          Check(hipMemcpyAsync(values + std::size_t(filled) * gpu::kHD, values,
-                               std::size_t(count) * gpu::kHD * 4,
-                               hipMemcpyDeviceToDevice, stream),
-                "copy values");
-          filled += count;
-        }
-        if (!slot.kh)
-          continue;
-        // The FP16 copies must hold what the F32 caches hold. Keys are
-        // position-major there: every later chunk copies the first.
-        std::uint16_t* kh = slot.kh + head * std::size_t(slot.cap) * gpu::kHD;
-        for (std::uint32_t chunk = 1; chunk < chunks; ++chunk)
-          Check(hipMemcpyAsync(kh + chunk * chunk_floats, kh, chunk_floats * 2,
-                               hipMemcpyDeviceToDevice, stream),
-                "copy keys");
-        fake_values.push_back({values, slot.vh + head * chunk_cap * chunk_floats});
+          for (int i = 0; i < 2; ++i) {
+            if (f32[i])
+              Check(hipMemcpyAsync(f32[i] + chunk * block, f32[i], block * 4,
+                                   hipMemcpyDeviceToDevice, stream),
+                    "copy cache");
+            Check(hipMemcpyAsync(f16[i] + chunk * block, f16[i], block * 2,
+                                 hipMemcpyDeviceToDevice, stream),
+                  "copy cache");
+          }
       }
     }
     Check(hipStreamSynchronize(stream), "synchronize");
-    // FP16 values are dimension-major in chunks: rebuilt on the host from the
-    // F32 values, which the doubling above has filled.
-    if (!fake_values.empty()) {
-      std::vector<float> wide(std::size_t(position) * gpu::kHD);
-      std::vector<std::uint16_t> half(std::size_t(chunks) * chunk_floats);
-      for (const auto& [src, dst] : fake_values) {
-        Check(hipMemcpy(wide.data(), src, wide.size() * 4,
-                        hipMemcpyDeviceToHost),
-              "read values");
-        for (std::size_t p = 0; p < position; ++p)
-          for (std::size_t d = 0; d < gpu::kHD; ++d) {
-            bool exact;
-            const float v =
-                std::clamp(wide[p * gpu::kHD + d], -65504.0f, 65504.0f);
-            half[((p / 1024) * gpu::kHD + d) * 1024 + p % 1024] =
-                HalfBits(v, &exact);
-          }
-        Check(hipMemcpy(dst, half.data(), half.size() * 2,
-                        hipMemcpyHostToDevice),
-              "write values");
-      }
-    }
     session.pos = position;
   }
 
@@ -1114,6 +1240,13 @@ struct GpuEngine::Impl {
                          hipMemcpyHostToDevice, stream),
           "copy step inputs");
 
+    attn_stats_now = false;
+    if (attn_stats_every > 0) {
+      const Session& s0 = sessions[rows[0].session];
+      const std::uint32_t before = s0.pos, after = max_pos + 1;
+      attn_stats_now = before / attn_stats_every != after / attn_stats_every;
+      stats_pos = max_pos;
+    }
     Mark(-1);
     gpu::EmbedArgs e{};
     e.table = tok_embd;
@@ -1174,6 +1307,7 @@ struct GpuEngine::Impl {
       Tap();
       Visit(il, il, false);
     }
+    ReportAttnStats(stats_pos);
     if (opt.capture_features) {
       gpu::FinalArgs f{};
       f.stack = stack;
