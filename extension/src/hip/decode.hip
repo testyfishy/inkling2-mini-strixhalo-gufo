@@ -318,6 +318,38 @@ __launch_bounds__(kCtrlThreads) __global__ void CtrlDownKernel(CtrlArgs a) {
   }
 }
 
+// One block per (row, controller): the two norms, and low from the products.
+__launch_bounds__(256) __global__ void CtrlCombineKernel(CtrlArgs a) {
+  __shared__ float sh[2][256];
+  const int t = threadIdx.x;
+  const int c = blockIdx.x % a.count;
+  const std::size_t b = blockIdx.x / a.count;
+  const float* cur = a.cur + b * a.cur_stride + c * kE;
+  const float* msg = a.msg + b * a.msg_stride + c * kE;
+  float v[2] = {0.0f, 0.0f};
+  for (int i = t; i < kE; i += 256) {
+    const float x = cur[i], y = msg[i];
+    v[0] += x * x;
+    v[1] += y * y;
+  }
+  sh[0][t] = v[0];
+  sh[1][t] = v[1];
+  __syncthreads();
+  for (int step = 128; step > 0; step >>= 1) {
+    if (t < step) {
+      sh[0][t] += sh[0][t + step];
+      sh[1][t] += sh[1][t + step];
+    }
+    __syncthreads();
+  }
+  if (t < kRank) {
+    const float inv_cur = 1.0f / sqrtf(sh[0][0] / kE + 1e-6f);
+    const float inv_msg = 1.0f / sqrtf(sh[1][0] / kE + 1e-6f);
+    const std::size_t at = (b * 3 + c) * kRank + t;
+    a.low[at] = a.yc[at] * inv_cur + a.ym[at] * inv_msg;
+  }
+}
+
 // cur = (1 - tanh(forget)) * cur + tanh(gain) * msg, one thread per value.
 __global__ void CtrlApplyKernel(CtrlArgs a) {
   const std::size_t idx =
@@ -327,13 +359,26 @@ __global__ void CtrlApplyKernel(CtrlArgs a) {
   const std::size_t b = idx / (static_cast<std::size_t>(kE) * a.count);
   if (b >= static_cast<std::size_t>(a.batch))
     return;
-  const float* low = a.low + (b * 3 + c) * kRank;
-  const float* gain_row = a.gain[c] + static_cast<std::size_t>(i) * kRank;
-  const float* forget_row = a.forget[c] + static_cast<std::size_t>(i) * kRank;
   float gain = 0.0f, forget = 0.0f;
-  for (int r = 0; r < kRank; ++r) {
-    gain += gain_row[r] * low[r];
-    forget += forget_row[r] * low[r];
+  if (a.yg) {
+    // tanh(v) = expm1(2 v) / (expm1(2 v) + 2), exact to rounding and several
+    // times cheaper than tanhf here; beyond |v| = 10 it is 1 in F32.
+    const float g = fminf(fmaxf(a.yg[(b * 3 + c) * kE + i], -10.0f), 10.0f);
+    const float f = fminf(fmaxf(a.yf[(b * 3 + c) * kE + i], -10.0f), 10.0f);
+    const float eg = expm1f(2.0f * g), ef = expm1f(2.0f * f);
+    float* cur = a.cur + b * a.cur_stride + c * kE;
+    const float msg = a.msg[b * a.msg_stride + c * kE + i];
+    const float x = cur[i];
+    cur[i] = x - ef / (ef + 2.0f) * x + eg / (eg + 2.0f) * msg;
+    return;
+  } else {
+    const float* low = a.low + (b * 3 + c) * kRank;
+    const float* gain_row = a.gain[c] + static_cast<std::size_t>(i) * kRank;
+    const float* forget_row = a.forget[c] + static_cast<std::size_t>(i) * kRank;
+    for (int r = 0; r < kRank; ++r) {
+      gain += gain_row[r] * low[r];
+      forget += forget_row[r] * low[r];
+    }
   }
   float* cur = a.cur + b * a.cur_stride + c * kE;
   const float msg = a.msg[b * a.msg_stride + c * kE + i];
@@ -420,7 +465,11 @@ __global__ void ToHalfKernel(ToHalfArgs a) {
     return;
   float v = a.x[b * a.x_stride + c];
   v = fminf(fmaxf(v, -65504.0f), 65504.0f);
-  reinterpret_cast<_Float16*>(a.out)[i] = static_cast<_Float16>(v);
+  const _Float16 h = static_cast<_Float16>(v);
+  reinterpret_cast<_Float16*>(a.out)[i] = h;
+  if (a.out_lo)
+    reinterpret_cast<_Float16*>(a.out_lo)[i] =
+        static_cast<_Float16>(v - static_cast<float>(h));
 }
 
 // The projections with the 16x16x16 FP16 matrix instruction, FP32 sums.
@@ -477,8 +526,12 @@ __launch_bounds__(256) __global__ void WmmaGemmKernel(GemmArgs a) {
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
       const int t = t0 + g * 16 + 2 * e + hi;
-      if (t < a.batch)
-        job.y[static_cast<std::size_t>(t) * job.y_stride + r] = acc[g][e];
+      if (t < a.batch) {
+        float* y = job.swap
+                       ? job.y + static_cast<std::size_t>(r) * job.y_stride + t
+                       : job.y + static_cast<std::size_t>(t) * job.y_stride + r;
+        *y = job.add ? *y + acc[g][e] : acc[g][e];
+      }
     }
 }
 
@@ -580,8 +633,12 @@ __launch_bounds__(256) __global__ void WmmaGemmBlockKernel(GemmArgs a) {
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const int t = t_block + (wt * WTS + g) * 16 + 2 * e + hi;
-        if (t < a.batch)
-          job.y[static_cast<std::size_t>(t) * job.y_stride + r] = acc[i][g][e];
+        if (t < a.batch) {
+          float* y = job.swap
+                         ? job.y + static_cast<std::size_t>(r) * job.y_stride + t
+                         : job.y + static_cast<std::size_t>(t) * job.y_stride + r;
+          *y = job.add ? *y + acc[i][g][e] : acc[i][g][e];
+        }
       }
   }
 }
@@ -1177,16 +1234,17 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
   const int tid = threadIdx.x;
   const int lane = tid & 31, wave = tid >> 5;
   const int sl = lane & 15, hi = lane >> 4;
-  const int chunk = blockIdx.x % a.max_chunks;
+  const int part = blockIdx.x % a.max_chunks;
+  const int span = a.span > 0 ? a.span : 1;
   const int kv_head = (blockIdx.x / a.max_chunks) % kNKV;
   const AttnGroup group = a.groups[blockIdx.x / (a.max_chunks * kNKV)];
   const RowState row0 = a.rows[group.row0];
   // The group's rows are at consecutive positions pos0, pos0 + 1, ...
   const int pos0 = row0.pos, pos_last = pos0 + group.count - 1;
   const bool ring = row0.layout == 0;
-  const int start = (ring ? row0.first / kAP * kAP : 0) + chunk * kT;
-  if (!ring && start > pos_last)
-    return;  // the combine does not look at this chunk
+  const int origin = ring ? row0.first / kAP * kAP : 0;
+  if (!ring && part * span * kT > pos_last)
+    return;  // the combine does not look at this part
 
   // Queries: index s * 32 + row for query head kv_head * 3 + s.
   for (int p = 0; p < kAQ * (kHD / 2) / 256; ++p) {
@@ -1225,13 +1283,17 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
       ring ? row0.kh + kv_head * kHD
            : row0.kh + static_cast<std::size_t>(kv_head) * row0.cap * kHD;
   const std::size_t key_stride = ring ? kHK : kHD;
+  const std::size_t value_stride = ring ? row0.cap : kT;
+  Float8 out[2 * kShare] = {};
+
+  for (int chunk = part * span; chunk < (part + 1) * span; ++chunk) {
+  const int start = origin + chunk * kT;
+  if (start > pos_last)
+    break;
   const std::uint16_t* values =
       ring ? row0.vh + static_cast<std::size_t>(kv_head) * kHD * row0.cap
            : row0.vh + (static_cast<std::size_t>(kv_head) * row0.chunk_cap + chunk) *
                            kHD * kT;
-  const std::size_t value_stride = ring ? row0.cap : kT;
-  Float8 out[2 * kShare] = {};
-
   for (int base = 0; base < kT && start + base <= pos_last; base += kAP) {
     // The slice's first entry in the key and in the value arrays.
     const std::size_t key_entry = ring ? (start + base) % row0.cap : start + base;
@@ -1356,6 +1418,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
     }
     __syncthreads();
   }
+  }
 
   constexpr float kUnscale = 1.0f / kProbScale;
 #pragma unroll
@@ -1369,7 +1432,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
           (static_cast<std::size_t>(group.row0 + row) * kNH + kv_head * kShare +
            (qt >> 1)) *
               a.max_chunks +
-          chunk;
+          part;
       a.chunk_out[slot * kHD + wave * 16 + sl] = out[qt][e] * kUnscale;
     }
   if (red_slot == 0)
@@ -1382,7 +1445,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
           (static_cast<std::size_t>(group.row0 + row) * kNH + kv_head * kShare +
            (qt >> 1)) *
               a.max_chunks +
-          chunk;
+          part;
       a.chunk_max[slot] = run_max[i];
       a.chunk_sum[slot] = run_sum[i] * kUnscale;
     }
@@ -1398,7 +1461,9 @@ __launch_bounds__(kHD) __global__ void AttentionCombineKernel(AttnArgs a) {
   const int n = row.pos - row.first + 1;
   // Sliding-window layers: the batched kernel wrote every chunk, with the
   // lowest maximum where a row has no position.
-  const int chunks = row.layout == 0 ? a.max_chunks : (n + kT - 1) / kT;
+  const int per_part = kT * (a.span > 0 ? a.span : 1);
+  const int chunks =
+      row.layout == 0 ? a.max_chunks : (n + per_part - 1) / per_part;
   const std::size_t base = (b * kNH + h) * a.max_chunks;
   float max = 0.0f;  // the zero sink's logit
   for (int c = 0; c < chunks; ++c)
@@ -2192,16 +2257,16 @@ __device__ __forceinline__ void LoadHalfBf16(const std::uint16_t* w,
     out[i] = v.u[i];
 }
 
-// A block owns one expert, 128 weight rows and up to 32 of the pairs that
-// selected the expert; it works like WmmaGemmBlockKernel, with the weights
-// converted to FP16 as they are copied into shared memory.
+// A block owns one expert, 128 weight rows and up to 32 * WTS of the pairs
+// that selected the expert; it works like WmmaGemmBlockKernel, with the
+// weights converted to FP16 as they are copied into shared memory.
 //   Up:   the rows are 64 hidden units' gate rows and up rows, the inputs are
 //         the pairs' x; a wave holds gate and up of the same units and stores
 //         the activation.
 //   Down: the rows are 128 outputs, the inputs are the pairs' activations.
-template <bool Up, bool Nvfp4>
+template <bool Up, bool Nvfp4, int WTS>
 __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
-  constexpr int BM = 128, BN = 32, BK = 4;
+  constexpr int BM = 128, BN = 32 * WTS, BK = 4;
   constexpr int kCols = Up ? kE : kFF;
   constexpr int kPerExpert = Up ? kFF / 64 : kE / BM;
   __shared__ std::uint32_t s_a[BK][BM][8];
@@ -2224,6 +2289,7 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
                              static_cast<std::size_t>(e) * (Up ? 2 * kFF : kE) *
                                  kRowBytes;
   constexpr int UA = BM * BK / 256;
+  constexpr int UB = (BN * BK + 255) / 256;
   const std::uint8_t* w_row[UA];
 #pragma unroll
   for (int p = 0; p < UA; ++p) {
@@ -2232,18 +2298,24 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
                        : rb * BM + pr;
     w_row[p] = base + static_cast<std::size_t>(row) * kRowBytes;
   }
-  const std::uint32_t* x_src = nullptr;
-  if (tid < BN * BK) {
-    const int t = t_block + tid / BK;
+  const std::uint32_t* x_src[UB];
+#pragma unroll
+  for (int p = 0; p < UB; ++p) {
+    const int unit = p * 256 + tid;
+    const int t = t_block + unit / BK;
     const int pair = list[t < n ? t : n - 1];
     const std::uint16_t* x =
         Up ? a.xh + static_cast<std::size_t>(pair / kTopK) * kE
            : a.acth + static_cast<std::size_t>(pair) * kFF;
-    x_src = reinterpret_cast<const std::uint32_t*>(x + (tid % BK) * 16);
+    x_src[p] = reinterpret_cast<const std::uint32_t*>(x + (unit % BK) * 16);
   }
-  // A wave whose batch tile is past the expert's pairs only helps copying.
-  const bool live = t_block + wt * 16 < n;
-  Float8 acc[2] = {};
+  // How many of this wave's batch tiles hold pairs; a wave with none only
+  // helps copying.
+  int live = 0;
+#pragma unroll
+  for (int g = 0; g < WTS; ++g)
+    live += t_block + (wt * WTS + g) * 16 < n ? 1 : 0;
+  Float8 acc[2][WTS] = {};
   for (int k = 0; k < kCols; k += 16 * BK) {
 #pragma unroll
     for (int p = 0; p < UA; ++p) {
@@ -2256,51 +2328,74 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
                          ks * 16,
                      dst);
     }
-    if (tid < BN * BK) {
-      const std::uint32_t* src = x_src + k / 2;
-      std::uint32_t* dst = s_b[tid % BK][tid / BK];
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        dst[i] = src[i];
+    for (int p = 0; p < UB; ++p) {
+      const int unit = p * 256 + tid;
+      if (unit < BN * BK) {
+        const std::uint32_t* src = x_src[p] + k / 2;
+        std::uint32_t* dst = s_b[unit % BK][unit / BK];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          dst[i] = src[i];
+      }
     }
     __syncthreads();
-    if (live) {
+    if (live > 0) {
 #pragma unroll
       for (int ks = 0; ks < BK; ++ks) {
-        Half16 xb;
-        __builtin_memcpy(&xb, s_b[ks][wt * 16 + sl], 32);
+        Half16 wa[2];
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-          Half16 wa;
-          __builtin_memcpy(&wa, s_a[ks][(wr * 2 + i) * 16 + sl], 32);
-          acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[i]);
+        for (int i = 0; i < 2; ++i)
+          __builtin_memcpy(&wa[i], s_a[ks][(wr * 2 + i) * 16 + sl], 32);
+#pragma unroll
+        for (int g = 0; g < WTS; ++g) {
+          if (g >= live)
+            break;
+          Half16 xb;
+          __builtin_memcpy(&xb, s_b[ks][(wt * WTS + g) * 16 + sl], 32);
+#pragma unroll
+          for (int i = 0; i < 2; ++i)
+            acc[i][g] =
+                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa[i], acc[i][g]);
         }
       }
     }
     __syncthreads();
   }
-  if (!live)
-    return;
 #pragma unroll
-  for (int el = 0; el < 8; ++el) {
-    const int t = t_block + wt * 16 + 2 * el + hi;
-    if (t >= n)
-      continue;
-    const int pair = list[t];
-    if constexpr (Up) {
-      const float scale = a.up_scale[pair];
-      const float v = Situ(acc[0][el] * scale, acc[1][el] * scale, a.situ_beta,
-                           a.situ_linear_beta);
-      reinterpret_cast<_Float16*>(a.acth)[static_cast<std::size_t>(pair) * kFF +
-                                          rb * 64 + wr * 16 + sl] =
-          static_cast<_Float16>(v);
-    } else {
-      const float coef = a.coef[pair];
+  for (int g = 0; g < WTS; ++g)
 #pragma unroll
-      for (int i = 0; i < 2; ++i)
-        a.contrib[static_cast<std::size_t>(pair) * kE + rb * BM +
-                  (wr * 2 + i) * 16 + sl] = coef * acc[i][el];
+    for (int el = 0; el < 8; ++el) {
+      const int t = t_block + (wt * WTS + g) * 16 + 2 * el + hi;
+      if (t >= n)
+        continue;
+      const int pair = list[t];
+      if constexpr (Up) {
+        const float scale = a.up_scale[pair];
+        const float v = Situ(acc[0][g][el] * scale, acc[1][g][el] * scale,
+                             a.situ_beta, a.situ_linear_beta);
+        reinterpret_cast<_Float16*>(a.acth)[static_cast<std::size_t>(pair) * kFF +
+                                            rb * 64 + wr * 16 + sl] =
+            static_cast<_Float16>(v);
+      } else {
+        const float coef = a.coef[pair];
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+          a.contrib[static_cast<std::size_t>(pair) * kE + rb * BM +
+                    (wr * 2 + i) * 16 + sl] = coef * acc[i][g][el];
+      }
     }
+}
+
+template <int WTS>
+void LaunchExpertWmma(const BatchExpertArgs& args, hipStream_t stream) {
+  const dim3 grid(kNX * 18, (args.batch + 32 * WTS - 1) / (32 * WTS));
+  if (args.nvfp4) {
+    ExpertWmmaKernel<true, true, WTS><<<grid, 256, 0, stream>>>(args);
+    ExpertWmmaKernel<false, true, WTS><<<grid, 256, 0, stream>>>(args);
+  } else {
+    ExpertWmmaKernel<true, false, WTS><<<grid, 256, 0, stream>>>(args);
+    ExpertWmmaKernel<false, false, WTS><<<grid, 256, 0, stream>>>(args);
   }
 }
 
@@ -2739,8 +2834,13 @@ void GlueC(const GlueCArgs& args, hipStream_t stream) {
   GlueCKernel<<<args.batch, kT, 0, stream>>>(args);
 }
 
+void CtrlCombine(const CtrlArgs& args, hipStream_t stream) {
+  CtrlCombineKernel<<<args.batch * args.count, 256, 0, stream>>>(args);
+}
+
 void Router(const RouterArgs& args, hipStream_t stream) {
-  RouterLogitsKernel<<<args.batch * kNX, kRouterThreads, 0, stream>>>(args);
+  if (!args.logits_ready)
+    RouterLogitsKernel<<<args.batch * kNX, kRouterThreads, 0, stream>>>(args);
   RouterSelectKernel<<<args.batch, kNX, 0, stream>>>(args);
 }
 
@@ -2749,14 +2849,19 @@ void BatchExperts(const BatchExpertArgs& args, hipStream_t stream) {
     ExpertGroupKernel<<<1, kNX, 0, stream>>>(args);
     ToHalfArgs h{args.x, kE, args.xh, kE, args.batch};
     ToHalfKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0, stream>>>(h);
-    const dim3 grid(kNX * 18, (args.batch + 31) / 32);
-    if (args.nvfp4) {
-      ExpertWmmaKernel<true, true><<<grid, 256, 0, stream>>>(args);
-      ExpertWmmaKernel<false, true><<<grid, 256, 0, stream>>>(args);
-    } else {
-      ExpertWmmaKernel<true, false><<<grid, 256, 0, stream>>>(args);
-      ExpertWmmaKernel<false, false><<<grid, 256, 0, stream>>>(args);
-    }
+    // A row picks 8 of 128 experts: batch / 16 pairs per expert on average.
+    // The tile width follows that, so that an expert's weights are read
+    // about once.
+    const int wide = args.wmma_tiles > 0 ? args.wmma_tiles
+                     : args.batch <= 384 ? 1
+                     : args.batch <= 768 ? 2
+                                         : 4;
+    if (wide == 1)
+      LaunchExpertWmma<1>(args, stream);
+    else if (wide == 2)
+      LaunchExpertWmma<2>(args, stream);
+    else
+      LaunchExpertWmma<4>(args, stream);
     ExpertSumKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0,
                       stream>>>(args);
     return;

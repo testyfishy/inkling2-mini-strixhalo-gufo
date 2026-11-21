@@ -122,7 +122,18 @@ struct CtrlArgs {
   float* low;
   int count;
   int batch;
+  // For CtrlCombine: down[:, :kE] cur and down[:, kE:] msg, unnormalized,
+  // laid out like `low`.
+  const float* yc;
+  const float* ym;
+  // For CtrlApply: when set, gain low and forget low are already here, kE
+  // values per (row, controller), laid out like cur with stride 3 * kE.
+  const float* yg;
+  const float* yf;
 };
+/// low = yc / rms(cur) + ym / rms(msg): CtrlDown with the two products done
+/// elsewhere (by Gemm).
+void CtrlCombine(const CtrlArgs& args, hipStream_t stream);
 void CtrlDown(const CtrlArgs& args, hipStream_t stream);
 void CtrlApply(const CtrlArgs& args, hipStream_t stream);
 
@@ -156,6 +167,12 @@ struct GemmJob {
   const std::uint16_t* wh;
   const std::uint16_t* xh;
   int xh_stride;
+  // Matrix-instruction kernels only: add the product to y instead of storing
+  // it (for products split over several launches).
+  bool add;
+  // Matrix-instruction kernels only: store row r of batch entry t at
+  // y[r * y_stride + t] instead of y[t * y_stride + r].
+  bool swap;
 };
 struct GemmArgs {
   GemmJob jobs[9];
@@ -194,6 +211,9 @@ struct ToHalfArgs {
   std::uint16_t* out;
   int cols;
   int batch;
+  // Optional second part: the FP16 value of what rounding to `out` lost, so
+  // that out + out_lo carries about 22 significant bits of x.
+  std::uint16_t* out_lo;
 };
 void ToHalf(const ToHalfArgs& args, hipStream_t stream);
 
@@ -259,6 +279,11 @@ struct AttnArgs {
   // (layout 0) the chunks start at the group's first window position rounded
   // down to 64, and max_chunks must be 2.
   bool batched;
+  // With `batched` on layout 1: a block walks `span` consecutive chunks and
+  // leaves one partial result for them, so that the scratch holds max_chunks
+  // = ceil(chunks / span) partials per head however long the context is
+  // (0 = 1).
+  int span;
   // Without `batched`: one block per (row, key head, chunk) that reads the
   // FP16 cache (queries, weights and sums stay F32). Works on both layouts;
   // on sliding-window layers max_chunks must be 1. Needs the chunk scratch.
@@ -303,6 +328,7 @@ struct RouterArgs {
   float* up_scale;     // stride kTopK, written
   float* coef;         // stride kTopK, written
   int batch;
+  bool logits_ready;   // `logits` already holds gate_inp x
 };
 void Router(const RouterArgs& args, hipStream_t stream);
 
@@ -347,6 +373,8 @@ struct BatchExpertArgs {
   float* xs;
   std::uint32_t* aq;
   float* as;
+  // Variant 5: pairs per block / 32 (1, 2 or 4; 0 = by batch).
+  int wmma_tiles;
   // Variant 5 scratch: FP16 copies of x (kE per row) and act (kFF per pair).
   std::uint16_t* xh;
   std::uint16_t* acth;

@@ -91,6 +91,18 @@ float HalfToFloat(std::uint16_t h) {
 }  // namespace
 
 struct GpuEngine::Impl {
+  // A small F32 matrix as hi + lo, both FP16 (lo null when it is all zero).
+  struct Split {
+    const std::uint16_t* hi{};
+    const std::uint16_t* lo{};
+  };
+  struct SplitJob {
+    Split w;
+    const std::uint16_t *xh, *xl;
+    int x_stride;
+    float* y;
+    int y_stride, rows, cols;
+  };
   static bool attention_window_env() {
     const char* v = std::getenv("INKLING2_ATTN_WINDOW");
     return !(v && *v == '0');
@@ -104,6 +116,9 @@ struct GpuEngine::Impl {
         *ffn_post, *norm[3], *res_query, *ffn_res_query, *ffn_norm, *gate_inp,
         *exp_probs_b, *up_scale, *down_scale, *msg_query;
     const float *ctrl_down[4], *ctrl_gain[4], *ctrl_forget[4];
+    // The router and the controllers' down matrices (cur columns, msg
+    // columns) as two FP16 parts each, for SplitGemm.
+    Split gate_split, down_cur[4], down_msg[4], gain_split[4], forget_split[4];
   };
   // One session's state for one layer visit. The convolution histories are
   // kept twice: a step reads one copy and writes the other.
@@ -208,6 +223,17 @@ struct GpuEngine::Impl {
   double ab_max_diff{0}, ab_max_abs{0}, ab_sq_diff{0}, ab_sq{0};
   std::size_t ab_bad{0}, ab_visits{0};
   int max_chunks{1};
+  std::size_t partial_slots{0};
+  // Steps of at least this many rows compute the router and the loop
+  // controllers' projections with SplitGemm (0 = never).
+  // INKLING2_SPLIT_GEMM_MIN_BATCH.
+  int split_min_batch{EnvOr("INKLING2_SPLIT_GEMM_MIN_BATCH", 2)};
+  std::size_t split_count{0}, split_with_lo{0};
+  std::uint16_t *sh_in{}, *sl_in{}, *sh_m{}, *sl_m{}, *sl_x{};
+  float *low_c{}, *low_m{}, *ctrl_g{}, *ctrl_f{};
+  std::uint16_t *low_h{}, *low_l{};
+  std::size_t max_heads{0};
+  int expert_tiles{EnvOr("INKLING2_WMMA_EXPERT_TILES", 0)};
   float *chunk_max{}, *chunk_sum{}, *chunk_out{};
   std::uint32_t max_pos{0};  // the highest position in the current step
   std::uint32_t* sel_ids{};
@@ -233,12 +259,15 @@ struct GpuEngine::Impl {
   std::vector<float> host_logits;
   std::size_t n_launches{0};
 
-  static constexpr int kPhases = 11;
+  static constexpr int kPhases = 18;
   static constexpr const char* kPhaseNames[kPhases] = {
       "glue A (mix, messages, norms)", "input projections",
       "glue B (conv, clips, KV store)", "attention", "output projection",
       "glue C (conv, mix, norm, router)", "experts NVFP4", "experts BF16",
-      "glue D (conv, residual)", "embed and copies", "output head"};
+      "glue D (conv, residual)", "embed and copies", "output head",
+      "loop controllers: apply", "router", "norms",
+      "loop controllers: FP16 copies", "loop controllers: down",
+      "loop controllers: norms", "loop controllers: gain and forget"};
   bool profile{false};
   double phase_seconds[kPhases] = {};
   std::chrono::steady_clock::time_point mark{};
@@ -335,6 +364,80 @@ struct GpuEngine::Impl {
     g.wmma_tiles = wmma_tiles;
     return true;
   }
+  // Columns [col0, col0 + cols) of a small matrix as two FP16 parts.
+  Split UpSplit(const Mat& mat, std::size_t col0, std::size_t cols) {
+    std::vector<std::uint16_t> hi(mat.rows * cols), lo(hi.size());
+    bool any_lo = false;
+    for (std::size_t r = 0; r < mat.rows; ++r)
+      for (std::size_t k = 0; k < cols; ++k) {
+        const std::size_t at = r * mat.cols + col0 + k;
+        float v;
+        if (mat.type == kGgmlTypeF32) {
+          std::memcpy(&v, static_cast<const std::uint8_t*>(mat.data) + at * 4, 4);
+        } else if (mat.type == kGgmlTypeBf16) {
+          std::uint16_t bits;
+          std::memcpy(&bits, static_cast<const std::uint8_t*>(mat.data) + at * 2, 2);
+          const std::uint32_t wide = std::uint32_t{bits} << 16;
+          std::memcpy(&v, &wide, 4);
+        } else {
+          throw std::runtime_error("inkling2 gpu: unsupported small matrix");
+        }
+        bool exact = true;
+        const std::uint16_t h = HalfBits(v, &exact);
+        hi[r * cols + k] = h;
+        lo[r * cols + k] = HalfBits(v - HalfToFloat(h), &exact);
+        any_lo = any_lo || (lo[r * cols + k] & 0x7fffu) != 0;
+      }
+    Split out;
+    out.hi = static_cast<const std::uint16_t*>(Upload(hi.data(), hi.size() * 2));
+    if (any_lo) {
+      out.lo = static_cast<const std::uint16_t*>(Upload(lo.data(), lo.size() * 2));
+      ++split_with_lo;
+    }
+    ++split_count;
+    return out;
+  }
+
+  // y = W x for every job, with the matrix-instruction kernel and F32-like
+  // accuracy: W = hi + lo and x = xh + xl in FP16, and the three products
+  // that matter (hi xh, hi xl, lo xh) are summed in FP32.
+  void SplitGemm(const SplitJob* jobs, int n) {
+    for (int pass = 0; pass < 3; ++pass) {
+      gpu::GemmArgs g{};
+      for (int j = 0; j < n; ++j) {
+        const std::uint16_t* w = pass == 2 ? jobs[j].w.lo : jobs[j].w.hi;
+        if (!w)
+          continue;
+        gpu::GemmJob& job = g.jobs[g.count++];
+        job.wh = w;
+        job.xh = pass == 1 ? jobs[j].xl : jobs[j].xh;
+        job.xh_stride = jobs[j].x_stride;
+        job.y = jobs[j].y;
+        job.y_stride = jobs[j].y_stride;
+        job.rows = jobs[j].rows;
+        job.cols = jobs[j].cols;
+        job.add = pass > 0;
+      }
+      if (g.count == 0)
+        continue;
+      g.batch = batch;
+      g.wmma = true;
+      g.wmma_tiles = wmma_tiles;
+      gpu::Gemm(g, stream);
+    }
+  }
+  void ToHalf2(const float* x, int stride, int cols, std::uint16_t* hi,
+               std::uint16_t* lo) {
+    gpu::ToHalfArgs h{};
+    h.x = x;
+    h.x_stride = stride;
+    h.out = hi;
+    h.cols = cols;
+    h.batch = batch;
+    h.out_lo = lo;
+    gpu::ToHalf(h, stream);
+  }
+
   // A small matrix as F32 on the device; BF16 storage is widened exactly.
   const float* UpF32(const Mat& mat) {
     if (mat.type == kGgmlTypeF32)
@@ -421,6 +524,8 @@ struct GpuEngine::Impl {
       l.ffn_res_query = Up(w.ffn_res_query);
       l.ffn_norm = Up(w.ffn_norm);
       l.gate_inp = UpF32(w.gate_inp);
+      if (split_min_batch > 0)
+        l.gate_split = UpSplit(w.gate_inp, 0, kE);
       l.exp_probs_b = Up(w.exp_probs_b);
       l.up_scale = Up(w.gate_up_scale);
       l.down_scale = Up(w.down_scale);
@@ -428,6 +533,12 @@ struct GpuEngine::Impl {
       for (int k = 0; k < 4; ++k) {
         const bool core = il >= c.loop_start && il < c.loop_end;
         l.ctrl_down[k] = core ? UpF32(w.ctrl_down[k]) : nullptr;
+        if (core && split_min_batch > 0) {
+          l.down_cur[k] = UpSplit(w.ctrl_down[k], 0, kE);
+          l.down_msg[k] = UpSplit(w.ctrl_down[k], kE, kE);
+          l.gain_split[k] = UpSplit(w.ctrl_gain[k], 0, kRank);
+          l.forget_split[k] = UpSplit(w.ctrl_forget[k], 0, kRank);
+        }
         l.ctrl_gain[k] = core ? UpF32(w.ctrl_gain[k]) : nullptr;
         l.ctrl_forget[k] = core ? UpF32(w.ctrl_forget[k]) : nullptr;
       }
@@ -516,10 +627,17 @@ struct GpuEngine::Impl {
       head_threads = std::atoi(v);
     if (const char* v = std::getenv("INKLING2_ATTN_WINDOW"); v && *v == '0')
       attention_window = false;
+    // Attention partials: the batched kernel leaves at most 16 per head and
+    // row; the per-row kernel one per 1,024 positions, which is only
+    // affordable for few rows (others then go through the batched kernel).
     max_chunks = static_cast<int>(std::max<std::size_t>(2, (opt.context + 1023) / 1024));
-    chunk_max = Floats(B * kNH * std::size_t(max_chunks));
-    chunk_sum = Floats(B * kNH * std::size_t(max_chunks));
-    chunk_out = Floats(B * kNH * std::size_t(max_chunks) * gpu::kHD);
+    partial_slots = std::max<std::size_t>(
+        B * 16, std::min<std::size_t>(B, 16) * std::size_t(max_chunks));
+    if (keep_f32)  // the F32 kernels leave one partial per chunk and row
+      partial_slots = std::max(partial_slots, B * std::size_t(max_chunks));
+    chunk_max = Floats(partial_slots * kNH);
+    chunk_sum = Floats(partial_slots * kNH);
+    chunk_out = Floats(partial_slots * kNH * gpu::kHD);
     contrib = Floats(B * kTopK * kE);
     if (opt.int8_experts) {
       xq = static_cast<std::uint32_t*>(Alloc(B * kE));
@@ -532,8 +650,28 @@ struct GpuEngine::Impl {
     if (const char* v = std::getenv("INKLING2_MAJOR_MIN_BATCH"))
       major_min_batch = std::atoi(v);
     low = Floats(B * 3 * kRank);
+    if (split_min_batch > 0) {
+      low_c = Floats(B * 3 * kRank);
+      low_m = Floats(B * 3 * kRank);
+      ctrl_g = Floats(B * 3 * kE);
+      ctrl_f = Floats(B * 3 * kE);
+      low_h = static_cast<std::uint16_t*>(Alloc(B * 3 * kRank * 2));
+      low_l = static_cast<std::uint16_t*>(Alloc(B * 3 * kRank * 2));
+      sh_in = static_cast<std::uint16_t*>(Alloc(B * 3 * kE * 2));
+      sl_in = static_cast<std::uint16_t*>(Alloc(B * 3 * kE * 2));
+      sh_m = static_cast<std::uint16_t*>(Alloc(B * 4 * kE * 2));
+      sl_m = static_cast<std::uint16_t*>(Alloc(B * 4 * kE * 2));
+      sl_x = static_cast<std::uint16_t*>(Alloc(B * kE * 2));
+      std::fprintf(stderr,
+                   "inkling2 gpu: %zu small matrices as two FP16 parts, %zu "
+                   "with a second part\n",
+                   split_count, split_with_lo);
+    }
     router_logits = Floats(B * kNX);
-    const std::size_t heads_cap = std::max<std::size_t>(opt.sessions, B);
+    // Rows whose logits a step may ask for.
+    const std::size_t heads_cap =
+        std::max<std::size_t>(opt.sessions, std::min<std::size_t>(B, 256));
+    max_heads = heads_cap;
     final_x = Floats(heads_cap * kE);
     logits = Floats(heads_cap * c.n_vocab_padded);
     host_logits.resize(heads_cap * c.n_vocab_padded);
@@ -820,6 +958,8 @@ struct GpuEngine::Impl {
     a.msg_query = l.msg_query;
     a.batch = batch;
     gpu::GlueA(a, stream);
+    Mark(0);
+    const bool split = split_min_batch > 0 && batch >= split_min_batch;
     if (looped) {
       gpu::CtrlArgs ctrl{};
       ctrl.cur = in;
@@ -834,9 +974,41 @@ struct GpuEngine::Impl {
       ctrl.low = low;
       ctrl.count = 3;
       ctrl.batch = batch;
-      gpu::CtrlDown(ctrl, stream);
+      if (split) {
+        ToHalf2(in, 3 * kE, 3 * kE, sh_in, sl_in);
+        ToHalf2(msgs, 4 * kE, 4 * kE, sh_m, sl_m);
+        Mark(14);
+        SplitJob jobs[6];
+        for (int j = 0; j < 3; ++j) {
+          jobs[2 * j] = {l.down_cur[j], sh_in + j * kE, sl_in + j * kE, 3 * kE,
+                         low_c + j * kRank, 3 * kRank, kRank, kE};
+          jobs[2 * j + 1] = {l.down_msg[j], sh_m + j * kE, sl_m + j * kE, 4 * kE,
+                             low_m + j * kRank, 3 * kRank, kRank, kE};
+        }
+        SplitGemm(jobs, 6);
+        Mark(15);
+        ctrl.yc = low_c;
+        ctrl.ym = low_m;
+        gpu::CtrlCombine(ctrl, stream);
+        Mark(16);
+        ToHalf2(low, 3 * kRank, 3 * kRank, low_h, low_l);
+        for (int j = 0; j < 3; ++j) {
+          jobs[2 * j] = {l.gain_split[j], low_h + j * kRank, low_l + j * kRank,
+                         3 * kRank, ctrl_g + j * kE, 3 * kE, kE, kRank};
+          jobs[2 * j + 1] = {l.forget_split[j], low_h + j * kRank,
+                             low_l + j * kRank, 3 * kRank, ctrl_f + j * kE,
+                             3 * kE, kE, kRank};
+        }
+        SplitGemm(jobs, 6);
+        Mark(17);
+        ctrl.yg = ctrl_g;
+        ctrl.yf = ctrl_f;
+      } else {
+        gpu::CtrlDown(ctrl, stream);
+      }
       gpu::CtrlApply(ctrl, stream);
     }
+    Mark(11);
     gpu::NormArgs norm{};
     norm.x = in;
     norm.stride = 3 * kE;
@@ -846,7 +1018,7 @@ struct GpuEngine::Impl {
     norm.batch = batch;
     norm.eps = c.norm_eps;
     gpu::Norm(norm, stream);
-    Mark(0);
+    Mark(13);
 
     const int taps = kNC * kNKV;
     gpu::GemmArgs g{};
@@ -930,9 +1102,11 @@ struct GpuEngine::Impl {
     // Which kernel: the batched FP16 one for steps of several rows per
     // session, else the per-row FP16 one; the F32 kernels only when the F32
     // cache is kept and a switch asks for them.
+    const std::size_t chunks_now = max_pos / 1024 + 1;
     const bool batched =
-        attn_batched_min > 0 && batch >= attn_batched_min * n_groups &&
-        (!swa || attn_batched_window);
+        (attn_batched_min > 0 && batch >= attn_batched_min * n_groups &&
+         (!swa || attn_batched_window)) ||
+        (!swa && std::size_t(batch) * chunks_now > partial_slots);
     const bool half = !batched && (attn_half || !keep_f32);
     if (batched) {
       gpu::ToHalfArgs h{};
@@ -960,8 +1134,12 @@ struct GpuEngine::Impl {
     at.skip = attn_skip;
     if (swa && (batched || half))
       at.max_chunks = batched ? 2 : 1;
+    if (!swa && batched) {
+      at.span = static_cast<int>((chunks_now + 15) / 16);
+      at.max_chunks = static_cast<int>((chunks_now + at.span - 1) / at.span);
+    }
     gpu::Attention(at, stream);
-    if (!swa && attn_stats_now) {
+    if (!swa && attn_stats_now && at.span <= 1) {
       // The kernel's per-chunk maximum and sum for the measured row, against
       // the host's: this checks the measurement and the kernel against each
       // other.
@@ -1044,6 +1222,7 @@ struct GpuEngine::Impl {
     cc.rows = rows;
     cc.batch = batch;
     gpu::GlueC(cc, stream);
+    Mark(5);
     if (block_start)
       ++n_blocks;
     if (looped) {
@@ -1058,9 +1237,36 @@ struct GpuEngine::Impl {
       ctrl.low = low;
       ctrl.count = 1;
       ctrl.batch = batch;
-      gpu::CtrlDown(ctrl, stream);
+      if (split) {
+        // msgs has not changed since its FP16 parts were made above.
+        ToHalf2(xn, kE, kE, xh_x, sl_x);
+        Mark(14);
+        SplitJob jobs[2] = {
+            {l.down_cur[3], xh_x, sl_x, kE, low_c, 3 * kRank, kRank, kE},
+            {l.down_msg[3], sh_m + 3 * kE, sl_m + 3 * kE, 4 * kE, low_m,
+             3 * kRank, kRank, kE}};
+        SplitGemm(jobs, 2);
+        Mark(15);
+        ctrl.yc = low_c;
+        ctrl.ym = low_m;
+        gpu::CtrlCombine(ctrl, stream);
+        Mark(16);
+        // (ToHalf packs its output: kRank values per row here.)
+        ToHalf2(low, 3 * kRank, kRank, low_h, low_l);
+        jobs[0] = {l.gain_split[3], low_h, low_l, kRank, ctrl_g, 3 * kE, kE,
+                   kRank};
+        jobs[1] = {l.forget_split[3], low_h, low_l, kRank, ctrl_f, 3 * kE, kE,
+                   kRank};
+        SplitGemm(jobs, 2);
+        Mark(17);
+        ctrl.yg = ctrl_g;
+        ctrl.yf = ctrl_f;
+      } else {
+        gpu::CtrlDown(ctrl, stream);
+      }
       gpu::CtrlApply(ctrl, stream);
     }
+    Mark(11);
     gpu::NormArgs ffn_norm{};
     ffn_norm.x = xn;
     ffn_norm.stride = kE;
@@ -1069,6 +1275,7 @@ struct GpuEngine::Impl {
     ffn_norm.batch = batch;
     ffn_norm.eps = c.norm_eps;
     gpu::Norm(ffn_norm, stream);
+    Mark(13);
     gpu::RouterArgs router{};
     router.gate_inp = l.gate_inp;
     router.x = xn;
@@ -1081,8 +1288,15 @@ struct GpuEngine::Impl {
     router.up_scale = sel_up;
     router.coef = sel_coef;
     router.batch = batch;
+    if (split) {
+      ToHalf2(xn, kE, kE, xh_x, sl_x);
+      const SplitJob job{l.gate_split, xh_x, sl_x, kE, router_logits,
+                         gpu::kNX, gpu::kNX, kE};
+      SplitGemm(&job, 1);
+      router.logits_ready = true;
+    }
     gpu::Router(router, stream);
-    Mark(5);
+    Mark(12);
 
     gpu::BatchExpertArgs e{};
     e.gate_up = l.gate_up;
@@ -1115,6 +1329,7 @@ struct GpuEngine::Impl {
     e.group_count = group_count;
     e.contrib = contrib;
     e.xh = xh_x;
+    e.wmma_tiles = expert_tiles;
     e.acth = acth;
     e.max_batch = static_cast<int>(opt.max_batch);
     gpu::BatchExperts(e, stream);
@@ -1288,6 +1503,8 @@ struct GpuEngine::Impl {
         state.vh = slot.vh;
       }
     }
+    if (heads.size() > max_heads)
+      throw std::runtime_error("inkling2 gpu: too many rows want logits");
     for (std::size_t i = 0; i < heads.size(); ++i)
       head_rows[i] = heads[i];
     // Groups for the batched attention kernel: runs cut into pieces of at
