@@ -85,15 +85,19 @@ What the runner does:
   plain text, so reasoning arrives as `reasoning_content`. `reasoning_effort` selects the
   template's effort level (minimal 0.1, low 0.2, medium 0.7, high 0.9, xhigh and max 0.99; the
   template's default is 0.9).
-- **Thinking off** (`reasoning_effort: "none"`). The template writes effort 0 for it, and the
-  weights file tested here opened a thinking block anyway. The runner therefore enforces it,
-  in two ways, each for the case where it was seen to work: without tools the prompt opens the
-  answer itself; with tools the prompt is left alone, so the model can start with a call, and
-  only the token that opens a thinking block is never sampled. (Blocking that token without
-  tools made the model write its deliberation into the answer.)
-- **Response formats** (`response_format`) run with thinking off. GUFO's grammar reads the
-  model's framing tokens as empty text, and with a thinking block before the answer the
-  constrained output came out malformed (a repeated key, an invented key).
+- **Thinking off** (`reasoning_effort: "none"`) does what the template does and no more: the
+  prompt says "Thinking effort level: 0". The weights file tested here still opened a thinking
+  block at that level (5 of 5 such requests in the trace of one test run), so a client that
+  asks for no thinking gets a shorter one. `INKLING2_SERVE_ENFORCE_NO_THINKING=1` makes the
+  runner enforce it: without tools the prompt opens the answer itself; with tools only the
+  token that opens a thinking block is never sampled, so the model can still start with a
+  call. (Blocking that token without tools made the model write its deliberation into the
+  answer.) Off by default, because the model answers better when it thinks.
+- **Response formats** (`response_format`) keep thinking: a grammar reads the text the server
+  sees, so the model thinks first and only the answer is constrained. (With the framing tokens
+  read as empty text, as in the first version, the constrained output came out malformed.) The
+  one exception is a request that asks for both a response format and no thinking: there the
+  prompt opens the answer.
 - **Tool calls.** The model writes
   `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>`;
   the server sees `<tool_call>{"name":"NAME","args":{...}}</tool_call>`, a syntax registered as
@@ -162,8 +166,9 @@ start to end in this form.
 
 - `gufo prompt` and `gufo chat` reach a runner without drivers only in GUFO revisions newer than
   the one in the container used here, which answers "unsupported model architecture".
-- `tool_choice: "required"` and strict tools go through GUFO's grammar, which the model's
-  framing does not fit: it wrote several sentences before the call (8.5 s for one call).
+- `tool_choice: "required"` gave a direct call in 1.8 s once the grammar read the framing tokens
+  as the text the server sees (one request tested; before that the model wrote several
+  sentences first). Strict tool schemas were not tested.
 - GUFO keeps checkpoints at the end of a prompt and at a few pass boundaries inside it. A
   conversation that only grows resumes from its end; changing the end of a long prompt
   reprocesses from the last kept boundary (26,300 tokens in the 100K test).

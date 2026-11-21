@@ -898,13 +898,20 @@ public:
   BuildConstraintVocabulary() const override {
     return std::make_shared<const sampling::ConstraintVocabulary>(
         tokenizer_.size(), [this](std::uint32_t id) {
-          // What a grammar reads for each token. Control tokens are empty,
-          // so a grammar never forbids the model's own framing, except the
-          // one that opens a tool call.
+          // What a grammar reads for each token. A grammar follows the text
+          // the server sees, so the tokens that open a thinking block or a
+          // tool call read as that text, and the end of a message reads as
+          // the end of a thinking block: a grammar with a reasoning phase
+          // then lets the model think first and constrains the answer only.
+          // After the answer that token does not fit the grammar, and the
+          // model ends with its end token. Other framing tokens are empty,
+          // so no grammar forbids them.
           return sampling::ConstraintVocabulary::Piece{
-              id == ids_.invoke_tool    ? std::string(kToolBlockOpen)
-              : tokenizer_.IsControl(id) ? std::string{}
-                                         : std::string(tokenizer_.Bytes(id)),
+              id == ids_.invoke_tool         ? std::string(kToolBlockOpen)
+              : id == ids_.content_thinking ? std::string("<think>")
+              : id == ids_.end_message      ? std::string("</think>")
+              : tokenizer_.IsControl(id)    ? std::string{}
+                                            : std::string(tokenizer_.Bytes(id)),
               id == tokenizer_.eos()};
         });
   }
@@ -958,7 +965,7 @@ public:
 
   [[nodiscard]] ext::InitialOutputState InitialOutputState(
       const ext::ChatRequest& request) const override {
-    return ThinkingOff(request) ? ext::InitialOutputState::kText
+    return OpensAnswer(request) ? ext::InitialOutputState::kText
                                 : ext::InitialOutputState::kAuto;
   }
 
@@ -1320,15 +1327,17 @@ private:
     }
     RenderedChat chat = RenderChat(tokenizer_, messages, tools, options);
     // Thinking off. The template writes "Thinking effort level: 0" for it,
-    // and the model may still open a thinking block. Two measures, each for
-    // the case where it was seen to work:
+    // which is all the runner does by default: whether the model then
+    // thinks is the model's own behaviour. With
+    // INKLING2_SERVE_ENFORCE_NO_THINKING=1 the runner makes sure it does
+    // not, by two measures, each for the case where it was seen to work:
     //  - Without tools, the prompt opens the answer itself, so the model
     //    continues with the answer.
     //  - With tools, the model must stay free to start with a call, so the
     //    prompt is left alone and only the token that opens a thinking block
     //    is taken out before sampling (NoThinking). Used without tools, that
     //    made the model write its deliberation into the answer.
-    if (ThinkingOff(request) && tools.empty()) {
+    if (OpensAnswer(request) && tools.empty()) {
       chat.tokens.push_back(ids_.message_model);
       chat.tokens.push_back(ids_.content_text);
       chat.text += "<|message_model|><|content_text|>";
@@ -1345,21 +1354,25 @@ private:
   // The context declares tools and switches thinking off.
   [[nodiscard]] bool NoThinking(
       std::span<const ext::TextRunnerToken> tokens) const {
-    return Declares(tokens, effort_zero_) && Declares(tokens, tool_declare_);
+    return enforce_no_thinking_ && Declares(tokens, effort_zero_) &&
+           Declares(tokens, tool_declare_);
   }
   void Mask(const State& s, float* logits) const {
     if (s.no_thinking)
       logits[ids_.content_thinking] = -1e30F;
   }
 
-  // Thinking is off when the request says so, and for every request with a
-  // response format: GUFO's grammar for the format reads the model's framing
-  // tokens as empty text, and with a thinking block in front of the answer
-  // the constrained output came out malformed.
   [[nodiscard]] static bool ThinkingOff(const ext::ChatRequest& request) {
-    return (request.reasoning.enabled.has_value() &&
-            !*request.reasoning.enabled) ||
-           request.response_format != nullptr;
+    return request.reasoning.enabled.has_value() && !*request.reasoning.enabled;
+  }
+  // Whether the prompt opens the answer for a request without tools: when
+  // thinking off is enforced, and for a request that asks for no thinking
+  // together with a response format. For that one GUFO's grammar has no
+  // reasoning phase, so the model cannot think anyway, and left to open its
+  // own message it wrote a wrong key in the test.
+  [[nodiscard]] bool OpensAnswer(const ext::ChatRequest& request) const {
+    return ThinkingOff(request) &&
+           (enforce_no_thinking_ || request.response_format != nullptr);
   }
 
   // What the model is writing when the context ends in `tokens`.
@@ -1405,6 +1418,7 @@ private:
   std::size_t sessions_;
   std::uint32_t max_batch_;
   bool lookup_;
+  bool enforce_no_thinking_{EnvInt("INKLING2_SERVE_ENFORCE_NO_THINKING", 0) != 0};
   // Tokens of the output that must repeat an earlier passage before a copy
   // is drafted from it (greedy requests; sampled ones need twice as many).
   std::size_t lookup_min_;

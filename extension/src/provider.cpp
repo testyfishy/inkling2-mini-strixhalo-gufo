@@ -314,6 +314,130 @@ int RunChatCases(const gufo::core::GgufReader& reader, const char* path) {
   return 0;
 }
 
+// INKLING2_SWEEP=<file of raw 32-bit token ids>: processes the text as one
+// prompt and, at each depth of INKLING2_SWEEP_POINTS (comma separated),
+// reports how fast the prompt was processed since the previous point, how
+// fast the last full step before the point ran, and how long a step that
+// generates one token takes there (the median of 12 tentative steps, which
+// compute everything and are then dropped), likewise a step that verifies 8
+// drafted tokens. INKLING2_BATCH sets the rows per prompt step.
+int RunDepthSweep(const gufo::core::GgufReader& reader, const char* path) {
+  using Clock = std::chrono::steady_clock;
+  const auto seconds = [](Clock::time_point from) {
+    return std::chrono::duration<double>(Clock::now() - from).count();
+  };
+  try {
+    std::vector<std::uint32_t> text;
+    if (std::FILE* file = std::fopen(path, "rb")) {
+      std::uint32_t id;
+      while (std::fread(&id, 4, 1, file) == 1)
+        text.push_back(id);
+      std::fclose(file);
+    }
+    std::vector<std::size_t> points;
+    {
+      const char* list = std::getenv("INKLING2_SWEEP_POINTS");
+      std::string spec = list ? list
+                              : "1024,4096,16384,32768,65536,100000,131072,"
+                                "196608,262144,393216,524288,655360,786432,"
+                                "917504,1040000";
+      for (std::size_t at = 0; at < spec.size();) {
+        const std::size_t comma = std::min(spec.find(',', at), spec.size());
+        points.push_back(static_cast<std::size_t>(
+            std::atoll(spec.substr(at, comma - at).c_str())));
+        at = comma + 1;
+      }
+    }
+    while (!points.empty() && points.back() + 16 > text.size())
+      points.pop_back();
+    if (points.empty())
+      throw std::runtime_error("the token file is shorter than every point");
+    inkling2::Config config;
+    std::string error;
+    if (!inkling2::LoadConfig(reader, &config, &error))
+      throw std::runtime_error(error);
+    const inkling2::Model model = inkling2::LoadModel(reader, config);
+    const inkling2::Tokenizer tokenizer(reader);
+    const std::size_t batch =
+        static_cast<std::size_t>(std::max(EnvInt("INKLING2_BATCH", 2048), 16));
+    inkling2::GpuEngine::Options options;
+    options.sessions = 1;
+    options.max_batch = static_cast<std::uint32_t>(batch);
+    options.context =
+        static_cast<std::uint32_t>((points.back() + 16 + 1023) / 1024 * 1024);
+    inkling2::GpuEngine engine(model, options);
+    std::printf("depth sweep: %zu tokens of text, %zu rows per prompt step, "
+                "context %u%c",
+                text.size(), batch, options.context, 10);
+    std::printf("%9s %12s %12s %10s %9s %9s %10s  %s%c", "depth", "prompt t/s",
+                "prompt t/s", "seconds", "1 token", "gen t/s", "8 drafts",
+                "next token", 10);
+    std::printf("%9s %12s %12s %10s %9s %9s %10s%c", "", "(interval)",
+                "(at depth)", "(total)", "(ms)", "", "(ms)", 10);
+    std::fflush(stdout);
+    std::size_t pos = 0;
+    double total = 0;
+    for (const std::size_t point : points) {
+      const std::size_t from = pos;
+      const auto t0 = Clock::now();
+      double last_rate = 0;
+      while (pos < point) {
+        const std::size_t rows_now = std::min(batch, point - pos);
+        std::vector<inkling2::GpuEngine::Row> rows;
+        rows.reserve(rows_now);
+        for (std::size_t i = 0; i < rows_now; ++i)
+          rows.push_back({0, text[pos + i]});
+        const auto step0 = Clock::now();
+        engine.Step(rows, inkling2::GpuEngine::Head::kNone);
+        engine.Synchronize();
+        if (rows_now == batch)
+          last_rate = static_cast<double>(rows_now) / seconds(step0);
+        pos += rows_now;
+      }
+      const double interval = seconds(t0);
+      total += interval;
+      // One generated token at this depth.
+      std::vector<double> ms;
+      std::uint32_t next = 0;
+      for (int rep = 0; rep < 12; ++rep) {
+        const auto g0 = Clock::now();
+        engine.Step({{0, text[pos]}}, inkling2::GpuEngine::Head::kLast, true);
+        next = engine.argmax(0);
+        ms.push_back(seconds(g0) * 1e3);
+        engine.Accept(0, 0);
+      }
+      std::sort(ms.begin(), ms.end());
+      const double one = ms[ms.size() / 2];
+      std::vector<double> ms8;
+      for (int rep = 0; rep < 3; ++rep) {
+        std::vector<inkling2::GpuEngine::Row> rows;
+        for (std::size_t i = 0; i < 9; ++i)
+          rows.push_back({0, text[pos + i]});
+        const auto g0 = Clock::now();
+        engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
+        (void)engine.argmax(8);
+        ms8.push_back(seconds(g0) * 1e3);
+        engine.Accept(0, 0);
+      }
+      std::sort(ms8.begin(), ms8.end());
+      std::string piece(tokenizer.Bytes(next));
+      for (char& c : piece)
+        if (c == 10 || c == 13)
+          c = ' ';
+      const bool right = next == text[pos + 1];
+      std::printf("%9zu %12.1f %12.1f %10.1f %9.2f %9.2f %10.1f  \"%s\"%s%c",
+                  point, static_cast<double>(point - from) / interval,
+                  last_rate, total, one, 1e3 / one, ms8[1], piece.c_str(),
+                  right ? " (as in the text)" : "", 10);
+      std::fflush(stdout);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s%c", e.what(), 10);
+    return 1;
+  }
+  return 0;
+}
+
 int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
   inkling2::Config config;
   std::string error;
@@ -994,6 +1118,8 @@ int Prompt(const gufo::ext::TextPromptOptions&,
     return RunTokenize(reader, text);
   if (const char* cases = std::getenv("INKLING2_CHAT"))
     return RunChatCases(reader, cases);
+  if (const char* tokens = std::getenv("INKLING2_SWEEP"))
+    return RunDepthSweep(reader, tokens);
   if (const char* kld = std::getenv("INKLING2_KLD"))
     return RunQuality(reader, kld);
   if (const char* ids = std::getenv("INKLING2_REF_TOKENS")) {
@@ -1007,7 +1133,7 @@ int Prompt(const gufo::ext::TextPromptOptions&,
 bool DevelopmentMode() {
   for (const char* name :
        {"INKLING2_REF_TOKENS", "INKLING2_KLD", "INKLING2_TOKENIZE",
-        "INKLING2_CHAT", "INKLING2_REPORT"})
+        "INKLING2_CHAT", "INKLING2_REPORT", "INKLING2_SWEEP"})
     if (std::getenv(name))
       return true;
   return false;
