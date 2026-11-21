@@ -5,7 +5,10 @@ Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkl
 Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`, 128 GB unified memory) at native weight
 precision.
 
-**Status: no GUFO runner exists yet.** What exists today is the baseline, the tooling and the plan.
+**Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
+extension: 1,056 tokens/s on a 4K-token prompt, 555 on a 100K-token prompt, 24 tokens/s generation
+(85 to 93 where the output repeats its context), KLD 0.0015 against llama.cpp on the same file.
+See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Goal
 
@@ -99,8 +102,14 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [x] M5a: the model's tokenizer and chat template in the extension, checked against
       independent references ([docs/SERVING.md](docs/SERVING.md))
-- [ ] M5: a runner for `gufo serve` (API, streaming, sampling) with the continuation cache, so
-      conversations resume without reprocessing
+- [x] M5: a runner for `gufo serve`: OpenAI-style API with streaming, reasoning and tool
+      calls, GUFO's continuation cache (a repeated 100K-token request restores in 43 ms) and
+      drafts copied from the context (85 to 93 tokens/s on rewrites and copies). Measured
+      through the server: 1,056 tokens/s on a 4K prompt, 555 on a 100K prompt, 24.0 tokens/s
+      generation ([docs/SERVING.md](docs/SERVING.md))
+- [ ] M5b: what serving still lacks: batched decode across sessions, smaller checkpoints,
+      `tool_choice: required` in the model's own framing, the disk cache and GUFO's
+      conformance suites
 - [ ] M6: kernel work on the hot path, each change checked against M3's logit comparison
 - [ ] Later: vision (mmproj), DSpark speculative decoding, tool calls, multi-session serving
 
