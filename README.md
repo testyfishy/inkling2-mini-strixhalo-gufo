@@ -70,8 +70,13 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       258), with the GPU's FP16 matrix instruction for
       projections and experts. Quality unchanged in the harness (KLD 0.0021 at 512
       tokens of context, 0.0014 at 4,096)
-- [ ] M4b3: prompt processing at depth. At 100K tokens of context it is 31 tokens/s, because
-      every row reads the whole attention cache by itself; attention needs the same treatment
+- [x] M4b3: attention for several rows of a session at once, with the same matrix instruction
+      and FP16 copies of the cache. Prompt processing at 256 rows per step: 573 tokens/s at
+      short context, 523 / 470 / 273 at 4K / 16K / 100K tokens of context (was 258 / 126 / 31).
+      Quality in the harness: KLD 0.0021 at 512 tokens, 0.0016 at 4,096 (0.0014 before)
+- [ ] M4b4: prompt processing at 100K still loses half its speed to the full-attention kernel,
+      and single-session generation at depth (13 tokens/s at 100K) still reads the F32 cache
+      row by row
 - [ ] M4c: speculative decoding with the model's DSpark drafter. Done so far: tentative steps
       in the engine, and a CPU prototype of the drafter whose acceptance matches llama.cpp's
       (2.0 to 4.4 tokens per step depending on the text; [docs/DSPARK.md](docs/DSPARK.md)).

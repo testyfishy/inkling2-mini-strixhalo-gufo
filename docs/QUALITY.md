@@ -80,6 +80,30 @@ between them are within what this measurement can resolve: a percent of the 4,09
 positions is 41 tokens, and the top-token rate moves by that much between any two arithmetic
 paths because of near-ties.
 
+## FP16 attention (on by default for steps of 4 or more rows per session)
+
+Attention in such steps reads FP16 copies of the queries, keys and values and stores the
+attention weights as FP16 (PROGRESS.md steps 17 and 18). Against the same llama.cpp references:
+
+| Kernels | Context, rows per step | Perplexity (llama.cpp) | Mean KLD | Median / 99% KLD | Same top token |
+|---|---|---:|---:|---:|---:|
+| Per-row attention (step 16) | 512, 64 | 7.7958 (7.7776) | 0.002137 | 0.000771 / 0.0214 | 97.99% |
+| Batched FP16 attention | 512, 64 | 7.7984 (7.7776) | 0.002068 | 0.000762 / 0.0193 | 98.09% |
+| Per-row attention, same build | 4,096, 256 | 7.4767 (7.4828) | 0.001419 | 0.000628 / 0.0131 | 98.19% |
+| Batched FP16, full-attention layers only | 4,096, 256 | 7.4814 (7.4828) | 0.001580 | 0.000642 / 0.0167 | 97.90% |
+| Batched FP16, all layers | 4,096, 256 | 7.4647 (7.4828) | 0.001573 | 0.000659 / 0.0150 | 98.09% |
+
+At 512 tokens nothing moves. At 4,096 tokens the mean KLD is 0.0016 instead of 0.0014: a
+difference of this size is at the edge of what one chunk of 2,047 scored positions resolves,
+but it is in the direction one would expect from rounding more values, so it is recorded as a
+small cost and not as noise. It is still below the 0.0017 of the kernels before step 16.
+
+The attention output itself was compared with the per-row kernel on the same steps
+(`INKLING2_ATTN_AB=1`): the root-mean-square difference is 2e-4 to 3e-4 of the output's size,
+the largest single difference 0.006 where the largest value is 10, on 4,096 tokens of real
+text (steps of 250 rows, so groups of 32 and of 26 rows), on steps of 40 rows at 100,000
+tokens of faked context, and on three sessions in one step. Nothing was non-finite.
+
 ## Longer context
 
 One chunk of 4,096 tokens, 2,047 scored positions (2,048 to 4,095), 64 rows per step. This

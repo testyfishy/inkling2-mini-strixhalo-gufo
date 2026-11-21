@@ -375,6 +375,49 @@ only: 8 sessions reach 63.4 tokens/s in total (was 56.2). The experts of such st
 by reading weights: rows rarely share an expert, and each row's eight experts are about 2 GB
 across the model.
 
+## Attention for several rows at once, 2026-11-21
+
+Until here every row read its whole key and value cache by itself: at 100,000 tokens of
+context a step of 256 rows read about 1.7 TB. Now up to 32 consecutive rows of a session share
+one read: a block owns 32 rows (96 query vectors of one key head) and 1,024 positions, walks
+them 64 positions at a time through shared memory, and computes both the scores and the
+weighted values with the matrix instruction from FP16 copies of the cache. The sliding-window
+layers (40 of the 48 visits) use the same kernel on their rings.
+
+Prompt processing, 256 rows per step, tokens/s (context faked beyond the prompt, as before):
+
+| Context | Per-row attention | Full-attention layers batched | All layers batched |
+|---|---:|---:|---:|
+| short (512-token prompt) | 485 | 485 | 573 |
+| short, 512 rows per step | 553 | | 680 |
+| 4,000 | 258 | 326 | 523 |
+| 16,000 | 126 | 301 | 470 |
+| 100,000 | 31 | 206 | 273 |
+
+Attention's share of a 256-row step, in ms: 102 -> 18 at short context, 377 -> 69 at 4,000
+(the first number already has the full-attention layers batched), 835 -> 515 at 100,000
+(before either it was not profiled; the whole step took about 8,300 ms there). The other phases are unchanged at about 420 ms.
+
+What is left at 100,000 tokens is the full-attention kernel itself, 8 visits of about 60 ms.
+By the count of multiplications it runs at roughly a quarter of the rate the projection
+kernels reach, so there is room in it (it stops four times per 64 positions to hand data
+between its waves, and its shared memory is nearly all of what a block may have).
+
+Steps with one row per session (parallel generation) are slower through this kernel than
+through the per-row one (4 sessions at 30,000 tokens: 22.4 against 27.0 tokens/s in total), so
+they keep the per-row kernel: the batched one is used from 4 rows per session on average.
+
+Steps that verify 7 given drafts (no drafter cost) at 4,000 tokens of real text give 54 to 67
+tokens/s, against 21 for plain generation there. At 100,000 tokens of faked context, with only
+the full-attention layers batched, such steps went from 17.8 to 32.9 tokens/s over 24 tokens;
+with all layers batched there is no comparable number, because on that meaningless context the
+run stops agreeing with plain generation after a few tokens (see DSPARK.md).
+
+Generation on this build: 24.7 tokens/s for one session, 65.0 in total for 8 sessions.
+
+Memory: the FP16 copies of the full-attention caches add about 33 KB per token per session to
+the 65 KB of the F32 caches, which single-row steps still read.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

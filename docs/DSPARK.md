@@ -168,3 +168,14 @@ What this says:
   whether a drafted run reproduces the plain run token for token depends on near-ties between
   kernels that round differently, and is not guaranteed. A verification step of 8 rows now
   costs about 118 ms.
+- With attention batched for steps of several rows (PROGRESS.md steps 17 and 18), a
+  verification step no longer reads the whole cache once per drafted row. At 4,000 tokens of
+  real text 7 given drafts verify at 54 to 67 tokens/s against 21 for plain generation, and
+  the run reproduces plain generation. At 1,500 tokens of real text it does not, with or
+  without the new attention kernel. At 100,000 tokens of faked context it does not either
+  once the sliding-window layers are batched (with only the full-attention layers batched it
+  did for 24 tokens, at 32.9 tokens/s against 17.8, and not for 48). The attention outputs of
+  those verification steps were compared with the per-row kernel directly and differ by 3e-4
+  of their size, as everywhere else, so this is the same sensitivity to near-ties as before,
+  on a context whose sliding windows are mostly empty; it is not a number to rely on in
+  either direction.

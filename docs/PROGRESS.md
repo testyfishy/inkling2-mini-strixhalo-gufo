@@ -28,6 +28,8 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 14 | `da803a4` | Tentative steps: a run of rows can be computed, then only its first rows kept (groundwork for speculative decoding; no drafter yet) | 24.8 plain; with drafts supplied and no drafter cost: 44.0 (3 correct drafts per step), 66.6 (7), 36.7 (3, a third of blocks wrong) | | | verified output equals plain generation, including after rejected drafts (on the short test prompt of that step; step 15 found a prose prompt where the integer kernels of 8-row and single-row steps disagree) |
 | 15 | `1aeb4a0` | DSpark drafter, host prototype: the engine exports the four hidden states it reads; drafts are verified in one tentative step | plain 24.5. Tokens per step with 7 drafts: 4.38 and 2.46 on two coding chat prompts (llama.cpp's own drafter: 4.39 and 2.58), 2.0 to 2.5 on encyclopedia prose (llama.cpp: 2.1 to 2.2). Not a speed result yet: the drafter runs on the CPU | | | drafted output equals plain generation on both coding prompts; on prose only with float experts or the per-row integer kernel (see DSPARK.md) |
 | 16 | `8adc66c` | Matrix-instruction kernels (16x16x16 FP16, FP32 sums) for the projections in steps of 2+ rows and for the experts in steps of 16+ rows, staged through shared memory | 24.8 (single-row steps are unchanged) | 482 at 256 rows per step, 553 at 512 (was 145); at depth 258 / 126 / 31 at 4K / 16K / 100K (was 115 / 78 / 27) | 63.4 (was 56.2) | same greedy tokens; PPL 7.796 vs 7.778, KLD 0.0021, top token 97.99% (the previous kernels on the same run: 7.817, 0.0020, 98.24%); 4,096-token context at 256 rows per step: PPL 7.477 vs 7.483, KLD 0.0014, top token 98.19% |
+| 17 | `d34635c` | Full attention for several rows of a session at once: one block per (32 rows, key head, 1,024 positions) reads FP16 keys and values once and multiplies with the matrix instruction | not re-measured (single-row steps keep their kernels) | 485 short; at depth 326 / 301 / 206 at 4K / 16K / 100K (was 258 / 126 / 31) | not re-measured (steps of one row per session keep the per-row kernel) | attention output against the per-row kernel on the same steps: relative difference 2e-4 to 3e-4 at 4K real text and at 100K faked; 4,096-token context: PPL 7.481 vs 7.483, KLD 0.0016, top token 97.90% |
+| 18 | `72f32b9` | The sliding-window layers through the same kernel | 24.7 | 573 at 256 rows per step, 680 at 512 (was 485, 553); at depth 523 / 470 / 273 at 4K / 16K / 100K | 65.0 | relative difference 2e-4 on all 48 visits; 512-token context: PPL 7.798 vs 7.778, KLD 0.0021, top token 98.09%; 4,096-token context: PPL 7.465 vs 7.483, KLD 0.0016, top token 98.09% (per-row attention on the same build: 7.477, 0.0014, 98.19%) |
 
 Notes on reading this table:
 
@@ -49,3 +51,14 @@ Notes on reading this table:
   kernels. Single-row steps (plain generation) still use the earlier kernels, so this step did
   not change generation speed for one session; a step that verifies 7 drafts went from about
   131 to 118 ms. The FP16 copies of the projection weights take about 2.2 GB more on the device.
+- Steps 17 and 18 change the arithmetic of attention in steps with at least 4 rows per session
+  on average: queries, keys and values are rounded to FP16 (the cache keeps F32 and FP16
+  copies), the attention weights are stored as FP16 relative to a running maximum (11
+  significant bits down to 2e-9 of it), and sums are FP32. `INKLING2_WMMA_ATTN_MIN_ROWS=0`
+  restores the per-row kernels, `INKLING2_WMMA_ATTN_WINDOW=0` only for the sliding-window
+  layers; `INKLING2_ATTN_AB=1` runs both kernels on every visit and reports the difference.
+  The FP16 copies add about 33 KB per token of context per session (3.3 GB at 100,000 tokens).
+  The threshold of 4 rows is not tuned: only 1 row per session (per-row kernel faster) and 8
+  rows (batched kernel faster) were measured.
+- The depth numbers still come from a faked context (the caches are filled by repetition). With
+  real text the batched kernels are checked up to 4,096 tokens.
