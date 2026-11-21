@@ -567,6 +567,82 @@ as without it. About 0.5 GB of a snapshot is the rings, whatever the length. Thi
 mechanism a prefix cache needs; choosing which prefixes to keep, and keeping them on disk, is
 not built.
 
+## Speed against context depth, 2026-11-21
+
+`INKLING2_SWEEP=<token file>` in the development driver processes one long real text
+(wikitext-2 train, 2,048 rows per prompt step) and stops at chosen depths. "Interval" is the
+average prompt speed since the previous point, "at depth" the speed of the last full step
+before the point. Generation is one step that produces a token, the median of 12; "8 drafts"
+is one step that verifies 8 drafted tokens.
+
+Baseline, engine as of step 25 (commit `e5b0104`):
+
+| Depth | Prompt, interval | Prompt, at depth | Seconds from 0 | One token | Generation | 8 drafts |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 1,034 t/s | | 1 | 42.3 ms | 23.7 t/s | 128 ms |
+| 4,096 | 1,020 | 1,068 | 4 | 43.4 | 23.1 | 124 |
+| 16,384 | 920 | 847 | 17 | 44.7 | 22.4 | 136 |
+| 32,768 | 744 | 678 | 39 | 48.3 | 20.7 | 148 |
+| 65,536 | 561 | 486 | 98 | 55.7 | 17.9 | 171 |
+| 100,000 | 419 | 378 | 180 | 63.3 | 15.8 | 182 |
+| 131,072 | 331 | 310 | 274 | 70.2 | 14.2 | 200 |
+| 196,608 | 234 | 227 | 554 | 84.6 | 11.8 | 234 |
+
+The run was stopped at 196,608 (it was planned to 1,040,000 and would have taken about three
+hours) to use the machine for the kernel work below. Both curves are straight lines in the
+depth so far: a prompt token costs 0.94 ms plus 17.8 microseconds per 1,000 tokens of depth, a
+generated token 42 ms plus 0.215 ms per 1,000. Extrapolated, not measured: about 51 prompt
+tokens/s and 4 generated tokens/s at 1,000,000, and about three hours to process a
+1,000,000-token prompt from nothing. The 131,072 and 196,608 intervals shared the GPU for
+about a minute with the micro-benchmark below.
+
+With the short path of step 26 (same run, to 100,000):
+
+| Depth | Prompt, interval | Prompt, at depth | Seconds from 0 |
+|---:|---:|---:|---:|
+| 4,096 | 1,089 | 1,064 | 4 |
+| 32,768 | 858 | 737 | 37 |
+| 100,000 | 541 | 437 | 162 |
+
+## What the matrix instruction can do, 2026-11-21
+
+`INKLING2_WMMA_BENCH=1` runs a micro-benchmark of the FP16 matrix instruction
+(`extension/src/hip/bench.hip`): blocks of 8 waves doing nothing but products, with operands
+kept in registers or read at the rate a real kernel needs. Measured while the depth sweep was
+also using the GPU, so the absolute figures are low; the ratios are the point.
+
+| Pattern | Multiply-adds per second |
+|---|---:|
+| Operands in registers | 27e12 |
+| One operand read per 3 or 8 products | 25 to 27e12 |
+| 12 products per 7 operand reads (3 x 4 tiles) | 20e12 |
+| 8 products per 6 reads (2 x 4 tiles) | 17.5e12 |
+| 6 products per 5 reads (2 x 3 tiles) | 16.5e12 |
+| 3 products per 4 reads (1 x 3 tiles: the attention kernel's score pattern) | 12e12 |
+
+Reading the operands of the next products ahead of time did not help, and reading them from
+device memory was as fast as from shared memory. So an operand read costs about as much as a
+product, and a kernel is fast when each operand it reads is used by several products.
+
+For comparison, what the engine's kernels reach on real work: experts and projections about
+7.5e12, the batched attention kernel about 2.5e12 at 100,000 tokens of depth. The compiled
+attention kernel showed why it was far below even its own pattern's 12e12: per slice of 64
+positions a wave executed 48 products and well over a thousand other instructions (staging
+keys and values through shared memory, a cross-wave maximum and sum for every query, a rescale
+of every accumulator, masks and bias tests for every score).
+
+Step 26 removes most of that for slices far before the rows (keys and values straight from the
+cache into the instruction, the maximum only recomputed when a score exceeds it, sums kept per
+lane, one barrier less): 16% faster at 100,000 tokens of depth (378 to 437 tokens/s), 29% over
+the whole 100,000-token prompt (419 to 541 over the last interval). That is less than the
+instruction counts suggested, so the kernel is not bound by them alone. A 2,048-row step at
+100,000 now takes 4.7 s: 1.9 s is everything that does not depend on depth, and of the 2.8 s
+of full attention about 1.1 s is reading the cache (each group of 32 rows reads all keys and
+values of a head: 210 GB per step) and about 0.9 s the products at their pattern's rate.
+What follows from that, not done yet: more rows per cache read, tiles that use each operand
+for several products, and the same tiling in the expert and projection kernels, which is
+where the 1.9 s is.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
