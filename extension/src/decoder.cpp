@@ -281,13 +281,14 @@ struct GpuEngine::Impl {
     scratch = Floats(B * kNH * std::size_t(max_n));
     low = Floats(B * 3 * kRank);
     router_logits = Floats(B * kNX);
-    final_x = Floats(std::size_t(opt.sessions) * kE);
-    logits = Floats(std::size_t(opt.sessions) * c.n_vocab_padded);
-    host_logits.resize(std::size_t(opt.sessions) * c.n_vocab_padded);
+    const std::size_t heads_cap = std::max<std::size_t>(opt.sessions, B);
+    final_x = Floats(heads_cap * kE);
+    logits = Floats(heads_cap * c.n_vocab_padded);
+    host_logits.resize(heads_cap * c.n_vocab_padded);
 
     off_tokens = sizeof(gpu::RowState) * c.visits() * B;
     off_heads = off_tokens + 4 * B;
-    host_staging.resize(off_heads + 4 * opt.sessions);
+    host_staging.resize(off_heads + 4 * heads_cap);
     staging = Alloc(host_staging.size());
     row_states = static_cast<const gpu::RowState*>(staging);
     dev_tokens = reinterpret_cast<const std::uint32_t*>(
@@ -495,7 +496,20 @@ struct GpuEngine::Impl {
     n_launches += looped ? 17 : 13;
   }
 
-  void Step(const std::vector<Row>& rows, bool head) {
+  void Reset(std::uint32_t index) {
+    Session& session = sessions.at(index);
+    session.pos = 0;
+    for (Slot& slot : session.slots) {
+      float** hist = slot.hist[session.hist_current];
+      Check(hipMemsetAsync(hist[0], 0, (kNC - 1) * kHK * 4, stream), "clear");
+      Check(hipMemsetAsync(hist[1], 0, (kNC - 1) * kHK * 4, stream), "clear");
+      Check(hipMemsetAsync(hist[2], 0, (kNC - 1) * kE * 4, stream), "clear");
+      Check(hipMemsetAsync(hist[3], 0, (kNC - 1) * kE * 4, stream), "clear");
+    }
+    Check(hipStreamSynchronize(stream), "synchronize");
+  }
+
+  void Step(const std::vector<Row>& rows, Head head) {
     if (rows.empty() || rows.size() > opt.max_batch)
       throw std::runtime_error("inkling2 gpu: batch size out of range");
     batch = static_cast<int>(rows.size());
@@ -516,10 +530,10 @@ struct GpuEngine::Impl {
         seen.push_back(row.session);
       }
       run[b] = continues ? run[b - 1] + 1 : 0;
-      if (b + 1 == rows.size() || rows[b + 1].session != row.session) {
+      if (b + 1 == rows.size() || rows[b + 1].session != row.session)
         last[b] = 1;
+      if (head == Head::kAll || (head == Head::kLast && last[b]))
         heads.push_back(static_cast<std::int32_t>(b));
-      }
     }
 
     auto* states = reinterpret_cast<gpu::RowState*>(host_staging.data());
@@ -618,7 +632,7 @@ struct GpuEngine::Impl {
       Visit(il, il, false);
 
     n_heads = 0;
-    if (head) {
+    if (head != Head::kNone) {
       Mark(9);
       n_heads = heads.size();
       gpu::FinalArgs f{};
@@ -660,8 +674,12 @@ GpuEngine::GpuEngine(const Model& model, const Options& options)
     : impl_(std::make_unique<Impl>(model, options)) {}
 GpuEngine::~GpuEngine() = default;
 
-void GpuEngine::Step(const std::vector<Row>& rows, bool head) {
+void GpuEngine::Step(const std::vector<Row>& rows, Head head) {
   impl_->Step(rows, head);
+}
+
+void GpuEngine::Reset(std::uint32_t session) {
+  impl_->Reset(session);
 }
 
 const float* GpuEngine::logits(std::size_t i) const {

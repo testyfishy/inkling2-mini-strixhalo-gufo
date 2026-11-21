@@ -34,11 +34,21 @@ public:
     std::uint32_t session;
     std::uint32_t token;
   };
+  enum class Head {
+    kNone,  // no logits
+    kLast,  // after the last row of each session's run
+    kAll,   // after every row
+  };
   /// Runs the rows. Rows of one session must be adjacent, in order, and a
-  /// session may appear once. With `head`, the logits after the last row of
-  /// each session's run are computed; read them with `logits(i)`, where i
-  /// counts the runs in order of appearance.
-  void Step(const std::vector<Row>& rows, bool head);
+  /// session may appear once. Read the logits with `logits(i)`, where i counts
+  /// the runs in order of appearance (kLast) or the rows (kAll).
+  void Step(const std::vector<Row>& rows, Head head);
+  void Step(const std::vector<Row>& rows, bool head) {
+    Step(rows, head ? Head::kLast : Head::kNone);
+  }
+
+  /// Forgets a session's context: its next row is position 0 again.
+  void Reset(std::uint32_t session);
 
   /// Raw logits (before the soft cap) of run `i` of the last step, one per
   /// vocabulary entry.

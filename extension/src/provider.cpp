@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
@@ -287,9 +288,153 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
   return 0;
 }
 
+// Quality check against llama.cpp: INKLING2_KLD names a file written by
+// `llama-perplexity --kl-divergence-base` on the same GGUF. The same token
+// chunks are run through the GPU engine and, as llama.cpp does, the second
+// half of each chunk is scored: perplexity of both, mean KL divergence from
+// llama.cpp's distribution to ours, and how often the top token agrees.
+// INKLING2_KLD_CHUNKS limits the chunks; INKLING2_BATCH sets rows per step.
+int RunQuality(const gufo::core::GgufReader& reader, const char* path) {
+  inkling2::Config config;
+  std::string error;
+  if (!inkling2::LoadConfig(reader, &config, &error) ||
+      !inkling2::CheckTensors(reader, config, nullptr, &error)) {
+    std::fprintf(stderr, "%s\n", error.c_str());
+    return 1;
+  }
+  std::FILE* file = std::fopen(path, "rb");
+  if (!file) {
+    std::fprintf(stderr, "inkling2: cannot open %s\n", path);
+    return 1;
+  }
+  char magic[8];
+  std::int32_t n_ctx = 0, n_vocab = 0, n_chunk = 0;
+  bool ok = std::fread(magic, 1, 8, file) == 8 &&
+            std::memcmp(magic, "_logits_", 8) == 0 &&
+            std::fread(&n_ctx, 4, 1, file) == 1 &&
+            std::fread(&n_vocab, 4, 1, file) == 1 &&
+            std::fread(&n_chunk, 4, 1, file) == 1;
+  if (!ok || n_vocab != static_cast<std::int32_t>(config.n_vocab) ||
+      n_ctx < 4 || n_chunk < 1) {
+    std::fprintf(stderr, "inkling2: %s is not a matching logits file\n", path);
+    std::fclose(file);
+    return 1;
+  }
+  std::vector<std::int32_t> tokens(std::size_t(n_chunk) * n_ctx);
+  ok = std::fread(tokens.data(), 4, tokens.size(), file) == tokens.size();
+  const int chunks = std::min<int>(n_chunk, EnvInt("INKLING2_KLD_CHUNKS", n_chunk));
+  const int batch = std::max(1, EnvInt("INKLING2_BATCH", 16));
+  const int first = n_ctx / 2;
+  const int scored = n_ctx - 1 - first;
+  // One record per scored position: a scale, an offset, then 16-bit log-probs.
+  const std::size_t record = 2 * ((std::size_t(n_vocab) + 1) / 2) + 4;
+  std::vector<std::uint16_t> base(std::size_t(scored) * record);
+
+  try {
+    const inkling2::Model model = inkling2::LoadModel(reader, config);
+    inkling2::GpuEngine::Options options;
+    options.sessions = 1;
+    options.max_batch = static_cast<std::uint32_t>(batch);
+    options.context = static_cast<std::uint32_t>(std::max(n_ctx, 1024));
+    inkling2::GpuEngine engine(model, options);
+
+    double nll = 0, nll_base = 0, kld_sum = 0, kld_max = 0;
+    std::size_t count = 0, same_top = 0;
+    std::vector<double> klds;
+    std::vector<float> log_p(n_vocab);
+    const auto start = std::chrono::steady_clock::now();
+    for (int chunk = 0; chunk < chunks && ok; ++chunk) {
+      ok = std::fread(base.data(), 2, base.size(), file) == base.size();
+      if (!ok)
+        break;
+      const std::int32_t* tok = tokens.data() + std::size_t(chunk) * n_ctx;
+      engine.Reset(0);
+      // Positions 0 .. n_ctx - 2 are fed; logits are needed from `first` on.
+      for (int i = 0; i < n_ctx - 1; i += batch) {
+        const int end = std::min(n_ctx - 1, i + batch);
+        std::vector<inkling2::GpuEngine::Row> rows;
+        for (int j = i; j < end; ++j)
+          rows.push_back({0, static_cast<std::uint32_t>(tok[j])});
+        const bool need = end > first;
+        engine.Step(rows, need ? inkling2::GpuEngine::Head::kAll
+                               : inkling2::GpuEngine::Head::kNone);
+        for (int j = std::max(i, first); j < end; ++j) {
+          const std::vector<float> logits = engine.capped_logits(j - i);
+          int top = 0;
+          for (int v = 1; v < n_vocab; ++v)
+            if (logits[v] > logits[top])
+              top = v;
+          double sum = 0;
+          for (int v = 0; v < n_vocab; ++v)
+            sum += std::exp(static_cast<double>(logits[v]) - logits[top]);
+          const double log_sum = std::log(sum) + logits[top];
+          const std::uint16_t* rec = base.data() + std::size_t(j - first) * record;
+          float scale, min_log_prob;
+          std::memcpy(&scale, rec, 4);
+          std::memcpy(&min_log_prob, rec + 2, 4);
+          const std::uint16_t* q = rec + 4;
+          // As llama.cpp computes it: its stored log-probabilities are used as
+          // they are, and entries at or below its floor of -16 are skipped.
+          int base_top = 0;
+          double kld = 0;
+          for (int v = 0; v < n_vocab; ++v) {
+            log_p[v] = scale * q[v] + min_log_prob;
+            if (q[v] > q[base_top])
+              base_top = v;
+            if (log_p[v] > -16.0f)
+              kld += std::exp(static_cast<double>(log_p[v])) *
+                     (log_p[v] - (logits[v] - log_sum));
+          }
+          const int target = tok[j + 1];
+          nll += log_sum - logits[target];
+          nll_base += -log_p[target];
+          kld_sum += kld;
+          kld_max = std::max(kld_max, kld);
+          klds.push_back(kld);
+          same_top += top == base_top ? 1 : 0;
+          ++count;
+        }
+      }
+      std::printf("chunk %d/%d: ppl %.4f (llama.cpp %.4f), mean KLD %.6f, "
+                  "same top token %.2f%%\n",
+                  chunk + 1, chunks, std::exp(nll / count),
+                  std::exp(nll_base / count), kld_sum / count,
+                  100.0 * same_top / count);
+      std::fflush(stdout);
+    }
+    std::fclose(file);
+    if (count == 0) {
+      std::fprintf(stderr, "inkling2: no positions scored\n");
+      return 1;
+    }
+    const double seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+    std::sort(klds.begin(), klds.end());
+    std::printf("\nquality over %zu positions (%d chunks of %d tokens, second "
+                "half scored):\n",
+                count, chunks, n_ctx);
+    std::printf("  perplexity, this engine   %.4f\n", std::exp(nll / count));
+    std::printf("  perplexity, llama.cpp     %.4f\n", std::exp(nll_base / count));
+    std::printf("  mean KLD vs llama.cpp     %.6f\n", kld_sum / count);
+    std::printf("  median / 99%% / max KLD    %.6f / %.6f / %.6f\n",
+                klds[klds.size() / 2], klds[klds.size() * 99 / 100], kld_max);
+    std::printf("  same top token            %.2f%%\n",
+                100.0 * same_top / count);
+    std::printf("  evaluated in %.1f s (%.1f tokens/s, %d rows per step)\n",
+                seconds, std::size_t(chunks) * (n_ctx - 1) / seconds, batch);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
 int Prompt(const gufo::ext::TextPromptOptions&,
            const gufo::core::GgufReader& reader,
            std::chrono::steady_clock::time_point) {
+  if (const char* kld = std::getenv("INKLING2_KLD"))
+    return RunQuality(reader, kld);
   if (const char* ids = std::getenv("INKLING2_REF_TOKENS")) {
     if (const char* v = std::getenv("INKLING2_GPU"); v && *v == '2')
       return RunDecoder(reader, ids);
