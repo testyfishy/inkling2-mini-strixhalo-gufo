@@ -10,7 +10,6 @@
 #include <string>
 
 #include "hip/decode.hpp"
-#include "hip/ops.hpp"
 
 namespace inkling2 {
 namespace {
@@ -18,9 +17,14 @@ namespace {
 using gpu::kE;
 using gpu::kHK;
 using gpu::kHQ;
+using gpu::kMaxStates;
 using gpu::kNC;
 using gpu::kNH;
+using gpu::kNKV;
 using gpu::kNR;
+using gpu::kNX;
+using gpu::kRank;
+using gpu::kTopK;
 
 void Check(hipError_t status, const char* what) {
   if (status != hipSuccess)
@@ -30,7 +34,7 @@ void Check(hipError_t status, const char* what) {
 
 }  // namespace
 
-struct GpuDecoder::Impl {
+struct GpuEngine::Impl {
   // Device copies of one physical layer's weights.
   struct Layer {
     const std::uint16_t *wq, *wk, *wv, *wo, *gate, *sink, *rel, *kcp, *vcp;
@@ -39,34 +43,71 @@ struct GpuDecoder::Impl {
     const float *q_clip, *rel_bias, *rel_clip, *k_conv, *v_conv, *attn_post,
         *ffn_post, *norm[3], *res_query, *ffn_res_query, *ffn_norm, *gate_inp,
         *exp_probs_b, *up_scale, *down_scale, *msg_query;
-    gpu::Ctrl ctrl[4];
+    const float *ctrl_down[4], *ctrl_gain[4], *ctrl_forget[4];
   };
-  // State of one layer visit.
+  // One session's state for one layer visit. The convolution histories are
+  // kept twice: a step reads one copy and writes the other.
   struct Slot {
-    float *k, *v, *hist_k, *hist_v, *hist_attn, *hist_ffn;
+    float *k, *v;
+    float* hist[2][4];
     int cap;
+  };
+  struct Session {
+    std::vector<Slot> slots;
+    std::uint32_t pos{0};
+    int hist_current{0};
   };
 
   const Model& m;
   const Config& c;
+  Options opt;
   hipStream_t stream{};
   std::vector<void*> owned;
   std::vector<Layer> layers;
-  std::vector<Slot> slots;
+  std::vector<Session> sessions;
   const std::uint16_t *tok_embd{}, *output{};
   const float *tok_norm{}, *output_norm{}, *output_res_query{};
-  // Working vectors.
+  // Per-row working buffers.
   float *cur{}, *input{}, *in{}, *msgs{}, *stack{}, *prelude{}, *bank0{},
       *bank_out{}, *q{}, *r{}, *gate{}, *sink{}, *k_raw{}, *v_raw{}, *k_taps{},
-      *v_taps{}, *attn{}, *proj{}, *xn{}, *sel{}, *act{}, *moe{}, *scratch{},
-      *final_x{}, *logits{}, *low{}, *router_logits{};
-  std::uint32_t context;
-  std::uint32_t pos{0};
+      *v_taps{}, *attn{}, *proj{}, *xn{}, *sel_up{}, *sel_coef{}, *act{},
+      *moe{}, *scratch{}, *final_x{}, *logits{}, *low{}, *router_logits{};
+  std::uint32_t* sel_ids{};
+  // Per-step staging: the row states of every visit, the tokens, the head rows.
+  void* staging{};
+  std::vector<std::uint8_t> host_staging;
+  std::size_t off_tokens{0}, off_heads{0};
+  const gpu::RowState* row_states{};
+  const std::uint32_t* dev_tokens{};
+  const std::int32_t* dev_heads{};
+  int max_n{0};
+
+  int batch{0};
   int n_blocks{0};
-  bool debug{false};
-  std::vector<double> sums;
-  std::vector<float> host_logits, host_vec;
+  std::size_t n_heads{0};
+  std::vector<float> host_logits;
   std::size_t n_launches{0};
+
+  static constexpr int kPhases = 11;
+  static constexpr const char* kPhaseNames[kPhases] = {
+      "glue A (mix, messages, norms)", "input projections",
+      "glue B (conv, clips, KV store)", "attention", "output projection",
+      "glue C (conv, mix, norm, router)", "experts NVFP4", "experts BF16",
+      "glue D (conv, residual)", "embed and copies", "output head"};
+  bool profile{false};
+  double phase_seconds[kPhases] = {};
+  std::chrono::steady_clock::time_point mark{};
+
+  // While profiling, a round trip after each kernel group, charged to `phase`.
+  void Mark(int phase) {
+    if (!profile)
+      return;
+    Check(hipStreamSynchronize(stream), "synchronize");
+    const auto now = std::chrono::steady_clock::now();
+    if (phase >= 0)
+      phase_seconds[phase] += std::chrono::duration<double>(now - mark).count();
+    mark = now;
+  }
 
   void* Alloc(std::size_t bytes, bool zero = false) {
     void* p = nullptr;
@@ -110,19 +151,27 @@ struct GpuDecoder::Impl {
     return static_cast<const float*>(Upload(wide.data(), wide.size() * 4));
   }
 
-  Impl(const Model& model, std::uint32_t ctx)
-      : m(model), c(model.c), context(ctx) {
+  // The physical layer a visit slot runs.
+  [[nodiscard]] std::uint32_t Physical(std::uint32_t slot) const {
+    const std::uint32_t core = c.loop_end - c.loop_start;
+    return slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % core;
+  }
+
+  Impl(const Model& model, const Options& options)
+      : m(model), c(model.c), opt(options) {
     const bool shape_ok =
         c.n_embd == kE && c.head_dim == gpu::kHD && c.n_head == kNH &&
-        c.n_head_kv == gpu::kNKV && c.n_rel == gpu::kNRel && c.n_conv == kNC &&
-        c.n_expert == gpu::kNX && c.n_expert_used == gpu::kTopK &&
-        c.loop_gate_rank == gpu::kRank && c.n_layer == 24 &&
-        c.loop_start == 6 && c.loop_end == 18 && c.res_block == 6 &&
-        c.n_swa == 1024 && c.n_rel_extent == 1024;
+        c.n_head_kv == kNKV && c.n_rel == gpu::kNRel && c.n_conv == kNC &&
+        c.n_expert == kNX && c.n_expert_used == kTopK &&
+        c.n_ff_exp == gpu::kFF && c.loop_gate_rank == kRank &&
+        c.n_layer == 24 && c.loop_start == 6 && c.loop_end == 18 &&
+        c.res_block == 6 && c.n_swa == 1024 && c.n_rel_extent == 1024;
     if (!shape_ok)
       throw std::runtime_error(
-          "inkling2 gpu: the decoder kernels are built for Inkling 2 Mini's "
+          "inkling2 gpu: the kernels are built for Inkling 2 Mini's "
           "dimensions; this file differs");
+    if (opt.sessions == 0 || opt.max_batch == 0)
+      throw std::runtime_error("inkling2 gpu: need a session and a batch row");
     Check(hipStreamCreate(&stream), "create stream");
 
     tok_embd = UpBf16(m.tok_embd);
@@ -174,54 +223,77 @@ struct GpuDecoder::Impl {
       l.up_scale = Up(w.gate_up_scale);
       l.down_scale = Up(w.down_scale);
       l.msg_query = Up(w.msg_query);
-      if (il >= c.loop_start && il < c.loop_end)
-        for (int k = 0; k < 4; ++k)
-          l.ctrl[k] = {UpF32(w.ctrl_down[k]), UpF32(w.ctrl_gain[k]),
-                       UpF32(w.ctrl_forget[k])};
+      for (int k = 0; k < 4; ++k) {
+        const bool core = il >= c.loop_start && il < c.loop_end;
+        l.ctrl_down[k] = core ? UpF32(w.ctrl_down[k]) : nullptr;
+        l.ctrl_gain[k] = core ? UpF32(w.ctrl_gain[k]) : nullptr;
+        l.ctrl_forget[k] = core ? UpF32(w.ctrl_forget[k]) : nullptr;
+      }
     }
 
-    slots.resize(c.visits());
-    for (std::uint32_t s = 0; s < c.visits(); ++s) {
-      Slot& slot = slots[s];
-      slot.cap = static_cast<int>(c.is_swa[Physical(s)] ? c.n_swa : context);
-      slot.k = Floats(std::size_t(slot.cap) * kHK, true);
-      slot.v = Floats(std::size_t(slot.cap) * kHK, true);
-      slot.hist_k = Floats((kNC - 1) * kHK, true);
-      slot.hist_v = Floats((kNC - 1) * kHK, true);
-      slot.hist_attn = Floats((kNC - 1) * kE, true);
-      slot.hist_ffn = Floats((kNC - 1) * kE, true);
+    // A sliding-window ring must keep the window of the earliest row of a
+    // batch while the latest row of the same session is stored.
+    const int swa_cap = static_cast<int>(c.n_swa + opt.max_batch);
+    sessions.resize(opt.sessions);
+    for (Session& session : sessions) {
+      session.slots.resize(c.visits());
+      for (std::uint32_t s = 0; s < c.visits(); ++s) {
+        Slot& slot = session.slots[s];
+        slot.cap =
+            c.is_swa[Physical(s)] ? swa_cap : static_cast<int>(opt.context);
+        slot.k = Floats(std::size_t(slot.cap) * kHK, true);
+        slot.v = Floats(std::size_t(slot.cap) * kHK, true);
+        for (int copy = 0; copy < 2; ++copy) {
+          slot.hist[copy][0] = Floats((kNC - 1) * kHK, true);
+          slot.hist[copy][1] = Floats((kNC - 1) * kHK, true);
+          slot.hist[copy][2] = Floats((kNC - 1) * kE, true);
+          slot.hist[copy][3] = Floats((kNC - 1) * kE, true);
+        }
+      }
     }
 
-    cur = Floats(kE);
-    input = Floats(kE);
-    in = Floats(3 * kE);
-    msgs = Floats(4 * kE);
-    stack = Floats(gpu::kMaxStates * kE);
-    prelude = Floats(kE);
-    bank0 = Floats(kE);
-    bank_out = Floats(kE);
-    q = Floats(kHQ);
-    r = Floats(kNR);
-    gate = Floats(kHQ);
-    sink = Floats(kNH);
-    k_raw = Floats(kHK);
-    v_raw = Floats(kHK);
-    k_taps = Floats(kNC * gpu::kNKV);
-    v_taps = Floats(kNC * gpu::kNKV);
-    attn = Floats(kHQ);
-    proj = Floats(kE);
-    xn = Floats(kE);
-    sel = Floats(3 * gpu::kTopK);
-    act = Floats(gpu::kTopK * c.n_ff_exp);
-    moe = Floats(kE);
-    scratch = Floats(std::size_t(kNH) * std::max<std::uint32_t>(context, c.n_swa));
-    final_x = Floats(kE);
-    low = Floats(3 * gpu::kRank);
-    router_logits = Floats(gpu::kNX);
-    logits = Floats(c.n_vocab_padded);
-    host_logits.resize(c.n_vocab_padded);
-    host_vec.resize(kE);
-    sums.assign(c.visits(), 0.0);
+    const std::size_t B = opt.max_batch;
+    cur = Floats(B * kE);
+    input = Floats(B * kE);
+    in = Floats(B * 3 * kE);
+    msgs = Floats(B * 4 * kE);
+    stack = Floats(B * kMaxStates * kE);
+    prelude = Floats(B * kE);
+    bank0 = Floats(B * kE);
+    bank_out = Floats(B * kE);
+    q = Floats(B * kHQ);
+    r = Floats(B * kNR);
+    gate = Floats(B * kHQ);
+    sink = Floats(B * kNH);
+    k_raw = Floats(B * kHK);
+    v_raw = Floats(B * kHK);
+    k_taps = Floats(B * kNC * kNKV);
+    v_taps = Floats(B * kNC * kNKV);
+    attn = Floats(B * kHQ);
+    proj = Floats(B * kE);
+    xn = Floats(B * kE);
+    sel_ids = static_cast<std::uint32_t*>(Alloc(B * kTopK * 4));
+    sel_up = Floats(B * kTopK);
+    sel_coef = Floats(B * kTopK);
+    act = Floats(B * kTopK * gpu::kFF);
+    moe = Floats(B * kE);
+    max_n = static_cast<int>(std::max<std::uint32_t>(opt.context, c.n_swa));
+    scratch = Floats(B * kNH * std::size_t(max_n));
+    low = Floats(B * 3 * kRank);
+    router_logits = Floats(B * kNX);
+    final_x = Floats(std::size_t(opt.sessions) * kE);
+    logits = Floats(std::size_t(opt.sessions) * c.n_vocab_padded);
+    host_logits.resize(std::size_t(opt.sessions) * c.n_vocab_padded);
+
+    off_tokens = sizeof(gpu::RowState) * c.visits() * B;
+    off_heads = off_tokens + 4 * B;
+    host_staging.resize(off_heads + 4 * opt.sessions);
+    staging = Alloc(host_staging.size());
+    row_states = static_cast<const gpu::RowState*>(staging);
+    dev_tokens = reinterpret_cast<const std::uint32_t*>(
+        static_cast<const std::uint8_t*>(staging) + off_tokens);
+    dev_heads = reinterpret_cast<const std::int32_t*>(
+        static_cast<const std::uint8_t*>(staging) + off_heads);
   }
 
   ~Impl() {
@@ -233,43 +305,12 @@ struct GpuDecoder::Impl {
       (void)hipStreamDestroy(stream);
   }
 
-  // The physical layer a visit slot runs.
-  [[nodiscard]] std::uint32_t Physical(std::uint32_t slot) const {
-    const std::uint32_t core = c.loop_end - c.loop_start;
-    return slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % core;
-  }
-
-  // Profiling: with `profile` on, every kernel group is followed by a round
-  // trip and its wall time is added to `phase_seconds`. That adds overhead of
-  // its own, so the phases show proportions, not the unprofiled cost.
-  static constexpr int kPhases = 11;
-  static constexpr const char* kPhaseNames[kPhases] = {
-      "glue A (mix, messages, norms)", "input projections",
-      "glue B (conv, clips, KV store)", "attention", "output projection",
-      "glue C (conv, mix, norm, router)", "experts NVFP4", "experts BF16",
-      "glue D (conv, residual)", "embed and copies", "output head"};
-  bool profile{false};
-  double phase_seconds[kPhases] = {};
-  std::chrono::steady_clock::time_point mark{};
-
-  void Mark(int phase) {
-    if (!profile)
-      return;
-    Check(hipStreamSynchronize(stream), "synchronize");
-    const auto now = std::chrono::steady_clock::now();
-    if (phase >= 0)
-      phase_seconds[phase] +=
-          std::chrono::duration<double>(now - mark).count();
-    mark = now;
-  }
-
   void Visit(std::uint32_t slot_index, std::uint32_t il, bool looped) {
     const Layer& l = layers[il];
-    Slot& slot = slots[slot_index];
     const bool swa = c.is_swa[il];
     const bool block_start = il % c.res_block == 0;
-    if (!swa && pos >= static_cast<std::uint32_t>(slot.cap))
-      throw std::runtime_error("inkling2 gpu: context is full");
+    const gpu::RowState* rows =
+        row_states + std::size_t(slot_index) * opt.max_batch;
 
     gpu::GlueAArgs a{};
     a.cur = cur;
@@ -284,51 +325,54 @@ struct GpuDecoder::Impl {
     a.bank0 = bank0;
     a.bank_out = bank_out;
     a.msg_query = l.msg_query;
+    a.batch = batch;
     gpu::GlueA(a, stream);
     if (looped) {
-      gpu::CtrlDownArgs down{};
-      gpu::CtrlApplyArgs apply{};
+      gpu::CtrlArgs ctrl{};
+      ctrl.cur = in;
+      ctrl.cur_stride = 3 * kE;
+      ctrl.msg = msgs;
+      ctrl.msg_stride = 4 * kE;
       for (int j = 0; j < 3; ++j) {
-        down.cur[j] = apply.cur[j] = in + j * kE;
-        down.msg[j] = apply.msg[j] = msgs + j * kE;
-        down.down[j] = l.ctrl[j].down;
-        apply.gain[j] = l.ctrl[j].gain;
-        apply.forget[j] = l.ctrl[j].forget;
+        ctrl.down[j] = l.ctrl_down[j];
+        ctrl.gain[j] = l.ctrl_gain[j];
+        ctrl.forget[j] = l.ctrl_forget[j];
       }
-      down.low = low;
-      apply.low = low;
-      down.count = apply.count = 3;
-      gpu::CtrlDown(down, stream);
-      gpu::CtrlApply(apply, stream);
+      ctrl.low = low;
+      ctrl.count = 3;
+      ctrl.batch = batch;
+      gpu::CtrlDown(ctrl, stream);
+      gpu::CtrlApply(ctrl, stream);
     }
     gpu::NormArgs norm{};
-    for (int j = 0; j < 3; ++j) {
-      norm.x[j] = in + j * kE;
+    norm.x = in;
+    norm.stride = 3 * kE;
+    for (int j = 0; j < 3; ++j)
       norm.w[j] = l.norm[j];
-    }
     norm.count = 3;
+    norm.batch = batch;
     norm.eps = c.norm_eps;
     gpu::Norm(norm, stream);
     Mark(0);
 
-    gpu::GemvArgs g{};
-    g.jobs[0] = {l.wq, in, q, kHQ, kE};
-    g.jobs[1] = {l.rel, in, r, kNR, kE};
-    g.jobs[2] = {l.gate, in, gate, kHQ, kE};
-    g.jobs[3] = {l.sink, in, sink, kNH, kE};
-    g.jobs[4] = {l.wk, in + kE, k_raw, kHK, kE};
-    g.jobs[5] = {l.wv, in + 2 * kE, v_raw, kHK, kE};
+    const int taps = kNC * kNKV;
+    gpu::GemmArgs g{};
+    g.jobs[0] = {l.wq, in, 3 * kE, q, kHQ, kHQ, kE};
+    g.jobs[1] = {l.rel, in, 3 * kE, r, kNR, kNR, kE};
+    g.jobs[2] = {l.gate, in, 3 * kE, gate, kHQ, kHQ, kE};
+    g.jobs[3] = {l.sink, in, 3 * kE, sink, kNH, kNH, kE};
+    g.jobs[4] = {l.wk, in + kE, 3 * kE, k_raw, kHK, kHK, kE};
+    g.jobs[5] = {l.wv, in + 2 * kE, 3 * kE, v_raw, kHK, kHK, kE};
     g.count = 6;
     if (!swa) {
-      g.jobs[6] = {l.kcp, in + kE, k_taps, kNC * gpu::kNKV, kE};
-      g.jobs[7] = {l.vcp, in + 2 * kE, v_taps, kNC * gpu::kNKV, kE};
+      g.jobs[6] = {l.kcp, in + kE, 3 * kE, k_taps, taps, taps, kE};
+      g.jobs[7] = {l.vcp, in + 2 * kE, 3 * kE, v_taps, taps, taps, kE};
       g.count = 8;
     }
-    gpu::GemvMulti(g, stream);
+    g.batch = batch;
+    gpu::Gemm(g, stream);
     Mark(1);
 
-    const float ratio = std::max(
-        1.0f, (pos + 1.0f) / static_cast<float>(c.log_scale_floor));
     gpu::GlueBArgs b{};
     b.k_raw = k_raw;
     b.v_raw = v_raw;
@@ -338,17 +382,13 @@ struct GpuDecoder::Impl {
     b.v_taps = swa ? nullptr : v_taps;
     b.k_conv = l.k_conv;
     b.v_conv = l.v_conv;
-    b.hist_k = slot.hist_k;
-    b.hist_v = slot.hist_v;
     b.q_clip = l.q_clip;
     b.rel_clip = l.rel_clip;
-    b.tau = swa ? 1.0f : 1.0f + c.log_scale_alpha * std::log(ratio);
     b.qk_clip = c.qk_clip;
     b.rel_clip_threshold = c.rel_clip;
     b.eps = c.norm_eps;
-    const std::size_t row = pos % static_cast<std::uint32_t>(slot.cap);
-    b.k_row = slot.k + row * kHK;
-    b.v_row = slot.v + row * kHK;
+    b.rows = rows;
+    b.batch = batch;
     gpu::GlueB(b, stream);
     Mark(2);
 
@@ -358,28 +398,26 @@ struct GpuDecoder::Impl {
     at.sink = sink;
     at.gate = gate;
     at.rel_bias = l.rel_bias;
-    at.kv_k = slot.k;
-    at.kv_v = slot.v;
     at.scratch = scratch;
     at.out = attn;
     at.extent = static_cast<int>(swa ? c.n_swa : c.n_rel_extent);
-    at.cap = slot.cap;
-    at.first = swa && pos >= c.n_swa ? static_cast<int>(pos - c.n_swa + 1) : 0;
-    at.pos = static_cast<int>(pos);
+    at.max_n = max_n;
     at.scale = 1.0f / std::sqrt(static_cast<float>(gpu::kHD));
+    at.rows = rows;
+    at.batch = batch;
     gpu::Attention(at, stream);
     Mark(3);
 
-    gpu::GemvArgs o{};
-    o.jobs[0] = {l.wo, attn, proj, kE, kHQ};
+    gpu::GemmArgs o{};
+    o.jobs[0] = {l.wo, attn, kHQ, proj, kE, kE, kHQ};
     o.count = 1;
-    gpu::GemvMulti(o, stream);
+    o.batch = batch;
+    gpu::Gemm(o, stream);
     Mark(4);
 
     gpu::GlueCArgs cc{};
     cc.proj = proj;
     cc.post_conv = l.attn_post;
-    cc.hist = slot.hist_attn;
     cc.input = input;
     cc.block_start = block_start;
     cc.stack = stack;
@@ -387,25 +425,32 @@ struct GpuDecoder::Impl {
     cc.cur = cur;
     cc.xn = xn;
     cc.ffn_res_query = l.ffn_res_query;
+    cc.rows = rows;
+    cc.batch = batch;
     gpu::GlueC(cc, stream);
+    if (block_start)
+      ++n_blocks;
     if (looped) {
-      gpu::CtrlDownArgs down{};
-      gpu::CtrlApplyArgs apply{};
-      down.cur[0] = apply.cur[0] = xn;
-      down.msg[0] = apply.msg[0] = msgs + 3 * kE;
-      down.down[0] = l.ctrl[3].down;
-      apply.gain[0] = l.ctrl[3].gain;
-      apply.forget[0] = l.ctrl[3].forget;
-      down.low = low;
-      apply.low = low;
-      down.count = apply.count = 1;
-      gpu::CtrlDown(down, stream);
-      gpu::CtrlApply(apply, stream);
+      gpu::CtrlArgs ctrl{};
+      ctrl.cur = xn;
+      ctrl.cur_stride = kE;
+      ctrl.msg = msgs + 3 * kE;
+      ctrl.msg_stride = 4 * kE;
+      ctrl.down[0] = l.ctrl_down[3];
+      ctrl.gain[0] = l.ctrl_gain[3];
+      ctrl.forget[0] = l.ctrl_forget[3];
+      ctrl.low = low;
+      ctrl.count = 1;
+      ctrl.batch = batch;
+      gpu::CtrlDown(ctrl, stream);
+      gpu::CtrlApply(ctrl, stream);
     }
     gpu::NormArgs ffn_norm{};
-    ffn_norm.x[0] = xn;
+    ffn_norm.x = xn;
+    ffn_norm.stride = kE;
     ffn_norm.w[0] = l.ffn_norm;
     ffn_norm.count = 1;
+    ffn_norm.batch = batch;
     ffn_norm.eps = c.norm_eps;
     gpu::Norm(ffn_norm, stream);
     gpu::RouterArgs router{};
@@ -416,63 +461,115 @@ struct GpuDecoder::Impl {
     router.up_scale_all = l.up_scale;
     router.down_scale_all = l.down_scale;
     router.weights_scale = c.expert_weights_scale;
-    router.ids = reinterpret_cast<std::uint32_t*>(sel);
-    router.up_scale = sel + gpu::kTopK;
-    router.coef = sel + 2 * gpu::kTopK;
+    router.ids = sel_ids;
+    router.up_scale = sel_up;
+    router.coef = sel_coef;
+    router.batch = batch;
     gpu::Router(router, stream);
     Mark(5);
-    if (block_start)
-      ++n_blocks;
 
-    gpu::ExpertArgs e{};
+    gpu::BatchExpertArgs e{};
     e.gate_up = l.gate_up;
     e.down = l.down;
     e.x = xn;
-    e.ids = router.ids;
-    e.up_scale = router.up_scale;
-    e.coef = router.coef;
+    e.ids = sel_ids;
+    e.up_scale = sel_up;
+    e.coef = sel_coef;
     e.act = act;
     e.out = moe;
-    e.count = gpu::kTopK;
-    e.ff = static_cast<int>(c.n_ff_exp);
-    e.n_embd = kE;
     e.situ_beta = c.situ_beta;
     e.situ_linear_beta = c.situ_linear_beta;
     e.nvfp4 = l.nvfp4;
-    gpu::Experts(e, stream);
+    e.batch = batch;
+    gpu::BatchExperts(e, stream);
     Mark(l.nvfp4 ? 6 : 7);
 
     gpu::GlueDArgs d{};
     d.moe = moe;
     d.post_conv = l.ffn_post;
-    d.hist = slot.hist_ffn;
     d.cur = cur;
+    d.rows = rows;
+    d.batch = batch;
     gpu::GlueD(d, stream);
     Mark(8);
     n_launches += looped ? 17 : 13;
-
-    if (debug) {
-      Check(hipMemcpyAsync(host_vec.data(), cur, kE * 4, hipMemcpyDeviceToHost,
-                           stream),
-            "copy layer output");
-      Check(hipStreamSynchronize(stream), "synchronize");
-      double sum = 0;
-      for (const float x : host_vec)
-        sum += x;
-      sums[slot_index] += sum;
-    }
   }
 
-  // Queues one token's layers; `head` adds the output projection.
-  void Run(std::uint32_t token, bool head) {
-    if (token >= c.n_vocab)
-      throw std::runtime_error("inkling2: token id out of range");
+  void Step(const std::vector<Row>& rows, bool head) {
+    if (rows.empty() || rows.size() > opt.max_batch)
+      throw std::runtime_error("inkling2 gpu: batch size out of range");
+    batch = static_cast<int>(rows.size());
+
+    // Runs: adjacent rows of one session, each session at most once.
+    std::vector<int> run(rows.size()), last(rows.size(), 0);
+    std::vector<std::uint32_t> seen;
+    std::vector<std::int32_t> heads;
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+      const Row& row = rows[b];
+      if (row.session >= sessions.size() || row.token >= c.n_vocab)
+        throw std::runtime_error("inkling2 gpu: session or token out of range");
+      const bool continues = b > 0 && rows[b - 1].session == row.session;
+      if (!continues) {
+        if (std::find(seen.begin(), seen.end(), row.session) != seen.end())
+          throw std::runtime_error(
+              "inkling2 gpu: a session's rows must be adjacent");
+        seen.push_back(row.session);
+      }
+      run[b] = continues ? run[b - 1] + 1 : 0;
+      if (b + 1 == rows.size() || rows[b + 1].session != row.session) {
+        last[b] = 1;
+        heads.push_back(static_cast<std::int32_t>(b));
+      }
+    }
+
+    auto* states = reinterpret_cast<gpu::RowState*>(host_staging.data());
+    auto* tokens =
+        reinterpret_cast<std::uint32_t*>(host_staging.data() + off_tokens);
+    auto* head_rows =
+        reinterpret_cast<std::int32_t*>(host_staging.data() + off_heads);
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+      Session& session = sessions[rows[b].session];
+      const std::uint32_t pos =
+          session.pos + static_cast<std::uint32_t>(run[b]);
+      if (pos >= opt.context)
+        throw std::runtime_error("inkling2 gpu: context is full");
+      tokens[b] = rows[b].token;
+      const float ratio = std::max(
+          1.0f, (pos + 1.0f) / static_cast<float>(c.log_scale_floor));
+      const float tau = 1.0f + c.log_scale_alpha * std::log(ratio);
+      for (std::uint32_t s = 0; s < c.visits(); ++s) {
+        const Slot& slot = session.slots[s];
+        const bool swa = c.is_swa[Physical(s)];
+        gpu::RowState& state = states[std::size_t(s) * opt.max_batch + b];
+        state.kv_k = slot.k;
+        state.kv_v = slot.v;
+        for (int k = 0; k < 4; ++k) {
+          state.hist_in[k] = slot.hist[session.hist_current][k];
+          state.hist_out[k] = slot.hist[1 - session.hist_current][k];
+        }
+        state.cap = slot.cap;
+        state.first =
+            swa && pos >= c.n_swa ? static_cast<int>(pos - c.n_swa + 1) : 0;
+        state.pos = static_cast<int>(pos);
+        state.run = run[b];
+        state.last = last[b];
+        state.tau = swa ? 1.0f : tau;
+      }
+    }
+    for (std::size_t i = 0; i < heads.size(); ++i)
+      head_rows[i] = heads[i];
+    Check(hipMemcpyAsync(staging, host_staging.data(), host_staging.size(),
+                         hipMemcpyHostToDevice, stream),
+          "copy step inputs");
+
+    Mark(-1);
     gpu::EmbedArgs e{};
-    e.row = tok_embd + std::size_t{token} * kE;
+    e.table = tok_embd;
+    e.tokens = dev_tokens;
     e.norm = tok_norm;
     e.eps = c.norm_eps;
     e.cur = cur;
-    Mark(-1);
+    e.batch = batch;
     gpu::Embed(e, stream);
 
     n_blocks = 0;
@@ -482,8 +579,11 @@ struct GpuDecoder::Impl {
     const int prelude_blocks = n_blocks;
     gpu::CopyArgs keep{};
     keep.dst[0] = prelude;
+    keep.dst_stride[0] = kE;
     keep.src[0] = cur;
+    keep.src_stride[0] = kE;
     keep.count = 1;
+    keep.batch = batch;
     gpu::Copy(keep, stream);
     const std::uint32_t core = c.loop_end - c.loop_start;
     for (std::uint32_t pass = 0; pass < c.loop_count; ++pass) {
@@ -492,12 +592,19 @@ struct GpuDecoder::Impl {
         // and its output. Then restart from the prelude.
         gpu::CopyArgs bank{};
         bank.dst[0] = bank0;
+        bank.dst_stride[0] = kE;
         bank.src[0] = stack + std::size_t(prelude_blocks + 1) * kE;
+        bank.src_stride[0] = kMaxStates * kE;
         bank.dst[1] = bank_out;
+        bank.dst_stride[1] = kE;
         bank.src[1] = cur;
+        bank.src_stride[1] = kE;
         bank.dst[2] = cur;
+        bank.dst_stride[2] = kE;
         bank.src[2] = prelude;
+        bank.src_stride[2] = kE;
         bank.count = 3;
+        bank.batch = batch;
         gpu::Copy(bank, stream);
         n_blocks = prelude_blocks;
       }
@@ -510,7 +617,10 @@ struct GpuDecoder::Impl {
     for (std::uint32_t il = c.loop_end; il < c.n_layer; ++il)
       Visit(il, il, false);
 
+    n_heads = 0;
     if (head) {
+      Mark(9);
+      n_heads = heads.size();
       gpu::FinalArgs f{};
       f.stack = stack;
       f.n_blocks = n_blocks;
@@ -518,34 +628,51 @@ struct GpuDecoder::Impl {
       f.res_query = output_res_query;
       f.norm = output_norm;
       f.eps = c.norm_eps;
+      f.head_rows = dev_heads;
       f.out = final_x;
-      Mark(9);
+      f.count = static_cast<int>(n_heads);
       gpu::Final(f, stream);
-      gpu::GemvArgs g{};
-      g.jobs[0] = {output, final_x, logits, static_cast<int>(c.n_vocab_padded),
-                   kE};
+      gpu::GemmArgs g{};
+      const int vocab = static_cast<int>(c.n_vocab_padded);
+      g.jobs[0] = {output, final_x, kE, logits, vocab, vocab, kE};
       g.count = 1;
-      gpu::GemvMulti(g, stream);
+      g.batch = static_cast<int>(n_heads);
+      gpu::Gemm(g, stream);
       Check(hipMemcpyAsync(host_logits.data(), logits,
-                           std::size_t{c.n_vocab} * 4, hipMemcpyDeviceToHost,
-                           stream),
+                           n_heads * c.n_vocab_padded * 4,
+                           hipMemcpyDeviceToHost, stream),
             "copy logits");
     }
     Check(hipStreamSynchronize(stream), "synchronize");
     Mark(10);
     n_launches += 6;
-    ++pos;
+
+    for (std::size_t b = 0; b < rows.size(); ++b)
+      if (last[b]) {
+        Session& session = sessions[rows[b].session];
+        session.pos += static_cast<std::uint32_t>(run[b]) + 1;
+        session.hist_current = 1 - session.hist_current;
+      }
   }
 };
 
-GpuDecoder::GpuDecoder(const Model& model, std::uint32_t context)
-    : impl_(std::make_unique<Impl>(model, context)) {}
-GpuDecoder::~GpuDecoder() = default;
+GpuEngine::GpuEngine(const Model& model, const Options& options)
+    : impl_(std::make_unique<Impl>(model, options)) {}
+GpuEngine::~GpuEngine() = default;
 
-std::vector<float> GpuDecoder::Feed(std::uint32_t token) {
-  impl_->Run(token, true);
-  std::vector<float> out(impl_->host_logits.begin(),
-                         impl_->host_logits.begin() + impl_->c.n_vocab);
+void GpuEngine::Step(const std::vector<Row>& rows, bool head) {
+  impl_->Step(rows, head);
+}
+
+const float* GpuEngine::logits(std::size_t i) const {
+  if (i >= impl_->n_heads)
+    throw std::runtime_error("inkling2 gpu: no logits for that run");
+  return impl_->host_logits.data() + i * impl_->c.n_vocab_padded;
+}
+
+std::vector<float> GpuEngine::capped_logits(std::size_t i) const {
+  const float* raw = logits(i);
+  std::vector<float> out(raw, raw + impl_->c.n_vocab);
   const float cap = impl_->c.logit_softcap;
   if (cap != 0.0f)
     for (float& x : out)
@@ -553,36 +680,33 @@ std::vector<float> GpuDecoder::Feed(std::uint32_t token) {
   return out;
 }
 
-std::uint32_t GpuDecoder::FeedGreedy(std::uint32_t token) {
-  impl_->Run(token, true);
+std::uint32_t GpuEngine::argmax(std::size_t i) const {
   // The soft cap is monotonic, so the raw logits give the same argmax.
-  const auto begin = impl_->host_logits.begin();
+  const float* raw = logits(i);
   return static_cast<std::uint32_t>(
-      std::max_element(begin, begin + impl_->c.n_vocab) - begin);
+      std::max_element(raw, raw + impl_->c.n_vocab) - raw);
 }
 
-void GpuDecoder::FeedSilent(std::uint32_t token) {
-  impl_->Run(token, false);
+std::uint32_t GpuEngine::position(std::uint32_t session) const {
+  return impl_->sessions.at(session).pos;
 }
 
-void GpuDecoder::SetProfile(bool on) {
+std::uint32_t GpuEngine::vocab() const {
+  return impl_->c.n_vocab;
+}
+
+void GpuEngine::SetProfile(bool on) {
   impl_->profile = on;
 }
 
-std::vector<std::pair<std::string, double>> GpuDecoder::phases() const {
+std::vector<std::pair<std::string, double>> GpuEngine::phases() const {
   std::vector<std::pair<std::string, double>> out;
   for (int i = 0; i < Impl::kPhases; ++i)
     out.emplace_back(Impl::kPhaseNames[i], impl_->phase_seconds[i]);
   return out;
 }
 
-void GpuDecoder::SetDebug(bool on) {
-  impl_->debug = on;
-}
-const std::vector<double>& GpuDecoder::layer_sums() const {
-  return impl_->sums;
-}
-std::size_t GpuDecoder::launches() const {
+std::size_t GpuEngine::launches() const {
   return impl_->n_launches;
 }
 
