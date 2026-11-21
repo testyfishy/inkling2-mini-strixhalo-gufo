@@ -153,6 +153,9 @@ struct GpuEngine::Impl {
   // per group of rows (0 = never). Steps of one row per session are faster
   // with the per-row kernel. INKLING2_WMMA_ATTN_MIN_ROWS.
   int attn_batched_min{EnvOr("INKLING2_WMMA_ATTN_MIN_ROWS", 4)};
+  // INKLING2_WMMA_ATTN_WINDOW=0 keeps sliding-window layers on the per-row
+  // kernel.
+  bool attn_batched_window{EnvOr("INKLING2_WMMA_ATTN_WINDOW", 1) != 0};
   std::uint16_t* qh{};
   const gpu::AttnGroup* dev_groups{};
   std::size_t off_groups{0};
@@ -391,7 +394,9 @@ struct GpuEngine::Impl {
 
     // A sliding-window ring must keep the window of the earliest row of a
     // batch while the latest row of the same session is stored.
-    const int swa_cap = static_cast<int>(c.n_swa + opt.max_batch);
+    // (A multiple of 64, for the FP16 copies.)
+    const int swa_cap =
+        static_cast<int>((c.n_swa + opt.max_batch + 63) / 64 * 64);
     sessions.resize(opt.sessions);
     for (Session& session : sessions) {
       session.hist = Floats(kHistFloats * c.visits(), true);
@@ -404,7 +409,7 @@ struct GpuEngine::Impl {
                         : static_cast<int>((opt.context + 1023) / 1024 * 1024);
         slot.k = Floats(std::size_t(slot.cap) * kHK, true);
         slot.v = Floats(std::size_t(slot.cap) * kHK, true);
-        if (!ring && attn_batched_min > 0) {
+        if (attn_batched_min > 0) {
           slot.kh = static_cast<std::uint16_t*>(
               Alloc(std::size_t(slot.cap) * kHK * 2, true));
           slot.vh = static_cast<std::uint16_t*>(
@@ -469,7 +474,7 @@ struct GpuEngine::Impl {
       head_threads = std::atoi(v);
     if (const char* v = std::getenv("INKLING2_ATTN_WINDOW"); v && *v == '0')
       attention_window = false;
-    max_chunks = static_cast<int>((opt.context + 1023) / 1024);
+    max_chunks = static_cast<int>(std::max<std::size_t>(2, (opt.context + 1023) / 1024));
     chunk_max = Floats(B * kNH * std::size_t(max_chunks));
     chunk_sum = Floats(B * kNH * std::size_t(max_chunks));
     chunk_out = Floats(B * kNH * std::size_t(max_chunks) * gpu::kHD);
@@ -731,7 +736,10 @@ struct GpuEngine::Impl {
     at.chunk_sum = chunk_sum;
     at.chunk_out = chunk_out;
     const bool batched =
-        !swa && attn_batched_min > 0 && batch >= attn_batched_min * n_groups;
+        attn_batched_min > 0 && batch >= attn_batched_min * n_groups &&
+        (!swa || attn_batched_window);
+    if (batched && swa)
+      at.max_chunks = 2;
     if (batched) {
       gpu::ToHalfArgs h{};
       h.x = q;

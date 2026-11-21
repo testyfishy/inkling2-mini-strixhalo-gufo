@@ -699,11 +699,21 @@ __launch_bounds__(kT) __global__ void GlueBKernel(GlueBArgs a) {
       }
     }
   } else {
-    float* k_row = row.kv_k + static_cast<std::size_t>(row.pos % row.cap) * kHK;
-    float* v_row = row.kv_v + static_cast<std::size_t>(row.pos % row.cap) * kHK;
+    const std::size_t ring = row.pos % row.cap;
+    float* k_row = row.kv_k + ring * kHK;
+    float* v_row = row.kv_v + ring * kHK;
     for (int c = t; c < kHK; c += kT) {
       k_row[c] = k_new[c] * factor[kNH + c / kHD];
       v_row[c] = v_new[c] * factor[kNH + kNKV + c / kHD];
+    }
+    if (row.kh) {
+      _Float16* kh = reinterpret_cast<_Float16*>(row.kh) + ring * kHK;
+      _Float16* vh = reinterpret_cast<_Float16*>(row.vh) + ring;
+      for (int c = t; c < kHK; c += kT) {
+        kh[c] = ClampHalf(k_new[c] * factor[kNH + c / kHD]);
+        vh[static_cast<std::size_t>(c) * row.cap] =
+            ClampHalf(v_new[c] * factor[kNH + kNKV + c / kHD]);
+      }
     }
   }
   for (int i = t; i < kNR; i += kT)
@@ -995,6 +1005,10 @@ __launch_bounds__(kT) __global__ void AttentionChunkKernel(AttnArgs a) {
 // It leaves the same per-chunk maximum, sum and weighted values as
 // AttentionChunkKernel, for AttentionCombineKernel.
 //
+// On sliding-window layers the chunks start at the group's first window
+// position rounded down to 64 (two chunks cover any group), a slice is 64
+// consecutive ring entries, and each row also masks what is before its window.
+//
 // Weights are stored times 2^15 so that FP16 keeps 11 significant bits down to
 // 2e-9 of the running maximum and only drops what is below 1e-12 of it.
 constexpr int kAQ = kAttnRows * kShare;  // queries of a block
@@ -1017,8 +1031,10 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
   const RowState row0 = a.rows[group.row0];
   // The group's rows are at consecutive positions pos0, pos0 + 1, ...
   const int pos0 = row0.pos, pos_last = pos0 + group.count - 1;
-  if (chunk * kT > pos_last)
-    return;
+  const bool ring = row0.layout == 0;
+  const int start = (ring ? row0.first / kAP * kAP : 0) + chunk * kT;
+  if (!ring && start > pos_last)
+    return;  // the combine does not look at this chunk
 
   // Queries: index s * 32 + row for query head kv_head * 3 + s.
   for (int p = 0; p < kAQ * (kHD / 2) / 256; ++p) {
@@ -1051,20 +1067,29 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
     run_max[i] = kLowest;
     run_sum[i] = 0.0f;
   }
+  // Keys of entry i (a position, or a ring entry): keys + i * key_stride.
+  // Values of dimension d at entry i: values + d * value_stride + i.
   const std::uint16_t* keys =
-      row0.kh + (static_cast<std::size_t>(kv_head) * row0.cap + chunk * kT) * kHD;
+      ring ? row0.kh + kv_head * kHD
+           : row0.kh + static_cast<std::size_t>(kv_head) * row0.cap * kHD;
+  const std::size_t key_stride = ring ? kHK : kHD;
   const std::uint16_t* values =
-      row0.vh +
-      (static_cast<std::size_t>(kv_head) * row0.chunk_cap + chunk) * kHD * kT;
+      ring ? row0.vh + static_cast<std::size_t>(kv_head) * kHD * row0.cap
+           : row0.vh + (static_cast<std::size_t>(kv_head) * row0.chunk_cap + chunk) *
+                           kHD * kT;
+  const std::size_t value_stride = ring ? row0.cap : kT;
   Float8 out[2 * kShare] = {};
 
-  for (int base = 0; base < kT && chunk * kT + base <= pos_last; base += kAP) {
+  for (int base = 0; base < kT && start + base <= pos_last; base += kAP) {
+    // The slice's first entry in the key and in the value arrays.
+    const std::size_t key_entry = ring ? (start + base) % row0.cap : start + base;
+    const std::size_t value_entry = ring ? key_entry : base;
     // 1. Keys: s_kv[(position * 8 + step) * 8 ..] = 16 dimensions.
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
       const int unit = p * 256 + tid;
       const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
-          keys + static_cast<std::size_t>(base + unit / 8) * kHD + (unit % 8) * 16);
+          keys + (key_entry + unit / 8) * key_stride + (unit % 8) * 16);
       std::uint32_t* dst = s_kv + unit * 8;
 #pragma unroll
       for (int i = 0; i < 8; ++i)
@@ -1085,9 +1110,9 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
         acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[i]);
       }
     }
-    const int j0 = chunk * kT + base + pt * 16 + hi;  // position of element 0
+    const int j0 = start + base + pt * 16 + hi;  // position of element 0
     // Whether any row of the group is within the bias extent of this slice.
-    const bool near = pos0 - (chunk * kT + base + kAP - 1) < a.extent;
+    const bool near = pos0 - (start + base + kAP - 1) < a.extent;
     float val[3][8];
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
@@ -1096,7 +1121,8 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
       for (int e = 0; e < 8; ++e) {
         const int j = j0 + 2 * e;
         float v = kLowest;
-        if (j <= q_pos[i]) {
+        // A window is the last `extent` positions.
+        if (j <= q_pos[i] && (!ring || q_pos[i] - j < a.extent)) {
           v = acc[i][e] * a.scale - q_sink[i];
           const int distance = q_pos[i] - j;
           if (near && distance < a.extent) {
@@ -1143,7 +1169,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
     for (int p = 0; p < 2; ++p) {
       const int unit = p * 256 + tid, dim = unit / 4, tile = unit % 4;
       const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
-          values + static_cast<std::size_t>(dim) * kT + base + tile * 16);
+          values + dim * value_stride + value_entry + tile * 16);
       std::uint32_t* dst = s_kv + (tile * kHD + dim) * 8;
 #pragma unroll
       for (int i = 0; i < 8; ++i)
@@ -1218,7 +1244,9 @@ __launch_bounds__(kHD) __global__ void AttentionCombineKernel(AttnArgs a) {
   const std::size_t b = blockIdx.x / kNH;
   const RowState row = a.rows[b];
   const int n = row.pos - row.first + 1;
-  const int chunks = (n + kT - 1) / kT;
+  // Sliding-window layers: the batched kernel wrote every chunk, with the
+  // lowest maximum where a row has no position.
+  const int chunks = row.layout == 0 ? a.max_chunks : (n + kT - 1) / kT;
   const std::size_t base = (b * kNH + h) * a.max_chunks;
   float max = 0.0f;  // the zero sink's logit
   for (int c = 0; c < chunks; ++c)
@@ -1226,6 +1254,8 @@ __launch_bounds__(kHD) __global__ void AttentionCombineKernel(AttnArgs a) {
   float total = __expf(0.0f - max);
   float acc = 0.0f;
   for (int c = 0; c < chunks; ++c) {
+    if (a.chunk_max[base + c] < 0.5f * kLowest)
+      continue;
     const float weight = __expf(a.chunk_max[base + c] - max);
     total += a.chunk_sum[base + c] * weight;
     acc += a.chunk_out[(base + c) * kHD + t] * weight;
@@ -2528,7 +2558,7 @@ void GlueB(const GlueBArgs& args, hipStream_t stream) {
 }
 
 void Attention(const AttnArgs& args, hipStream_t stream) {
-  if (args.chunked && args.batched) {
+  if (args.batched) {
     AttentionBatchKernel<<<args.group_count * kNKV * args.max_chunks, 256, 0,
                            stream>>>(args);
     AttentionCombineKernel<<<args.batch * kNH, kHD, 0, stream>>>(args);

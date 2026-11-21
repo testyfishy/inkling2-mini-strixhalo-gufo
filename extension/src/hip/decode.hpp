@@ -60,12 +60,17 @@ struct RowState {
   //     kv_v[(head * cap + pos) * kHD + dim]
   int layout;
   int chunk_cap;  // cap / 1024, for layout 1
-  // Optional FP16 copies of a layout 1 cache for the batched attention
-  // kernel, laid out the other way round, as the matrix instruction wants
-  // them: keys position-major per head,
+  // Optional FP16 copies of the cache for the batched attention kernel, laid
+  // out as the matrix instruction wants them: keys with a position's 128
+  // dimensions together, values with a dimension's positions together.
+  // Layout 1: keys position-major per head,
   //     kh[(head * cap + pos) * kHD + dim]
   // and values dimension-major inside chunks of 1,024 positions,
   //     vh[((head * chunk_cap + pos / 1024) * kHD + dim) * 1024 + pos % 1024]
+  // Layout 0 (cap must be a multiple of 64): keys like kv_k,
+  //     kh[((pos % cap) * kNKV + head) * kHD + dim]
+  // and values dimension-major over the ring,
+  //     vh[(head * kHD + dim) * cap + pos % cap]
   std::uint16_t* kh;
   std::uint16_t* vh;
 };
@@ -245,11 +250,13 @@ struct AttnArgs {
   float* chunk_max;  // batch * kNH * max_chunks
   float* chunk_sum;  // batch * kNH * max_chunks
   float* chunk_out;  // batch * kNH * max_chunks * kHD
-  // With `chunked`: one block per (group of rows, key head, chunk) instead of
-  // per (row, key head, chunk). It reads the chunk's FP16 keys and values
-  // once for all of the group's rows and multiplies with the 16x16x16 FP16
-  // matrix instruction (FP32 sums). Needs RowState::kh / vh, an FP16 copy of
-  // q, and the groups.
+  // One block per (group of rows, key head, chunk) instead of per (row, key
+  // head, chunk) or per (row, query head). It reads the chunk's FP16 keys and
+  // values once for all of the group's rows and multiplies with the 16x16x16
+  // FP16 matrix instruction (FP32 sums). Needs RowState::kh / vh, an FP16
+  // copy of q, the groups and the chunk scratch. On sliding-window layers
+  // (layout 0) the chunks start at the group's first window position rounded
+  // down to 64, and max_chunks must be 2.
   bool batched;
   const std::uint16_t* qh;  // stride kHQ
   const AttnGroup* groups;
