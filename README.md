@@ -78,7 +78,10 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       generation reads it: 23.7 / 22.8 / 15.4 tokens/s at 4K / 16K / 100K (was 21.3 / 19.6 /
       13.3). First run on real text at depth: a 102,400-token prompt at 355 tokens/s on
       average, generation after it at 15.8
-- [ ] M4b5: speed at depth is set by the 33 KB every generated token reads per token of
+- [x] M4b5: prompt steps of up to 4,096 rows: 1,082 tokens/s at 2,048 rows per step on a
+      4,096-token prompt (was 573), 550 on average over a real 102,400-token prompt (was 355).
+      Quality unchanged (KLD 0.0015 at 4,096 tokens)
+- [ ] M4b6: speed at depth is set by the 33 KB every generated token reads per token of
       context; on encyclopedia text the attention weights are too spread out to skip any of
       it (docs/BENCHMARKS.md; code and agent logs not measured yet). What is left: a single-pass generation kernel at the memory's rate,
       drafts verified several per read, drafts copied from the context, and saved contexts so

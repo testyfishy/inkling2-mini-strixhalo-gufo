@@ -495,6 +495,56 @@ has that this extension does not are therefore large prompt steps with every ker
 them, and a drafter on the GPU. Its attention reads the whole FP16 cache like ours, in 16
 splits per head with a running softmax, and it also slows with depth.
 
+## Large prompt steps, 2026-11-21
+
+Prompts are now fed up to 4,096 rows per step. What made that pay: expert tiles sized to the
+step (a row picks 8 of 128 experts, so 2,048 rows give each expert about 128 rows to share one
+read of its weights), and moving the router and the loop controllers off kernels that ran one
+small block per row and output (they were over a third of a large step).
+
+| Rows per step | 256 | 512 | 1,024 | 2,048 | 4,096 |
+|---|---:|---:|---:|---:|---:|
+| 4,096-token prompt, tokens/s | 564 | 715* | 971 | 1,082 | 1,146 |
+
+(* before the router and controller change.) Real text: a 32,768-token prompt averages 836
+tokens/s, a 102,400-token prompt 550 (186 s; 288 s before).
+
+One 2,048-row step at short context takes about 1.9 s: experts 813 ms, attention 312 (the
+sliding-window layers), input projections 236, loop controllers 180, glue 215, output
+projection 78. Experts and projections run at about 7.5e12 multiply-adds per second, a third
+of what this GPU is reported to sustain.
+
+At 100,000 tokens of (faked) context the same step takes 5.6 s, 4.0 s of it in the 8
+full-attention visits: 368 tokens/s. There attention costs 2 ms per row whatever the step
+size: 4.9e9 multiply-adds per token, more than the rest of the model together, at a third of
+the rate the other kernels reach. A cheaper exponential for the weights was tried and changed
+nothing, so the exponentials are not what limits it. This kernel is the open item for prompts
+at depth.
+
+## What bounds generation for one session
+
+One token reads these weights once (profile of a single-row step, 40.5 ms):
+
+| Part | Bytes per token | Time at 190 GB/s | Measured |
+|---|---:|---:|---:|
+| Input projections (BF16, 48 visits) | 1.9 GB | 10.0 ms | 12.0 ms |
+| Experts (8 of 128 per visit; NVFP4 on 44 visits, BF16 on 4) | 2.1 GB | 11.0 ms | 11.4 ms |
+| Output head (BF16, 200K rows) | 0.9 GB | 4.8 ms | 5.1 ms |
+| Output projection (BF16) | 0.7 GB | 3.6 ms | 5.3 ms |
+| Everything else (about 15 small kernels per visit) | | | about 8 ms |
+
+So plain generation with the weights as they are in the file cannot exceed about 34 tokens/s
+on this machine, and it is at 24.7. The 8 ms of small kernels is mostly launch latency (726
+launches per token); fusing them is worth perhaps 10%.
+
+Steps that verify drafts: 2 rows take about 60 ms, 4 rows about 80, 8 rows about 113,
+because every extra row reads its own 2.1 GB of experts. A drafter that gets 60% of single
+drafts accepted (what Loom reports for this model) would therefore give 1.6 tokens per 60 ms
+plus its own cost: no gain over 24.7. Drafts pay when many are accepted in a row: 8 tokens
+per 113 ms is 70 tokens/s, which is the case for text copied from the context (code edits,
+quoting), where the drafts cost nothing. Loom's 42.7 tokens/s comes with 8-bit projection
+weights, which halve the largest read; that belongs to the later phase where weights change.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

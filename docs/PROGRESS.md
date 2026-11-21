@@ -31,6 +31,8 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 17 | `d34635c` | Full attention for several rows of a session at once: one block per (32 rows, key head, 1,024 positions) reads FP16 keys and values once and multiplies with the matrix instruction | not re-measured (single-row steps keep their kernels) | 485 short; at depth 326 / 301 / 206 at 4K / 16K / 100K (was 258 / 126 / 31) | not re-measured (steps of one row per session keep the per-row kernel) | attention output against the per-row kernel on the same steps: relative difference 2e-4 to 3e-4 at 4K real text and at 100K faked; 4,096-token context: PPL 7.481 vs 7.483, KLD 0.0016, top token 97.90% |
 | 18 | `72f32b9` | The sliding-window layers through the same kernel | 24.7 | 573 at 256 rows per step, 680 at 512 (was 485, 553); at depth 523 / 470 / 273 at 4K / 16K / 100K | 65.0 | relative difference 2e-4 on all 48 visits; 512-token context: PPL 7.798 vs 7.778, KLD 0.0021, top token 98.09%; 4,096-token context: PPL 7.465 vs 7.483, KLD 0.0016, top token 98.09% (per-row attention on the same build: 7.477, 0.0014, 98.19%) |
 | 19 | `d30bca9` | The key/value cache is FP16 only; steps of few rows read it with a per-row kernel (F32 queries, weights and sums) | 25.0 short; 23.7 / 22.8 / 15.4 at 4K / 16K / 100K faked (was 21.3 / 19.6 / 13.3); 15.8 after 102,400 tokens of real text | unchanged at depth (275 at 100K faked); a real 102,400-token prompt averages 355 | 67.7 | attention output against the F32 kernels: relative difference 2e-4; same greedy tokens as the F32 kernels on the test prompt (96 tokens); 4,096-token context with the per-row kernel on every step: PPL 7.484 vs 7.483, KLD 0.0015, top token 98.09% |
+| 20 | `5a4eebe` | Prompt steps of up to 4,096 rows: expert tiles of up to 128 pairs, router and loop controllers through the matrix-instruction kernel (values split into two FP16 parts), attention scratch independent of the context | 24.7 | 4,096-token prompt: 1,082 at 2,048 rows per step, 1,146 at 4,096 (was 573 at 256); real 32,768-token prompt 836 on average, real 102,400-token prompt 550 (was 355); at 100K faked 368 | 65.6 | 4,096-token context: PPL 7.485 vs 7.483, KLD 0.0015, top token 97.95%; 512: 7.793 vs 7.778, KLD 0.0021, 97.94% |
+| 21 | `1348e16` | Output head of steps with fewer than 16 rows back on the F32 kernel (the matrix-instruction kernel took 21 ms there instead of 5 to 8) | 24.7 | unchanged | 70.6 (2 sessions: 33.1) | same tokens from both head kernels for 3 sessions |
 
 Notes on reading this table:
 
@@ -68,3 +70,13 @@ Notes on reading this table:
   F32 attention kernels and `INKLING2_ATTN_AB=1` need. From this step the faked context
   repeats the first 1,024 positions of both keys and values (before, values repeated the
   prompt), and the first run on real text at depth exists: 102,400 tokens of wikitext.
+- Step 20 changes the arithmetic of the router and of the loop controllers in steps of 2 or
+  more rows: their products are computed from FP16 halves, but with every input split into a
+  rounded part and the rounding's remainder (and likewise the weights, which here are all
+  exact in FP16), summed in FP32, so the result keeps about 22 significant bits.
+  `INKLING2_SPLIT_GEMM_MIN_BATCH=0` restores the per-row F32 kernels. Plain generation after a
+  prompt changed at one near-tie on the test prompt (token 8 of 96) because the prompt's
+  cache contents changed in the last bits; the draft-checking test, which feeds a single-row
+  run's tokens to multi-row steps, then stops agreeing at that token. That test is a
+  consistency check between two arithmetic paths, not a quality measure; the quality harness
+  is unchanged.
