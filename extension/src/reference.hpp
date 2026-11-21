@@ -12,6 +12,8 @@
 
 namespace inkling2 {
 
+class Backend;
+
 /// Plain CPU implementation of the Inkling 2 Mini forward pass, one token at a
 /// time, following llama.cpp's graph (src/models/inkling2.cpp and
 /// inkling2-loop.cpp) operation by operation. It is the correctness reference
@@ -26,7 +28,10 @@ public:
     std::vector<std::pair<std::string, double>> debug;  // layer 0 stages
   };
 
-  Reference(const gufo::core::GgufReader& reader, const Config& config);
+  /// `backend` runs the heavy matrix products; null selects the CPU. It must
+  /// outlive the reference.
+  Reference(const gufo::core::GgufReader& reader, const Config& config,
+            Backend* backend = nullptr);
   ~Reference();
 
   /// Feeds one token at the next position and returns the logits over the

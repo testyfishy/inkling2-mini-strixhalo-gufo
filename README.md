@@ -47,8 +47,14 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       native-precision file: same top-10 next tokens, log-probabilities within 0.05, identical
       24-token greedy continuation, all 48 layer visits within about 1% (see
       [docs/CORRECTNESS.md](docs/CORRECTNESS.md))
-- [ ] M3: tokenizer and chat template, checked against the reference
-- [ ] M3b: forward pass on HIP, compared with the CPU reference and llama.cpp
+- [x] M3: first GPU decode. The heavy matrix products (BF16 projections, NVFP4 and BF16
+      experts, output head) run in HIP kernels; everything else still runs on the CPU. Output
+      matches the CPU reference (logits to five digits, identical greedy tokens). Speed is
+      13.5 tokens/s, **below** the llama.cpp baseline of 19.5: the time goes to three
+      CPU-GPU round trips per layer visit, not to the kernels
+- [ ] M3b: whole decode step on the GPU with one round trip per token (mixing, norms,
+      convolutions, attention over a device KV cache, routing)
+- [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [ ] M5: continuation cache, so conversations resume without reprocessing
 - [ ] M6: kernel work on the hot path, each change checked against M3's logit comparison

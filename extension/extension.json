@@ -19,7 +19,7 @@
       "model_ids": [
         "inkling-2-mini"
       ],
-      "target": "gufo_inkling2_native",
+      "target": "gufo_inkling2_native_gpu",
       "entry": "inkling2_native_provider_register"
     }
   ],
@@ -27,6 +27,11 @@
   "targets": {
     "gufo_inkling2_native": {
       "requires": []
+    },
+    "gufo_inkling2_native_gpu": {
+      "requires": [
+        "hip"
+      ]
     }
   },
   "licenses": [

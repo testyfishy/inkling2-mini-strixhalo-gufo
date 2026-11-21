@@ -47,6 +47,27 @@ backend and a model-specific GUFO runner.
 correctly and coherently, with reasoning and answer separated, at 19.4 t/s. This is a smoke test,
 not a quality evaluation.
 
+## Extension, first GPU decode, 2026-11-21
+
+Native-precision file, greedy decode of 96 tokens after a 5-token prompt, one sequence, measured
+inside `gufo prompt` (development driver, fixed token ids, no tokenizer).
+
+| Path | Generation (t/s) |
+|---|---:|
+| CPU reference, 16 threads | 2.2 |
+| HIP kernels for the matrix products, rest on CPU | 13.5 |
+| llama.cpp HIP, same file (baseline) | 19.5 |
+
+Where the 74 ms per token goes in the HIP path: about 29 ms in the projection calls, 21 ms in
+the expert calls, 24 ms in CPU-side work. Changing the GEMV thread layout (32 to 256 threads per
+row, or several rows per block) moves the total by under 7%, so the kernels are not the limit:
+each layer visit makes three CPU-GPU round trips (144 per token), each with staging copies and a
+stream synchronization. At roughly 54 MB of projection weights and 36 MB of expert weights read
+per visit, the kernel calls average about 90-100 GB/s including that overhead.
+
+This is a correctness milestone, not a speed result. The next step moves the remaining
+per-visit operations onto the GPU so a token needs one round trip.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

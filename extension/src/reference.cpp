@@ -1,5 +1,7 @@
 #include "reference.hpp"
 
+#include "backend.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -49,8 +51,7 @@ inline float Bf16(std::uint16_t bits) {
 // NVFP4 as stored by ggml (block_nvfp4): 64 values per 36-byte block, in four
 // sub-blocks of 16 that each carry an unsigned E4M3 scale. The E2M1 value
 // table is doubled, so the scale decode halves.
-constexpr int kNvfp4Block = 64;
-constexpr int kNvfp4Bytes = 36;
+constexpr int kNvfp4Block = kNvfp4Values;
 constexpr float kFp4Values[16] = {0, 1,  2,  3,  4,  6,  8,  12,
                                   0, -1, -2, -3, -4, -6, -8, -12};
 
@@ -86,52 +87,79 @@ float DotNvfp4(const std::uint8_t* row, const float* x, std::size_t cols) {
 
 // ---- tensors -----------------------------------------------------------
 
-/// A weight used as `y = W x`: GGUF dims {n_in, n_out[, n_expert]}, stored
-/// with one row of n_in values per output.
-struct Mat {
-  const std::uint8_t* data{nullptr};
-  std::size_t cols{0}, rows{0};
-  std::uint16_t type{0};
+float Dot(const Mat& m, const std::uint8_t* row, const float* x) {
+  if (m.type == kGgmlTypeNvfp4)
+    return DotNvfp4(row, x, m.cols);
+  // Sixteen independent partial sums, so the compiler can vectorize without
+  // being allowed to reorder a single running sum.
+  constexpr std::size_t kLanes = 16;
+  float lanes[kLanes] = {};
+  const std::size_t whole = m.cols / kLanes * kLanes;
+  float sum = 0.0f;
+  if (m.type == kF32) {
+    const float* w = reinterpret_cast<const float*>(row);
+    for (std::size_t c = 0; c < whole; c += kLanes)
+      for (std::size_t j = 0; j < kLanes; ++j)
+        lanes[j] += w[c + j] * x[c + j];
+    for (std::size_t c = whole; c < m.cols; ++c)
+      sum += w[c] * x[c];
+  } else {
+    const std::uint16_t* w = reinterpret_cast<const std::uint16_t*>(row);
+    for (std::size_t c = 0; c < whole; c += kLanes)
+      for (std::size_t j = 0; j < kLanes; ++j)
+        lanes[j] += Bf16(w[c + j]) * x[c + j];
+    for (std::size_t c = whole; c < m.cols; ++c)
+      sum += Bf16(w[c]) * x[c];
+  }
+  for (const float lane : lanes)
+    sum += lane;
+  return sum;
+}
 
-  [[nodiscard]] std::size_t RowBytes() const {
-    if (type == kF32)
-      return cols * 4;
-    if (type == kBF16)
-      return cols * 2;
-    return cols / kNvfp4Block * kNvfp4Bytes;
+/// y = W[expert] x on the CPU.
+void MulCpu(const Mat& m, const float* x, float* y, std::size_t expert = 0) {
+  const std::size_t row_bytes = m.RowBytes();
+  const std::uint8_t* base = m.data + expert * m.rows * row_bytes;
+  ParallelFor(m.rows, m.cols, [&](std::size_t begin, std::size_t end) {
+    for (std::size_t r = begin; r < end; ++r)
+      y[r] = Dot(m, base + r * row_bytes, x);
+  });
+}
+
+Vec MulCpu(const Mat& m, const Vec& x) {
+  Vec y(m.rows);
+  MulCpu(m, x.data(), y.data());
+  return y;
+}
+
+class CpuBackend final : public Backend {
+public:
+  void Mul(const Job* jobs, std::size_t count) override {
+    for (std::size_t i = 0; i < count; ++i)
+      MulCpu(*jobs[i].mat, jobs[i].x, jobs[i].y);
   }
 
-  [[nodiscard]] float Dot(const std::uint8_t* row, const float* x) const {
-    if (type == kGgmlTypeNvfp4)
-      return DotNvfp4(row, x, cols);
-    float sum = 0.0f;
-    if (type == kF32) {
-      const float* w = reinterpret_cast<const float*>(row);
-      for (std::size_t c = 0; c < cols; ++c)
-        sum += w[c] * x[c];
-    } else {
-      const std::uint16_t* w = reinterpret_cast<const std::uint16_t*>(row);
-      for (std::size_t c = 0; c < cols; ++c)
-        sum += Bf16(w[c]) * x[c];
+  void Experts(const ExpertCall& call) override {
+    const std::size_t ff = call.down->cols, e = call.down->rows;
+    Vec gate_up(2 * ff), act(ff), down(e);
+    std::fill(call.out, call.out + e, 0.0f);
+    for (std::size_t i = 0; i < call.count; ++i) {
+      MulCpu(*call.gate_up, call.x, gate_up.data(), call.ids[i]);
+      for (std::size_t k = 0; k < ff; ++k) {
+        const float g = gate_up[k] * call.up_scale[i];
+        const float u = gate_up[ff + k] * call.up_scale[i];
+        // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+        act[k] = call.situ_beta * std::tanh(g / call.situ_beta) *
+                 (1.0f / (1.0f + std::exp(-g))) * call.situ_linear_beta *
+                 std::tanh(u / call.situ_linear_beta);
+      }
+      MulCpu(*call.down, act.data(), down.data(), call.ids[i]);
+      for (std::size_t k = 0; k < e; ++k)
+        call.out[k] += call.coef[i] * down[k];
     }
-    return sum;
   }
 
-  /// y = W[expert] x
-  void Mul(const float* x, float* y, std::size_t expert = 0) const {
-    const std::uint8_t* base = data + expert * rows * RowBytes();
-    const std::size_t row_bytes = RowBytes();
-    ParallelFor(rows, cols, [&](std::size_t begin, std::size_t end) {
-      for (std::size_t r = begin; r < end; ++r)
-        y[r] = Dot(base + r * row_bytes, x);
-    });
-  }
-
-  [[nodiscard]] Vec Mul(const Vec& x, std::size_t expert = 0) const {
-    Vec y(rows);
-    Mul(x.data(), y.data(), expert);
-    return y;
-  }
+  [[nodiscard]] const char* name() const override { return "cpu"; }
 };
 
 const GgufTensorInfo& Find(const GgufReader& reader, const std::string& name) {
@@ -289,6 +317,8 @@ struct Reference::Impl {
   std::vector<Slot> slots;
   Trace trace;
   std::uint32_t pos{0};
+  CpuBackend cpu;
+  Backend* backend{&cpu};
   mutable bool debug_slot{false};
 
   // Sums of layer-0 intermediates over all tokens, for comparison with
@@ -305,7 +335,10 @@ struct Reference::Impl {
     d.emplace_back(name, Sum(v));
   }
 
-  Impl(const GgufReader& reader, const Config& config) : c(config) {
+  Impl(const GgufReader& reader, const Config& config, Backend* gpu)
+      : c(config) {
+    if (gpu)
+      backend = gpu;
     tok_embd = LoadMat(reader, "token_embd.weight");
     output = LoadMat(reader, "output.weight");
     tok_norm = LoadVec(reader, "token_embd_norm.weight");
@@ -418,9 +451,9 @@ struct Reference::Impl {
     std::copy(message.begin(), message.end(), gate.begin() + e);
     RmsNorm(gate.data(), e, 1e-6f);
     RmsNorm(gate.data() + e, e, 1e-6f);
-    const Vec low = l.ctrl_down[k].Mul(gate);
-    const Vec gain = l.ctrl_gain[k].Mul(low);
-    const Vec forget = l.ctrl_forget[k].Mul(low);
+    const Vec low = MulCpu(l.ctrl_down[k], gate);
+    const Vec gain = MulCpu(l.ctrl_gain[k], low);
+    const Vec forget = MulCpu(l.ctrl_forget[k], low);
     Vec out(e);
     for (std::size_t i = 0; i < e; ++i)
       out[i] = cur[i] - std::tanh(forget[i]) * cur[i] +
@@ -429,9 +462,9 @@ struct Reference::Impl {
   }
 
   Vec Moe(const Vec& x, const Layer& l) const {
-    const std::size_t e = c.n_embd, ff = c.n_ff_exp;
+    const std::size_t e = c.n_embd;
     Dbg("ffn_normed", x);
-    Vec probs = l.gate_inp.Mul(x);
+    Vec probs = MulCpu(l.gate_inp, x);
     Dbg("moe_logits", probs);
     for (float& p : probs)
       p = Sigmoid(p);
@@ -448,27 +481,24 @@ struct Reference::Impl {
       weight_sum += probs[order[i]];
     weight_sum += 1e-20f;
 
-    Vec out(e, 0.0f), gate_up(2 * ff), act(ff), down(e);
+    Vec out(e, 0.0f);
+    Backend::ExpertCall call{};
+    call.gate_up = &l.gate_up;
+    call.down = &l.down;
+    call.x = x.data();
+    call.count = c.n_expert_used;
+    call.situ_beta = c.situ_beta;
+    call.situ_linear_beta = c.situ_linear_beta;
+    call.out = out.data();
     for (std::uint32_t i = 0; i < c.n_expert_used; ++i) {
       const std::size_t expert = order[i];
-      const float weight =
-          probs[expert] / weight_sum * c.expert_weights_scale;
-      l.gate_up.Mul(x.data(), gate_up.data(), expert);
-      const float s_up =
+      call.ids[i] = static_cast<std::uint32_t>(expert);
+      call.up_scale[i] =
           l.gate_up_scale.empty() ? 1.0f : l.gate_up_scale[expert];
-      for (std::size_t k = 0; k < ff; ++k) {
-        const float g = gate_up[k] * s_up, u = gate_up[ff + k] * s_up;
-        // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
-        act[k] = c.situ_beta * std::tanh(g / c.situ_beta) * Sigmoid(g) *
-                 c.situ_linear_beta * std::tanh(u / c.situ_linear_beta);
-      }
-      Dbg("gate_up_raw", gate_up);
-      Dbg("situ", act);
-      l.down.Mul(act.data(), down.data(), expert);
-      const float s_down = l.down_scale.empty() ? 1.0f : l.down_scale[expert];
-      for (std::size_t k = 0; k < e; ++k)
-        out[k] += weight * s_down * down[k];
+      call.coef[i] = probs[expert] / weight_sum * c.expert_weights_scale *
+                     (l.down_scale.empty() ? 1.0f : l.down_scale[expert]);
     }
+    backend->Experts(call);
     Dbg("moe_out", out);
     return out;
   }
@@ -476,16 +506,30 @@ struct Reference::Impl {
   Vec Attention(const Vec in[3], const Layer& l, Slot& slot) const {
     const std::size_t hd = c.head_dim, nh = c.n_head, nkv = c.n_head_kv;
     Dbg("attn_in_q", in[0]);
-    Vec q = l.wq.Mul(in[0]);
+    Vec q(l.wq.rows), r(l.rel.rows), gate(l.gate.rows), sink(l.sink.rows);
+    Vec k_raw(l.wk.rows), v_raw(l.wv.rows), k_taps, v_taps;
+    Backend::Job jobs[8] = {
+        {&l.wq, in[0].data(), q.data()},
+        {&l.rel, in[0].data(), r.data()},
+        {&l.gate, in[0].data(), gate.data()},
+        {&l.sink, in[0].data(), sink.data()},
+        {&l.wk, in[1].data(), k_raw.data()},
+        {&l.wv, in[2].data(), v_raw.data()},
+    };
+    std::size_t n_jobs = 6;
+    if (!l.swa) {
+      k_taps.resize(l.k_conv_proj.rows);
+      v_taps.resize(l.v_conv_proj.rows);
+      jobs[n_jobs++] = {&l.k_conv_proj, in[1].data(), k_taps.data()};
+      jobs[n_jobs++] = {&l.v_conv_proj, in[2].data(), v_taps.data()};
+    }
+    backend->Mul(jobs, n_jobs);
     Dbg("q_proj", q);
-    const Vec k_taps = l.swa ? Vec{} : l.k_conv_proj.Mul(in[1]);
-    const Vec v_taps = l.swa ? Vec{} : l.v_conv_proj.Mul(in[2]);
-    Vec k = Convolve(l.wk.Mul(in[1]), l.k_conv, l.swa ? nullptr : &k_taps,
-                     slot.history[0]);
-    Vec v = Convolve(l.wv.Mul(in[2]), l.v_conv, l.swa ? nullptr : &v_taps,
-                     slot.history[1]);
-    Vec r = l.rel.Mul(in[0]);
     Dbg("r_proj", r);
+    Vec k = Convolve(k_raw, l.k_conv, l.swa ? nullptr : &k_taps,
+                     slot.history[0]);
+    Vec v = Convolve(v_raw, l.v_conv, l.swa ? nullptr : &v_taps,
+                     slot.history[1]);
 
     Clip(q, hd, l.q_clip.data(), c.qk_clip);
     Clip(k, hd, nullptr, c.qk_clip);
@@ -503,7 +547,6 @@ struct Reference::Impl {
       for (float& x : r)
         x *= tau;
     }
-    const Vec sink = l.sink.Mul(in[0]);
     Dbg("Qcur", q);
     Dbg("Kcur", k);
     Dbg("Vcur", v);
@@ -556,13 +599,15 @@ struct Reference::Impl {
     });
 
     Dbg("kqv_out", out);
-    const Vec gate = l.gate.Mul(in[0]);
     Dbg("gate_logits", gate);
     for (std::size_t i = 0; i < out.size(); ++i)
       out[i] *= Sigmoid(gate[i]);
     Dbg("gated", out);
-    Dbg("wo", l.wo.Mul(out));
-    return Convolve(l.wo.Mul(out), l.attn_post_conv, nullptr, slot.history[2]);
+    Vec projected(l.wo.rows);
+    const Backend::Job job{&l.wo, out.data(), projected.data()};
+    backend->Mul(&job, 1);
+    Dbg("wo", projected);
+    return Convolve(projected, l.attn_post_conv, nullptr, slot.history[2]);
   }
 
   Vec RunLayer(std::size_t slot_index, std::size_t il, Vec cur,
@@ -672,7 +717,9 @@ struct Reference::Impl {
     if (!want_logits)
       return {};
 
-    Vec logits = output.Mul(cur);
+    Vec logits(output.rows);
+    const Backend::Job job{&output, cur.data(), logits.data()};
+    backend->Mul(&job, 1);
     logits.resize(c.n_vocab);  // drop the padded vocabulary
     if (c.logit_softcap != 0.0f)
       for (float& x : logits)
@@ -681,8 +728,9 @@ struct Reference::Impl {
   }
 };
 
-Reference::Reference(const GgufReader& reader, const Config& config)
-    : impl_(std::make_unique<Impl>(reader, config)) {}
+Reference::Reference(const GgufReader& reader, const Config& config,
+                     Backend* backend)
+    : impl_(std::make_unique<Impl>(reader, config, backend)) {}
 Reference::~Reference() = default;
 
 std::vector<float> Reference::Feed(std::uint32_t token, bool want_logits) {

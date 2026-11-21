@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,7 +12,9 @@
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
 
+#include "backend.hpp"
 #include "config.hpp"
+#include "gpu.hpp"
 #include "reference.hpp"
 
 namespace {
@@ -75,7 +78,11 @@ int RunReference(const gufo::core::GgufReader& reader, const char* ids) {
   if (tokens.empty())
     return 1;
   try {
-    inkling2::Reference reference(reader, config);
+    // INKLING2_GPU=1 runs the heavy matrix products on the GPU.
+    std::unique_ptr<inkling2::Backend> gpu;
+    if (const char* v = std::getenv("INKLING2_GPU"); v && *v == '1')
+      gpu = inkling2::MakeGpuBackend();
+    inkling2::Reference reference(reader, config, gpu.get());
     std::vector<float> logits;
     const auto start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < tokens.size(); ++i)
@@ -105,19 +112,27 @@ int RunReference(const gufo::core::GgufReader& reader, const char* ids) {
       std::printf("top %2d  token %6u  logit %10.5f  logprob %10.5f\n", i,
                   order[i], logits[order[i]], logits[order[i]] - log_norm);
     // Greedy continuation, to compare token for token with llama.cpp.
+    const char* where = gpu ? gpu->name() : "cpu";
     if (const char* n = std::getenv("INKLING2_REF_GEN")) {
+      const int count = std::atoi(n);
       std::printf("greedy:");
-      for (int i = 0; i < std::atoi(n); ++i) {
+      const auto gen_start = std::chrono::steady_clock::now();
+      for (int i = 0; i < count; ++i) {
         const auto best = static_cast<std::uint32_t>(
             std::max_element(logits.begin(), logits.end()) - logits.begin());
         std::printf(" %u", best);
-        std::fflush(stdout);
         logits = reference.Feed(best, true);
       }
-      std::printf("\n");
+      const double gen_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        gen_start)
+              .count();
+      std::printf("\ngeneration: %d tokens in %.2f s (%.2f tokens/s, %s)\n",
+                  count, gen_seconds, count / gen_seconds, where);
     }
-    std::printf("reference: %zu tokens in %.1f s (%.2f tokens/s, CPU)\n",
-                tokens.size(), seconds, tokens.size() / seconds);
+    std::printf("prompt: %zu tokens in %.2f s (%.2f tokens/s, %s; on the GPU "
+                "this includes uploading weights on first use)\n",
+                tokens.size(), seconds, tokens.size() / seconds, where);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;
@@ -150,8 +165,4 @@ void inkling2_native_provider_register(gufo::ext::Registry& registry) {
       // not size; this provider reads them from their reserved bytes.
       .accepts_unsized_tensors = true,
   });
-}
-
-void inkling2_native_register(gufo::ext::Registry& registry) {
-  (void)registry;
 }
