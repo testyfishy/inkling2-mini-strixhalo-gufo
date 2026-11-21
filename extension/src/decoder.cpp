@@ -224,6 +224,7 @@ struct GpuEngine::Impl {
   std::size_t ab_bad{0}, ab_visits{0};
   int max_chunks{1};
   std::size_t partial_slots{0};
+  int head_wmma_min{EnvOr("INKLING2_WMMA_HEAD_MIN_BATCH", 16)};
   // Steps of at least this many rows compute the router and the loop
   // controllers' projections with SplitGemm (0 = never).
   // INKLING2_SPLIT_GEMM_MIN_BATCH.
@@ -1638,7 +1639,10 @@ struct GpuEngine::Impl {
       g.count = 1;
       g.batch = static_cast<int>(n_heads);
       g.single_threads = head_threads;
-      Wmma(g, final_x, kE, xh_head);
+      // Few rows: the F32 kernel, which reads a weight row once for all of
+      // them, is several times faster on this 200K-row matrix.
+      if (static_cast<int>(n_heads) >= head_wmma_min)
+        Wmma(g, final_x, kE, xh_head);
       gpu::Gemm(g, stream);
       Check(hipMemcpyAsync(host_logits.data(), logits,
                            n_heads * c.n_vocab_padded * 4,
