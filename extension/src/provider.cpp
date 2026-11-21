@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,13 +15,17 @@
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
 
+#include <gufo/ext/json.hpp>
+
 #include "backend.hpp"
+#include "chat.hpp"
 #include "config.hpp"
 #include "decoder.hpp"
 #include "drafter.hpp"
 #include "gpu.hpp"
 #include "model.hpp"
 #include "reference.hpp"
+#include "tokenizer.hpp"
 
 namespace {
 
@@ -161,6 +167,150 @@ int RunReference(const gufo::core::GgufReader& reader, const char* ids) {
 int EnvInt(const char* name, int fallback) {
   const char* v = std::getenv(name);
   return v && *v ? std::atoi(v) : fallback;
+}
+
+// INKLING2_TOKENIZE=<text file>: tokenizes the file and writes the token ids
+// as 32-bit integers to INKLING2_TOKENIZE_OUT. With INKLING2_TOKENIZE_CONTROL
+// the spellings of control tokens in the text become those tokens.
+int RunTokenize(const gufo::core::GgufReader& reader, const char* path) {
+  try {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+      throw std::runtime_error("cannot read the text file");
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    auto t0 = std::chrono::steady_clock::now();
+    const inkling2::Tokenizer tokenizer(reader);
+    const double load_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    const bool control = std::getenv("INKLING2_TOKENIZE_CONTROL") != nullptr;
+    t0 = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> ids;
+    if (control)
+      ids = tokenizer.EncodeWithControl(text);
+    else
+      tokenizer.Encode(text, &ids);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    std::string back;
+    for (const std::uint32_t id : ids)
+      back += tokenizer.Bytes(id);
+    std::printf("tokenizer: %u entries, loaded in %.2f s; %zu bytes -> %zu "
+                "tokens in %.3f s (%.0f tokens/s); decodes back to the text: %s",
+                tokenizer.size(), load_s, text.size(), ids.size(), seconds,
+                ids.size() / std::max(seconds, 1e-9),
+                back == text ? "yes" : "NO");
+    std::printf("%c", 10);
+    if (const char* out_path = std::getenv("INKLING2_TOKENIZE_OUT")) {
+      std::ofstream out(out_path, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(ids.data()),
+                static_cast<std::streamsize>(ids.size() * 4));
+      if (!out)
+        throw std::runtime_error("cannot write the token file");
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s%c", e.what(), 10);
+    return 1;
+  }
+  return 0;
+}
+
+// INKLING2_CHAT=<JSON file>: an array of conversations in the OpenAI format
+// ({"messages": [...], "tools": [...], "reasoning_effort": "low"}). Renders
+// each with the chat template and writes case-N.txt (the prompt as text) and
+// case-N.i32 (its tokens) into INKLING2_CHAT_OUT.
+int RunChatCases(const gufo::core::GgufReader& reader, const char* path) {
+  namespace json = gufo::json;
+  try {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+      throw std::runtime_error("cannot read the conversations");
+    const std::string source((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+    const json::Value cases = json::parse(source);
+    const inkling2::Tokenizer tokenizer(reader);
+    const char* out_dir = std::getenv("INKLING2_CHAT_OUT");
+    std::size_t n = 0;
+    for (const json::Value& item : cases.items()) {
+      std::vector<inkling2::ChatMessage> messages;
+      if (const json::Value* list = item.find("messages"))
+        for (const json::Value& m : list->items()) {
+          inkling2::ChatMessage message;
+          const std::string role = m.member_str("role");
+          message.role = role == "system" || role == "developer"
+                             ? inkling2::ChatMessage::Role::kSystem
+                         : role == "assistant"
+                             ? inkling2::ChatMessage::Role::kAssistant
+                         : role == "tool" ? inkling2::ChatMessage::Role::kTool
+                                          : inkling2::ChatMessage::Role::kUser;
+          message.content = m.member_str("content");
+          message.reasoning = m.member_str("reasoning_content");
+          message.name = m.member_str("name");
+          message.tool_call_id = m.member_str("tool_call_id");
+          if (const json::Value* calls = m.find("tool_calls"))
+            for (const json::Value& c : calls->items()) {
+              inkling2::ChatToolCall call;
+              call.id = c.member_str("id");
+              if (const json::Value* fn = c.find("function")) {
+                call.name = fn->member_str("name");
+                if (const json::Value* args = fn->find("arguments"))
+                  for (const auto& [key, value] : args->members())
+                    call.arguments.push_back(
+                        {key,
+                         value.is_string()
+                             ? value.str()
+                             : value.dump(json::Value::Numbers::kAsParsed),
+                         value.is_string()});
+              }
+              message.tool_calls.push_back(std::move(call));
+            }
+          messages.push_back(std::move(message));
+        }
+      std::vector<inkling2::ChatTool> tools;
+      if (const json::Value* list = item.find("tools"))
+        for (const json::Value& t : list->items()) {
+          const json::Value* fn = t.find("function");
+          if (!fn)
+            fn = &t;
+          inkling2::ChatTool tool;
+          tool.name = fn->member_str("name");
+          tool.description = fn->member_str("description");
+          if (const json::Value* p = fn->find("parameters"))
+            tool.parameters_json = p->dump(json::Value::Numbers::kAsParsed);
+          tool.type = t.member_str("type", "function");
+          tools.push_back(std::move(tool));
+        }
+      inkling2::ChatOptions options;
+      if (const json::Value* effort = item.find("reasoning_effort"))
+        options.effort = effort->is_string()
+                             ? inkling2::EffortByName(effort->str())
+                             : effort->as_double();
+      const inkling2::RenderedChat chat =
+          inkling2::RenderChat(tokenizer, messages, tools, options);
+      const bool same = chat.tokens == tokenizer.EncodeWithControl(chat.text);
+      std::printf("case %zu: %zu tokens; equal to tokenizing the text with "
+                  "control tokens: %s",
+                  n, chat.tokens.size(), same ? "yes" : "no");
+      std::printf("%c", 10);
+      if (out_dir) {
+        const std::string base =
+            std::string(out_dir) + "/case-" + std::to_string(n);
+        std::ofstream text(base + ".txt", std::ios::binary);
+        text.write(chat.text.data(),
+                   static_cast<std::streamsize>(chat.text.size()));
+        std::ofstream ids(base + ".i32", std::ios::binary);
+        ids.write(reinterpret_cast<const char*>(chat.tokens.data()),
+                  static_cast<std::streamsize>(chat.tokens.size() * 4));
+      }
+      ++n;
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s%c", e.what(), 10);
+    return 1;
+  }
+  return 0;
 }
 
 int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
@@ -839,6 +989,10 @@ int RunQuality(const gufo::core::GgufReader& reader, const char* path) {
 int Prompt(const gufo::ext::TextPromptOptions&,
            const gufo::core::GgufReader& reader,
            std::chrono::steady_clock::time_point) {
+  if (const char* text = std::getenv("INKLING2_TOKENIZE"))
+    return RunTokenize(reader, text);
+  if (const char* cases = std::getenv("INKLING2_CHAT"))
+    return RunChatCases(reader, cases);
   if (const char* kld = std::getenv("INKLING2_KLD"))
     return RunQuality(reader, kld);
   if (const char* ids = std::getenv("INKLING2_REF_TOKENS")) {

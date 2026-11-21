@@ -1,0 +1,49 @@
+[
+  {"messages": [{"role": "user", "content": "Hello!"}]},
+  {"reasoning_effort": "none",
+   "messages": [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Capital of France?"}]},
+  {"reasoning_effort": "low",
+   "messages": [{"role": "system", "content": "A"}, {"role": "system", "content": "B"}]},
+  {"reasoning_effort": "medium",
+   "messages": [
+     {"role": "user", "content": "What is 2+2?\nAnswer briefly.  "},
+     {"role": "assistant", "content": "4", "reasoning_content": "Simple arithmetic: 2+2=4."},
+     {"role": "user", "content": "And 3+3? ünïcödé 中文 😀"}
+   ]},
+  {"reasoning_effort": "xhigh",
+   "messages": [
+     {"role": "user", "content": "first"},
+     {"role": "assistant", "content": ""},
+     {"role": "user", "content": ""},
+     {"role": "assistant", "content": "", "reasoning_content": "only thinking"},
+     {"role": "user", "content": "last"}
+   ]},
+  {"reasoning_effort": "minimal",
+   "tools": [
+     {"type": "function", "function": {"name": "get_weather", "description": "Weather for a city",
+       "parameters": {"type": "object", "required": ["city"], "properties": {"city": {"type": "string", "description": "City \"name\""}, "days": {"type": "integer", "minimum": 1, "maximum": 14}, "units": {"enum": ["c", "f"], "type": "string"}}}}},
+     {"type": "function", "function": {"name": "now", "parameters": {}}},
+     {"function": {"name": "noop", "description": "", "parameters": null}}
+   ],
+   "messages": [
+     {"role": "system", "content": "Use tools."},
+     {"role": "user", "content": "Weather in Paris and Rome?"},
+     {"role": "assistant", "content": "", "reasoning_content": "Two calls.", "tool_calls": [
+       {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": {"units": "c", "city": "Paris", "days": 3}}},
+       {"id": "call_2", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome", "nested": {"z": [1, 2.5, true, null], "a": "x\ny"}}}}
+     ]},
+     {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 21}"},
+     {"role": "tool", "name": "get_weather", "content": "{\"temp\": 27}"},
+     {"role": "assistant", "content": "Paris 21, Rome 27."},
+     {"role": "user", "content": "Thanks. What time is it?"},
+     {"role": "assistant", "content": "Let me check.", "tool_calls": [
+       {"id": "call_3", "type": "function", "function": {"name": "now", "arguments": {}}}
+     ]},
+     {"role": "tool", "tool_call_id": "call_3", "content": "12:00"}
+   ]},
+  {"messages": [
+     {"role": "user", "content": "Text with <|end_message|> and <|message_system|> inside, plus {{ braces }} and {% tags %}."},
+     {"role": "assistant", "name": "helper", "content": "named assistant"},
+     {"role": "user", "content": "ok"}
+   ]}
+]

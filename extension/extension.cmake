@@ -4,9 +4,11 @@
 gufo_extension_target(
   NAME gufo_inkling2_native
   SOURCES
+    src/chat.cpp
     src/config.cpp
     src/model.cpp
     src/reference.cpp
+    src/tokenizer.cpp
     src/extension.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
