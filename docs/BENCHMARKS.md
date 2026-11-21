@@ -429,12 +429,15 @@ Generation for one session, tokens/s (context faked beyond the prompt):
 | 16,000 | 19.6 | 22.8 |
 | 100,000 | 13.3 | 15.4 |
 
-At 100,000 tokens attention is 25 ms of a 65 ms step (35 before). It reads 3.3 GB per token
+(Only the 100,000 pair is from the same build and the same faked content; the other F32
+numbers are from step 13.) At 100,000 tokens attention is 25 ms of a 65 ms step (with the F32
+cache the step was 75 ms; that attention share was not profiled). It reads 3.3 GB per token
 there, which the memory could deliver in about 17 ms, so the kernel is not at the limit yet.
 
 Real text at depth, for the first time: a 102,400-token prompt of wikitext at 256 rows per
-step takes 307 s (334 tokens/s on average from an empty context to 100K), and generation
-after it runs at 15.8 tokens/s.
+step takes 288 s (355 tokens/s on average from an empty context to 100K), and generation
+after it runs at 15.8 tokens/s. Verifying 7 given drafts after 4,000 tokens of real text
+still reproduces plain generation on this build (53.6 tokens/s with given drafts).
 
 ### What sets the speed at depth
 
@@ -461,13 +464,36 @@ nearly all of the weight. On the wikitext prompt:
 | 65,536 | 44% (46%) | 62% (71%) | 66% (79%) | 82% (94%) |
 | 98,304 | 42% (49%) | 61% (74%) | 65% (81%) | 81% (94%) |
 
+The 2,048 heaviest positions (what Flash-Next's index would keep) hold 87% of the weight on
+average at 16,384 tokens and 94% at 32,768 (median 98%): keeping only those would drop 6% to
+13% of the attention on average.
+
+The measurement was checked against the attention kernel itself: for the measured row the
+host's and the kernel's per-chunk highest logit agree within 0.003 and the per-chunk sums
+within 0.16%, over 6,144 chunks. That is also the first check of the batched kernel's scores
+on real text beyond 4,096 tokens.
+
 (Mean over the 192 heads, median in brackets.) On average 34% to 70% of the weight is on the
 last 1,024 positions, and the rest is spread thinly over the whole context: a typical head
 needs most of the 64-position slices to stay within one part in ten thousand. Skipping the
 values of positions that get no weight, or screening keys coarsely first, would therefore save
-a fifth of the reads at best while changing the result more than anything done so far. Those
-two ideas are dropped. This is one kind of text and one row per depth; code or dialogue may
-be more concentrated and can be measured the same way.
+a fifth of the reads at best while changing the result more than anything done so far. On
+this evidence those two ideas are not pursued for now. It is encyclopedia prose and one row
+per depth; code and agent logs may be more concentrated and should be measured the same way
+before the question is closed.
+
+### Another implementation of the same model on the same machine
+
+The Loom project (github.com/ROCm/hrx-system) publishes a package for Inkling 2 Mini measured
+on a Strix Halo on 2026-11-21 (huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom), from a
+Q4_K_XL file with 8-bit projection weights, so not the same arithmetic as here. Its reported
+numbers: prompts at 1,179 to 1,282 tokens/s from 1K to 16K and 1,102 at 32K, with steps of
+2,048 tokens; generation at 42.7 tokens/s at short context, 39.6 at 2K and 29.6 at 32K with
+its drafter on the GPU proposing one token per step (60% accepted, 1.6 tokens per pass, so
+about 27 passes per second, close to the 25 plain steps per second here). The two things it
+has that this extension does not are therefore large prompt steps with every kernel built for
+them, and a drafter on the GPU. Its attention reads the whole FP16 cache like ours, in 16
+splits per head with a running softmax, and it also slows with depth.
 
 ## Not measured yet
 

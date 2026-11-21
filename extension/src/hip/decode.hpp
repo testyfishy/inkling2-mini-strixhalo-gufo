@@ -263,6 +263,9 @@ struct AttnArgs {
   // FP16 cache (queries, weights and sums stay F32). Works on both layouts;
   // on sliding-window layers max_chunks must be 1. Needs the chunk scratch.
   bool half;
+  // Timing experiments on the per-row FP16 kernel: 1 skips the value reads,
+  // 2 the key reads. The output is then wrong.
+  int skip;
   const std::uint16_t* qh;  // stride kHQ
   const AttnGroup* groups;
   int group_count;

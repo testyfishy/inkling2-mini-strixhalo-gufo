@@ -193,12 +193,18 @@ struct GpuEngine::Impl {
   // weights are for the step's last row (a diagnostic; it is slow).
   int attn_stats_every{EnvOr("INKLING2_ATTN_STATS", 0)};
   bool attn_stats_now{false};
+  int attn_skip{EnvOr("INKLING2_ATTN_SKIP", 0)};
   std::uint32_t stats_pos{0};
   struct HeadStats {
-    double sink, last_1024, pos_999, pos_9999, slice_999, slice_9999,
+    double sink, last_1024, top_2048, pos_999, pos_9999, slice_999, slice_9999,
         slice_99999, chunk_9999;
   };
   std::vector<HeadStats> stats;
+  // The host's per-chunk maximum and sum of the visit just measured, to be
+  // compared with what the attention kernel leaves in its chunk scratch.
+  std::vector<double> stats_chunk_max, stats_chunk_sum;
+  double stats_max_diff{0}, stats_sum_diff{0};
+  std::size_t stats_chunks{0};
   double ab_max_diff{0}, ab_max_abs{0}, ab_sq_diff{0}, ab_sq{0};
   std::size_t ab_bad{0}, ab_visits{0};
   int max_chunks{1};
@@ -664,6 +670,8 @@ struct GpuEngine::Impl {
     std::vector<float> key(n * gpu::kHD);
     stats.resize(stats.size() + kNH);
     HeadStats* out = stats.data() + stats.size() - kNH;
+    stats_chunk_max.assign(kNH * ((n + 1023) / 1024), 0.0);
+    stats_chunk_sum.assign(kNH * ((n + 1023) / 1024), 0.0);
     for (std::size_t kv = 0; kv < kNKV; ++kv) {
       Check(hipMemcpy(keys.data(),
                       row.kh + kv * std::size_t(row.cap) * gpu::kHD,
@@ -690,6 +698,20 @@ struct GpuEngine::Impl {
             w[j] = v;
             max = std::max(max, v);
           }
+          // Per chunk of 1,024 positions, as the kernels keep it: the
+          // highest logit and the sum of exp(logit - that).
+          const std::size_t n_chunks = (n + 1023) / 1024;
+          for (std::size_t ch = 0; ch < n_chunks; ++ch) {
+            const std::size_t lo = ch * 1024, hi = std::min(n, lo + 1024);
+            double cm = w[lo];
+            for (std::size_t j = lo; j < hi; ++j)
+              cm = std::max(cm, w[j]);
+            double cs = 0.0;
+            for (std::size_t j = lo; j < hi; ++j)
+              cs += std::exp(w[j] - cm);
+            stats_chunk_max[h * n_chunks + ch] = cm;
+            stats_chunk_sum[h * n_chunks + ch] = cs;
+          }
           double total = std::exp(-max);
           for (double& v : w) {
             v = std::exp(v - max);
@@ -697,6 +719,16 @@ struct GpuEngine::Impl {
           }
           HeadStats& st = out[h];
           st.sink = std::exp(-max) / total;
+          {
+            std::vector<double> sorted(w);
+            const std::size_t top = std::min<std::size_t>(2048, n);
+            std::partial_sort(sorted.begin(), sorted.begin() + top, sorted.end(),
+                              std::greater<double>());
+            double held = 0.0;
+            for (std::size_t j = 0; j < top; ++j)
+              held += sorted[j];
+            st.top_2048 = held / total;
+          }
           double recent = 0.0;
           for (std::size_t j = n > 1024 ? n - 1024 : 0; j < n; ++j)
             recent += w[j];
@@ -750,12 +782,19 @@ struct GpuEngine::Impl {
                  pos, stats.size());
     line("weight on the sink", &HeadStats::sink);
     line("weight on the last 1,024 positions", &HeadStats::last_1024);
+    line("weight on the 2,048 heaviest positions", &HeadStats::top_2048);
     line("positions holding all but 1e-3", &HeadStats::pos_999);
     line("positions holding all but 1e-4", &HeadStats::pos_9999);
     line("slices of 64 holding all but 1e-3", &HeadStats::slice_999);
     line("slices of 64 holding all but 1e-4", &HeadStats::slice_9999);
     line("slices of 64 holding all but 1e-5", &HeadStats::slice_99999);
     line("chunks of 1,024 holding all but 1e-4", &HeadStats::chunk_9999);
+    std::fprintf(stderr,
+                 "  against the attention kernel, %zu chunks: largest difference "
+                 "of a chunk's highest logit %.3g, of its sum %.3g (relative)\n",
+                 stats_chunks, stats_max_diff, stats_sum_diff);
+    stats_max_diff = stats_sum_diff = 0.0;
+    stats_chunks = 0;
     stats.clear();
   }
 
@@ -918,9 +957,38 @@ struct GpuEngine::Impl {
     }
     at.batched = batched;
     at.half = half;
+    at.skip = attn_skip;
     if (swa && (batched || half))
       at.max_chunks = batched ? 2 : 1;
     gpu::Attention(at, stream);
+    if (!swa && attn_stats_now) {
+      // The kernel's per-chunk maximum and sum for the measured row, against
+      // the host's: this checks the measurement and the kernel against each
+      // other.
+      Check(hipStreamSynchronize(stream), "synchronize");
+      const std::size_t chunks = stats_chunk_max.size() / kNH;
+      const std::size_t row_base =
+          (std::size_t(batch) - 1) * kNH * at.max_chunks;
+      std::vector<float> dev_max(kNH * std::size_t(at.max_chunks)),
+          dev_sum(dev_max.size());
+      Check(hipMemcpy(dev_max.data(), chunk_max + row_base, dev_max.size() * 4,
+                      hipMemcpyDeviceToHost),
+            "chunk maxima");
+      Check(hipMemcpy(dev_sum.data(), chunk_sum + row_base, dev_sum.size() * 4,
+                      hipMemcpyDeviceToHost),
+            "chunk sums");
+      for (std::size_t h = 0; h < kNH; ++h)
+        for (std::size_t ch = 0; ch < chunks; ++ch) {
+          const double hm = stats_chunk_max[h * chunks + ch],
+                       hs = stats_chunk_sum[h * chunks + ch];
+          stats_max_diff = std::max(
+              stats_max_diff, std::fabs(dev_max[h * at.max_chunks + ch] - hm));
+          stats_sum_diff = std::max(
+              stats_sum_diff,
+              std::fabs(dev_sum[h * at.max_chunks + ch] - hs) / hs);
+          ++stats_chunks;
+        }
+    }
     if ((batched || half) && attn_ab && keep_f32) {
       const std::size_t n = std::size_t(batch) * kHQ;
       Check(hipMemcpyAsync(ab_new.data(), attn, n * 4, hipMemcpyDeviceToHost,

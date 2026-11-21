@@ -1034,7 +1034,7 @@ __launch_bounds__(kT) __global__ void AttentionChunkHalfKernel(AttnArgs a) {
     for (int s = 0; s < kShare; ++s)
       dot[s] = 0.0f;
     // A position's 128 key values are contiguous: 16 bytes per load.
-    for (int i = 0; i < kHD; i += 8) {
+    for (int i = 0; i < (a.skip == 2 ? 0 : kHD); i += 8) {
       float k[8];
       LoadHalf8(key + i, k);
 #pragma unroll
@@ -1109,7 +1109,7 @@ __launch_bounds__(kT) __global__ void AttentionChunkHalfKernel(AttnArgs a) {
   float acc[kShare];
   for (int s = 0; s < kShare; ++s)
     acc[s] = 0.0f;
-  for (int j = part * kSpan; j < end;) {
+  for (int j = part * kSpan; j < (a.skip == 1 ? 0 : end);) {
     const std::size_t entry = ring ? (row.first + j) % row.cap : j;
     if ((entry & 7) == 0 && j + 8 <= end) {
       float v[8];
