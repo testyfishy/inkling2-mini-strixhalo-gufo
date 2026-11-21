@@ -52,8 +52,12 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       matches the CPU reference (logits to five digits, identical greedy tokens). Speed is
       13.5 tokens/s, **below** the llama.cpp baseline of 19.5: the time goes to three
       CPU-GPU round trips per layer visit, not to the kernels
-- [ ] M3b: whole decode step on the GPU with one round trip per token (mixing, norms,
-      convolutions, attention over a device KV cache, routing)
+- [x] M3b: whole decode step on the GPU with one round trip per token (mixing, loop messages,
+      norms, convolutions, attention over a device KV cache, routing). All 48 layer visits match
+      the CPU reference to about 2.5e-4 and the greedy tokens are identical. **20.9 tokens/s**
+      single stream at native precision, against 19.5 for llama.cpp HIP on the same file
+- [ ] M4: speed beyond single-stream decode: speculative decoding with the model's DSpark
+      drafter, and batched decode across sessions
 - [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [ ] M5: continuation cache, so conversations resume without reprocessing

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "model.hpp"
@@ -30,6 +32,11 @@ public:
   /// sum of its output is accumulated here (compare Reference::Trace::l_out).
   void SetDebug(bool on);
   [[nodiscard]] const std::vector<double>& layer_sums() const;
+
+  /// With profiling on, every kernel group is timed with its own round trip.
+  void SetProfile(bool on);
+  /// Seconds accumulated per kernel group while profiling.
+  [[nodiscard]] std::vector<std::pair<std::string, double>> phases() const;
 
   [[nodiscard]] std::size_t launches() const;
 

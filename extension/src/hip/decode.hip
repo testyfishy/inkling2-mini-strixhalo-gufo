@@ -86,51 +86,6 @@ __device__ inline void Mix(float (*sh)[kT], const float* const* states, int n,
   __syncthreads();
 }
 
-// cur = (1 - tanh(forget)) * cur + tanh(gain) * msg, both controllers reading
-// the rank-64 projection of [rms(cur), rms(msg)]. In place on `cur`.
-__device__ inline void Control(float (*sh)[kT], float* low, float* cur,
-                               const float* msg, Ctrl c) {
-  const int t = threadIdx.x;
-  float mine[2] = {0.0f, 0.0f};
-  for (int i = t; i < kE; i += kT) {
-    mine[0] += cur[i] * cur[i];
-    mine[1] += msg[i] * msg[i];
-  }
-  float total[2];
-  BlockSum(sh, mine, 2, total);
-  const float inv_cur = 1.0f / sqrtf(total[0] / kE + 1e-6f);
-  const float inv_msg = 1.0f / sqrtf(total[1] / kE + 1e-6f);
-
-  // 64 dot products of 2E values, each split across kT / 64 threads.
-  constexpr int kParts = kT / kRank;
-  constexpr int kSpan = 2 * kE / kParts;
-  const int d = t % kRank, part = t / kRank;
-  const float* row = c.down + static_cast<std::size_t>(d) * 2 * kE;
-  float acc = 0.0f;
-  for (int j = part * kSpan; j < (part + 1) * kSpan; ++j) {
-    const float g = j < kE ? cur[j] * inv_cur : msg[j - kE] * inv_msg;
-    acc += row[j] * g;
-  }
-  sh[0][t] = acc;
-  __syncthreads();
-  if (t < kRank) {
-    float sum = 0.0f;
-    for (int p = 0; p < kParts; ++p)
-      sum += sh[0][t + kRank * p];
-    low[t] = sum;
-  }
-  __syncthreads();
-  for (int i = t; i < kE; i += kT) {
-    float gain = 0.0f, forget = 0.0f;
-    for (int r = 0; r < kRank; ++r) {
-      gain += c.gain[i * kRank + r] * low[r];
-      forget += c.forget[i * kRank + r] * low[r];
-    }
-    cur[i] = cur[i] - tanhf(forget) * cur[i] + tanhf(gain) * msg[i];
-  }
-  __syncthreads();
-}
-
 // x = rms_norm(x) * weight, in place.
 __device__ inline void NormW(float (*sh)[kT], float* x, const float* weight,
                              float eps) {
@@ -178,7 +133,6 @@ __device__ inline float ClipFactor(float sum_sq, float threshold) {
 
 __launch_bounds__(kT) __global__ void GlueAKernel(GlueAArgs a) {
   __shared__ float sh[kSums][kT];
-  __shared__ float low[kRank];
   const int t = threadIdx.x;
   for (int i = t; i < kE; i += kT)
     a.input[i] = a.cur[i];
@@ -209,11 +163,137 @@ __launch_bounds__(kT) __global__ void GlueAKernel(GlueAArgs a) {
   if (a.looped) {
     const float* bank[2] = {a.bank0, a.bank_out};
     Mix(sh, bank, 2, a.msg_query, 4, a.msgs);
-    for (int j = 0; j < 3; ++j)
-      Control(sh, low, a.in + j * kE, a.msgs + j * kE, a.ctrl[j]);
   }
-  for (int j = 0; j < 3; ++j)
-    NormW(sh, a.in + j * kE, a.norm[j], a.eps);
+}
+
+// The loop controllers' rank-64 projection of [rms(cur), rms(msg)]: one block
+// per (controller, rank). Each block also sums the squares it needs for the
+// two norms, which costs little next to its 2E-wide row.
+constexpr int kCtrlThreads = 128;
+__launch_bounds__(kCtrlThreads) __global__ void CtrlDownKernel(CtrlDownArgs a) {
+  __shared__ float sh[4][kCtrlThreads];
+  const int t = threadIdx.x;
+  const int c = blockIdx.x / kRank, d = blockIdx.x % kRank;
+  const float* cur = a.cur[c];
+  const float* msg = a.msg[c];
+  const float* row = a.down[c] + static_cast<std::size_t>(d) * 2 * kE;
+  float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int i = t; i < kE; i += kCtrlThreads) {
+    const float x = cur[i], y = msg[i];
+    v[0] += x * x;
+    v[1] += y * y;
+    v[2] += row[i] * x;
+    v[3] += row[kE + i] * y;
+  }
+  for (int k = 0; k < 4; ++k)
+    sh[k][t] = v[k];
+  __syncthreads();
+  for (int step = kCtrlThreads / 2; step > 0; step >>= 1) {
+    if (t < step)
+      for (int k = 0; k < 4; ++k)
+        sh[k][t] += sh[k][t + step];
+    __syncthreads();
+  }
+  if (t == 0) {
+    const float inv_cur = 1.0f / sqrtf(sh[0][0] / kE + 1e-6f);
+    const float inv_msg = 1.0f / sqrtf(sh[1][0] / kE + 1e-6f);
+    a.low[c * kRank + d] = sh[2][0] * inv_cur + sh[3][0] * inv_msg;
+  }
+}
+
+// cur = (1 - tanh(forget)) * cur + tanh(gain) * msg, one thread per value.
+__global__ void CtrlApplyKernel(CtrlApplyArgs a) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int c = idx / kE, i = idx % kE;
+  if (c >= a.count)
+    return;
+  const float* low = a.low + c * kRank;
+  const float* gain_row = a.gain[c] + static_cast<std::size_t>(i) * kRank;
+  const float* forget_row = a.forget[c] + static_cast<std::size_t>(i) * kRank;
+  float gain = 0.0f, forget = 0.0f;
+  for (int r = 0; r < kRank; ++r) {
+    gain += gain_row[r] * low[r];
+    forget += forget_row[r] * low[r];
+  }
+  const float x = a.cur[c][i];
+  a.cur[c][i] = x - tanhf(forget) * x + tanhf(gain) * a.msg[c][i];
+}
+
+// x = rms_norm(x) * weight for up to three vectors, one block each.
+constexpr int kNormThreads = 256;
+__launch_bounds__(kNormThreads) __global__ void NormKernel(NormArgs a) {
+  __shared__ float sh[kNormThreads];
+  const int t = threadIdx.x;
+  float* x = a.x[blockIdx.x];
+  const float* w = a.w[blockIdx.x];
+  float mine = 0.0f;
+  for (int i = t; i < kE; i += kNormThreads)
+    mine += x[i] * x[i];
+  sh[t] = mine;
+  __syncthreads();
+  for (int step = kNormThreads / 2; step > 0; step >>= 1) {
+    if (t < step)
+      sh[t] += sh[t + step];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sh[0] / kE + a.eps);
+  for (int i = t; i < kE; i += kNormThreads)
+    x[i] = x[i] * inv * w[i];
+}
+
+// The router's 128 logits: one block per expert.
+constexpr int kRouterThreads = 64;
+__launch_bounds__(kRouterThreads) __global__ void RouterLogitsKernel(
+    const float* __restrict__ gate_inp, const float* __restrict__ x,
+    float* __restrict__ logits) {
+  __shared__ float sh[kRouterThreads];
+  const int t = threadIdx.x;
+  const float* row = gate_inp + static_cast<std::size_t>(blockIdx.x) * kE;
+  float acc = 0.0f;
+  for (int i = t; i < kE; i += kRouterThreads)
+    acc += row[i] * x[i];
+  sh[t] = acc;
+  __syncthreads();
+  for (int step = kRouterThreads / 2; step > 0; step >>= 1) {
+    if (t < step)
+      sh[t] += sh[t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    logits[blockIdx.x] = sh[0];
+}
+
+// Top-8 of the 128 experts by sigmoid(logit) + bias, with the router weights.
+__launch_bounds__(kNX) __global__ void RouterSelectKernel(RouterArgs a) {
+  __shared__ float prob[kNX];
+  __shared__ float key[kNX];
+  __shared__ float top_prob[kTopK];
+  __shared__ int top_id[kTopK];
+  const int t = threadIdx.x;
+  prob[t] = Sigmoid(a.logits[t]);
+  key[t] = prob[t] + (a.exp_probs_b ? a.exp_probs_b[t] : 0.0f);
+  __syncthreads();
+  // Rank by selection key, highest first, ties to the lower index.
+  int rank = 0;
+  for (int j = 0; j < kNX; ++j)
+    rank += (key[j] > key[t] || (key[j] == key[t] && j < t)) ? 1 : 0;
+  if (rank < kTopK) {
+    top_prob[rank] = prob[t];
+    top_id[rank] = t;
+  }
+  __syncthreads();
+  if (t == 0) {
+    float sum = 1e-20f;
+    for (int i = 0; i < kTopK; ++i)
+      sum += top_prob[i];
+    for (int i = 0; i < kTopK; ++i) {
+      const int id = top_id[i];
+      a.ids[i] = static_cast<std::uint32_t>(id);
+      a.up_scale[i] = a.up_scale_all ? a.up_scale_all[id] : 1.0f;
+      a.coef[i] = top_prob[i] / sum * a.weights_scale *
+                  (a.down_scale_all ? a.down_scale_all[id] : 1.0f);
+    }
+  }
 }
 
 constexpr int kGemvThreads = 128;
@@ -366,7 +446,6 @@ __launch_bounds__(kAttnThreads) __global__ void AttentionKernel(AttnArgs a) {
 
 __launch_bounds__(kT) __global__ void GlueCKernel(GlueCArgs a) {
   __shared__ float sh[kSums][kT];
-  __shared__ float low[kRank];
   const int t = threadIdx.x;
   for (int i = t; i < kE; i += kT) {
     const float conv =
@@ -388,53 +467,6 @@ __launch_bounds__(kT) __global__ void GlueCKernel(GlueCArgs a) {
     states[s] = a.stack + static_cast<std::size_t>(s) * kE;
   states[n] = a.cur;
   Mix(sh, states, n + 1, a.ffn_res_query, 1, a.xn);
-  if (a.looped)
-    Control(sh, low, a.xn, a.msg_ffn, a.ctrl);
-  NormW(sh, a.xn, a.ffn_norm, a.eps);
-
-  // Router: 128 logits of E values, each split across kT / 128 threads.
-  constexpr int kParts = kT / kNX;
-  constexpr int kSpan = kE / kParts;
-  const int expert = t % kNX, part = t / kNX;
-  const float* row = a.gate_inp + static_cast<std::size_t>(expert) * kE;
-  float acc = 0.0f;
-  for (int j = part * kSpan; j < (part + 1) * kSpan; ++j)
-    acc += row[j] * a.xn[j];
-  sh[0][t] = acc;
-  __syncthreads();
-  if (t < kNX) {
-    float logit = 0.0f;
-    for (int p = 0; p < kParts; ++p)
-      logit += sh[0][t + kNX * p];
-    const float prob = Sigmoid(logit);
-    sh[1][t] = prob;
-    sh[2][t] = prob + (a.exp_probs_b ? a.exp_probs_b[t] : 0.0f);
-  }
-  __syncthreads();
-  if (t < kNX) {
-    // Rank by selection key, highest first, ties to the lower index.
-    const float key = sh[2][t];
-    int rank = 0;
-    for (int j = 0; j < kNX; ++j)
-      rank += (sh[2][j] > key || (sh[2][j] == key && j < t)) ? 1 : 0;
-    if (rank < kTopK) {
-      sh[3][rank] = sh[1][t];
-      sh[4][rank] = static_cast<float>(t);
-    }
-  }
-  __syncthreads();
-  if (t == 0) {
-    float sum = 1e-20f;
-    for (int i = 0; i < kTopK; ++i)
-      sum += sh[3][i];
-    for (int i = 0; i < kTopK; ++i) {
-      const int id = static_cast<int>(sh[4][i]);
-      a.ids[i] = static_cast<std::uint32_t>(id);
-      a.up_scale[i] = a.up_scale_all ? a.up_scale_all[id] : 1.0f;
-      a.coef[i] = sh[3][i] / sum * a.weights_scale *
-                  (a.down_scale_all ? a.down_scale_all[id] : 1.0f);
-    }
-  }
 }
 
 __global__ void GlueDKernel(GlueDArgs a) {
@@ -502,6 +534,24 @@ void Attention(const AttnArgs& args, hipStream_t stream) {
 
 void GlueC(const GlueCArgs& args, hipStream_t stream) {
   GlueCKernel<<<1, kT, 0, stream>>>(args);
+}
+
+void CtrlDown(const CtrlDownArgs& args, hipStream_t stream) {
+  CtrlDownKernel<<<args.count * kRank, kCtrlThreads, 0, stream>>>(args);
+}
+
+void CtrlApply(const CtrlApplyArgs& args, hipStream_t stream) {
+  CtrlApplyKernel<<<(args.count * kE + 255) / 256, 256, 0, stream>>>(args);
+}
+
+void Norm(const NormArgs& args, hipStream_t stream) {
+  NormKernel<<<args.count, kNormThreads, 0, stream>>>(args);
+}
+
+void Router(const RouterArgs& args, hipStream_t stream) {
+  RouterLogitsKernel<<<kNX, kRouterThreads, 0, stream>>>(args.gate_inp, args.x,
+                                                          args.logits);
+  RouterSelectKernel<<<1, kNX, 0, stream>>>(args);
 }
 
 void GlueD(const GlueDArgs& args, hipStream_t stream) {

@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -58,7 +59,7 @@ struct GpuDecoder::Impl {
   float *cur{}, *input{}, *in{}, *msgs{}, *stack{}, *prelude{}, *bank0{},
       *bank_out{}, *q{}, *r{}, *gate{}, *sink{}, *k_raw{}, *v_raw{}, *k_taps{},
       *v_taps{}, *attn{}, *proj{}, *xn{}, *sel{}, *act{}, *moe{}, *scratch{},
-      *final_x{}, *logits{};
+      *final_x{}, *logits{}, *low{}, *router_logits{};
   std::uint32_t context;
   std::uint32_t pos{0};
   int n_blocks{0};
@@ -215,6 +216,8 @@ struct GpuDecoder::Impl {
     moe = Floats(kE);
     scratch = Floats(std::size_t(kNH) * std::max<std::uint32_t>(context, c.n_swa));
     final_x = Floats(kE);
+    low = Floats(3 * gpu::kRank);
+    router_logits = Floats(gpu::kNX);
     logits = Floats(c.n_vocab_padded);
     host_logits.resize(c.n_vocab_padded);
     host_vec.resize(kE);
@@ -234,6 +237,30 @@ struct GpuDecoder::Impl {
   [[nodiscard]] std::uint32_t Physical(std::uint32_t slot) const {
     const std::uint32_t core = c.loop_end - c.loop_start;
     return slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % core;
+  }
+
+  // Profiling: with `profile` on, every kernel group is followed by a round
+  // trip and its wall time is added to `phase_seconds`. That adds overhead of
+  // its own, so the phases show proportions, not the unprofiled cost.
+  static constexpr int kPhases = 11;
+  static constexpr const char* kPhaseNames[kPhases] = {
+      "glue A (mix, messages, norms)", "input projections",
+      "glue B (conv, clips, KV store)", "attention", "output projection",
+      "glue C (conv, mix, norm, router)", "experts NVFP4", "experts BF16",
+      "glue D (conv, residual)", "embed and copies", "output head"};
+  bool profile{false};
+  double phase_seconds[kPhases] = {};
+  std::chrono::steady_clock::time_point mark{};
+
+  void Mark(int phase) {
+    if (!profile)
+      return;
+    Check(hipStreamSynchronize(stream), "synchronize");
+    const auto now = std::chrono::steady_clock::now();
+    if (phase >= 0)
+      phase_seconds[phase] +=
+          std::chrono::duration<double>(now - mark).count();
+    mark = now;
   }
 
   void Visit(std::uint32_t slot_index, std::uint32_t il, bool looped) {
@@ -257,12 +284,32 @@ struct GpuDecoder::Impl {
     a.bank0 = bank0;
     a.bank_out = bank_out;
     a.msg_query = l.msg_query;
-    for (int j = 0; j < 3; ++j) {
-      a.ctrl[j] = l.ctrl[j];
-      a.norm[j] = l.norm[j];
-    }
-    a.eps = c.norm_eps;
     gpu::GlueA(a, stream);
+    if (looped) {
+      gpu::CtrlDownArgs down{};
+      gpu::CtrlApplyArgs apply{};
+      for (int j = 0; j < 3; ++j) {
+        down.cur[j] = apply.cur[j] = in + j * kE;
+        down.msg[j] = apply.msg[j] = msgs + j * kE;
+        down.down[j] = l.ctrl[j].down;
+        apply.gain[j] = l.ctrl[j].gain;
+        apply.forget[j] = l.ctrl[j].forget;
+      }
+      down.low = low;
+      apply.low = low;
+      down.count = apply.count = 3;
+      gpu::CtrlDown(down, stream);
+      gpu::CtrlApply(apply, stream);
+    }
+    gpu::NormArgs norm{};
+    for (int j = 0; j < 3; ++j) {
+      norm.x[j] = in + j * kE;
+      norm.w[j] = l.norm[j];
+    }
+    norm.count = 3;
+    norm.eps = c.norm_eps;
+    gpu::Norm(norm, stream);
+    Mark(0);
 
     gpu::GemvArgs g{};
     g.jobs[0] = {l.wq, in, q, kHQ, kE};
@@ -278,6 +325,7 @@ struct GpuDecoder::Impl {
       g.count = 8;
     }
     gpu::GemvMulti(g, stream);
+    Mark(1);
 
     const float ratio = std::max(
         1.0f, (pos + 1.0f) / static_cast<float>(c.log_scale_floor));
@@ -302,6 +350,7 @@ struct GpuDecoder::Impl {
     b.k_row = slot.k + row * kHK;
     b.v_row = slot.v + row * kHK;
     gpu::GlueB(b, stream);
+    Mark(2);
 
     gpu::AttnArgs at{};
     at.q = q;
@@ -319,11 +368,13 @@ struct GpuDecoder::Impl {
     at.pos = static_cast<int>(pos);
     at.scale = 1.0f / std::sqrt(static_cast<float>(gpu::kHD));
     gpu::Attention(at, stream);
+    Mark(3);
 
     gpu::GemvArgs o{};
     o.jobs[0] = {l.wo, attn, proj, kE, kHQ};
     o.count = 1;
     gpu::GemvMulti(o, stream);
+    Mark(4);
 
     gpu::GlueCArgs cc{};
     cc.proj = proj;
@@ -336,20 +387,40 @@ struct GpuDecoder::Impl {
     cc.cur = cur;
     cc.xn = xn;
     cc.ffn_res_query = l.ffn_res_query;
-    cc.looped = looped;
-    cc.msg_ffn = msgs + 3 * kE;
-    cc.ctrl = l.ctrl[3];
-    cc.ffn_norm = l.ffn_norm;
-    cc.eps = c.norm_eps;
-    cc.gate_inp = l.gate_inp;
-    cc.exp_probs_b = l.exp_probs_b;
-    cc.up_scale_all = l.up_scale;
-    cc.down_scale_all = l.down_scale;
-    cc.weights_scale = c.expert_weights_scale;
-    cc.ids = reinterpret_cast<std::uint32_t*>(sel);
-    cc.up_scale = sel + gpu::kTopK;
-    cc.coef = sel + 2 * gpu::kTopK;
     gpu::GlueC(cc, stream);
+    if (looped) {
+      gpu::CtrlDownArgs down{};
+      gpu::CtrlApplyArgs apply{};
+      down.cur[0] = apply.cur[0] = xn;
+      down.msg[0] = apply.msg[0] = msgs + 3 * kE;
+      down.down[0] = l.ctrl[3].down;
+      apply.gain[0] = l.ctrl[3].gain;
+      apply.forget[0] = l.ctrl[3].forget;
+      down.low = low;
+      apply.low = low;
+      down.count = apply.count = 1;
+      gpu::CtrlDown(down, stream);
+      gpu::CtrlApply(apply, stream);
+    }
+    gpu::NormArgs ffn_norm{};
+    ffn_norm.x[0] = xn;
+    ffn_norm.w[0] = l.ffn_norm;
+    ffn_norm.count = 1;
+    ffn_norm.eps = c.norm_eps;
+    gpu::Norm(ffn_norm, stream);
+    gpu::RouterArgs router{};
+    router.gate_inp = l.gate_inp;
+    router.x = xn;
+    router.logits = router_logits;
+    router.exp_probs_b = l.exp_probs_b;
+    router.up_scale_all = l.up_scale;
+    router.down_scale_all = l.down_scale;
+    router.weights_scale = c.expert_weights_scale;
+    router.ids = reinterpret_cast<std::uint32_t*>(sel);
+    router.up_scale = sel + gpu::kTopK;
+    router.coef = sel + 2 * gpu::kTopK;
+    gpu::Router(router, stream);
+    Mark(5);
     if (block_start)
       ++n_blocks;
 
@@ -357,9 +428,9 @@ struct GpuDecoder::Impl {
     e.gate_up = l.gate_up;
     e.down = l.down;
     e.x = xn;
-    e.ids = cc.ids;
-    e.up_scale = cc.up_scale;
-    e.coef = cc.coef;
+    e.ids = router.ids;
+    e.up_scale = router.up_scale;
+    e.coef = router.coef;
     e.act = act;
     e.out = moe;
     e.count = gpu::kTopK;
@@ -369,6 +440,7 @@ struct GpuDecoder::Impl {
     e.situ_linear_beta = c.situ_linear_beta;
     e.nvfp4 = l.nvfp4;
     gpu::Experts(e, stream);
+    Mark(l.nvfp4 ? 6 : 7);
 
     gpu::GlueDArgs d{};
     d.moe = moe;
@@ -376,7 +448,8 @@ struct GpuDecoder::Impl {
     d.hist = slot.hist_ffn;
     d.cur = cur;
     gpu::GlueD(d, stream);
-    n_launches += 9;
+    Mark(8);
+    n_launches += looped ? 17 : 13;
 
     if (debug) {
       Check(hipMemcpyAsync(host_vec.data(), cur, kE * 4, hipMemcpyDeviceToHost,
@@ -399,6 +472,7 @@ struct GpuDecoder::Impl {
     e.norm = tok_norm;
     e.eps = c.norm_eps;
     e.cur = cur;
+    Mark(-1);
     gpu::Embed(e, stream);
 
     n_blocks = 0;
@@ -445,6 +519,7 @@ struct GpuDecoder::Impl {
       f.norm = output_norm;
       f.eps = c.norm_eps;
       f.out = final_x;
+      Mark(9);
       gpu::Final(f, stream);
       gpu::GemvArgs g{};
       g.jobs[0] = {output, final_x, logits, static_cast<int>(c.n_vocab_padded),
@@ -457,6 +532,7 @@ struct GpuDecoder::Impl {
             "copy logits");
     }
     Check(hipStreamSynchronize(stream), "synchronize");
+    Mark(10);
     n_launches += 6;
     ++pos;
   }
@@ -487,6 +563,17 @@ std::uint32_t GpuDecoder::FeedGreedy(std::uint32_t token) {
 
 void GpuDecoder::FeedSilent(std::uint32_t token) {
   impl_->Run(token, false);
+}
+
+void GpuDecoder::SetProfile(bool on) {
+  impl_->profile = on;
+}
+
+std::vector<std::pair<std::string, double>> GpuDecoder::phases() const {
+  std::vector<std::pair<std::string, double>> out;
+  for (int i = 0; i < Impl::kPhases; ++i)
+    out.emplace_back(Impl::kPhaseNames[i], impl_->phase_seconds[i]);
+  return out;
 }
 
 void GpuDecoder::SetDebug(bool on) {

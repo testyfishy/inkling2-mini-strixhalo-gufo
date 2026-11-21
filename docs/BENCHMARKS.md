@@ -89,6 +89,47 @@ per-call overhead and CPU work were removed entirely, and about 34 tokens/s if t
 also reached bandwidth. That is an estimate from kernel timings, not a measured decode speed; it
 is the ceiling for single-stream decode at native precision without speculative decoding.
 
+## Extension, whole decode step on the GPU, 2026-11-21
+
+Same file and prompt, greedy decode of 128 tokens, one sequence, one host round trip per token.
+
+| Path | Generation (t/s) | Per token |
+|---|---:|---:|
+| GPU decoder, first version (two single-block glue kernels) | 17.0 | 58.8 ms |
+| GPU decoder, loop controllers and router spread across the GPU | 20.9 | 47.9 ms |
+| llama.cpp HIP, same file (baseline) | 19.5 | 51.3 ms |
+
+Per-token profile of the 20.9 t/s version (each kernel group timed with its own round trip, so
+the sum, 49.8 ms, is slightly above the unprofiled 47.9 ms):
+
+| Kernel group | ms per token | Note |
+|---|---:|---|
+| NVFP4 experts (44 visits) | 15.1 | compute-bound: 4-bit decode plus multiply |
+| Input projections (48 visits, about 40 MB each) | 12.0 | about 158 GB/s, near bandwidth |
+| Output head (201,024 x 2,304 BF16) | 5.6 | about 165 GB/s |
+| Attention output projection (48 x 14 MB) | 5.3 | |
+| Glue C: convolution, mix, message, norm, router | 3.0 | was 5.9 |
+| Glue A: mixes, messages, norms | 2.8 | was 10.7 |
+| BF16 experts (4 visits) | 2.6 | about 195 GB/s |
+| Attention over the KV cache | 2.2 | short context |
+| Glue B and D | 1.1 | |
+
+What this says about single-stream speed at native precision:
+
+- About 25 ms per token is BF16 weight traffic that already runs near the memory bandwidth of
+  the machine. It cannot shrink without changing the stored precision.
+- The NVFP4 expert kernel is the largest remaining compute cost. It already processes about
+  twice as many weights per second as the BF16 kernels; a better decode might save a few ms.
+- A fully tuned single-stream decoder is therefore estimated at roughly 25 tokens/s, not
+  dramatically above today's 20.9. Larger gains have to come from doing more per pass over the
+  weights: speculative decoding (verifying several drafted tokens in one pass) and batching
+  several sessions together. Neither is built yet.
+
+Not covered by these numbers: contexts beyond a few hundred tokens (attention cost grows with
+context, and the 1,024-token sliding window wrap is untested on the GPU), prompt processing in
+batches (prompts are currently fed one token at a time, about 24 tokens/s), sampling, and
+anything through GUFO's serving interface.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

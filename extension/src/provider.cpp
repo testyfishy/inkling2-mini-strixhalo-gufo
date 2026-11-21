@@ -215,6 +215,7 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
       std::uint32_t next = order[0];
       std::printf("greedy:");
       const std::size_t launches_before = decoder.launches();
+      decoder.SetProfile(std::getenv("INKLING2_PROFILE") != nullptr);
       const auto gen_start = std::chrono::steady_clock::now();
       for (int i = 0; i < count; ++i) {
         std::printf(" %u", next);
@@ -229,6 +230,10 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                   count, gen_seconds, count / gen_seconds,
                   static_cast<double>(decoder.launches() - launches_before) /
                       count);
+      if (std::getenv("INKLING2_PROFILE"))
+        for (const auto& [name, phase_seconds] : decoder.phases())
+          std::printf("  %-34s %7.3f ms per token\n", name.c_str(),
+                      phase_seconds / count * 1e3);
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());

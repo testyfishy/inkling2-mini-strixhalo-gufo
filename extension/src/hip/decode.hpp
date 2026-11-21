@@ -34,8 +34,9 @@ struct Ctrl {
 };
 
 /// Before the projections: keeps the layer input, mixes the earlier block
-/// outputs into the attention inputs, applies the cross-pass messages, and
-/// normalizes. Writes the three inputs (Q, K, V) to `in` (3 * E).
+/// outputs into the three attention inputs (Q, K, V) in `in` (3 * E) and, on
+/// a looped visit, mixes the cross-pass messages. CtrlDown, CtrlApply and
+/// Norm follow.
 struct GlueAArgs {
   const float* cur;
   float* input;         // copy of cur (the residual branch)
@@ -49,11 +50,54 @@ struct GlueAArgs {
   const float* bank0;      // the previous pass's block after the first core block
   const float* bank_out;   // the previous pass's output
   const float* msg_query;  // 4 * E
-  Ctrl ctrl[3];
-  const float* norm[3];    // norm weight of each input
-  float eps;
 };
 void GlueA(const GlueAArgs& args, hipStream_t stream);
+
+/// The loop controllers of up to three vectors: low = down [rms(cur), rms(msg)]
+/// into `low` (count * rank), then cur = (1 - tanh(forget low)) * cur +
+/// tanh(gain low) * msg in place.
+struct CtrlDownArgs {
+  const float* cur[3];
+  const float* msg[3];
+  const float* down[3];
+  float* low;
+  int count;
+};
+void CtrlDown(const CtrlDownArgs& args, hipStream_t stream);
+struct CtrlApplyArgs {
+  float* cur[3];
+  const float* msg[3];
+  const float* gain[3];
+  const float* forget[3];
+  const float* low;
+  int count;
+};
+void CtrlApply(const CtrlApplyArgs& args, hipStream_t stream);
+
+/// x = rms_norm(x) * w in place, for up to three E-wide vectors.
+struct NormArgs {
+  float* x[3];
+  const float* w[3];
+  int count;
+  float eps;
+};
+void Norm(const NormArgs& args, hipStream_t stream);
+
+/// The MoE router: logits = gate_inp x, then the top experts by
+/// sigmoid(logit) + bias with their normalized weights.
+struct RouterArgs {
+  const float* gate_inp;      // kNX * kE
+  const float* x;             // kE
+  float* logits;              // kNX scratch
+  const float* exp_probs_b;   // kNX or null
+  const float* up_scale_all;  // kNX or null
+  const float* down_scale_all;
+  float weights_scale;
+  std::uint32_t* ids;  // kTopK, written
+  float* up_scale;     // kTopK, written
+  float* coef;         // kTopK, written
+};
+void Router(const RouterArgs& args, hipStream_t stream);
 
 struct GemvJob {
   const std::uint16_t* w;  // BF16, rows of cols values
@@ -107,7 +151,8 @@ struct AttnArgs {
 void Attention(const AttnArgs& args, hipStream_t stream);
 
 /// After the output projection: the post-attention convolution, the residual
-/// or block push, the feed-forward input (mix, message, norm) and the router.
+/// or block push, and the feed-forward input mix into `xn`. The message
+/// controller, Norm and Router follow.
 struct GlueCArgs {
   const float* proj;       // kE
   const float* post_conv;  // kE * kNC
@@ -117,21 +162,8 @@ struct GlueCArgs {
   float* stack;
   int n_blocks;            // before this layer's push
   float* cur;              // written: the feed-forward residual input
-  float* xn;               // written: the experts' input
+  float* xn;               // written: the mixed feed-forward input
   const float* ffn_res_query;
-  bool looped;
-  const float* msg_ffn;
-  Ctrl ctrl;
-  const float* ffn_norm;
-  float eps;
-  const float* gate_inp;      // kNX * kE
-  const float* exp_probs_b;   // kNX or null
-  const float* up_scale_all;  // kNX or null
-  const float* down_scale_all;
-  float weights_scale;
-  std::uint32_t* ids;  // kTopK, written
-  float* up_scale;     // kTopK, written
-  float* coef;         // kTopK, written
 };
 void GlueC(const GlueCArgs& args, hipStream_t stream);
 
