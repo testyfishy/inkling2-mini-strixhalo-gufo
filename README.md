@@ -97,7 +97,10 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       Still to do: the drafter on the GPU, and cheaper extra rows in a verification step
 - [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
-- [ ] M5: continuation cache, so conversations resume without reprocessing
+- [x] M5a: the model's tokenizer and chat template in the extension, checked against
+      independent references ([docs/SERVING.md](docs/SERVING.md))
+- [ ] M5: a runner for `gufo serve` (API, streaming, sampling) with the continuation cache, so
+      conversations resume without reprocessing
 - [ ] M6: kernel work on the hot path, each change checked against M3's logit comparison
 - [ ] Later: vision (mmproj), DSpark speculative decoding, tool calls, multi-session serving
 
