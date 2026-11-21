@@ -43,8 +43,12 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [x] M1: probe and loader — GUFO routes Inkling 2 Mini `inkling2_loop` files to this extension,
       which validates the hyperparameters and every tensor shape (`gufo prompt` reports the
       inventory and then says the runner is missing)
-- [ ] M2: tokenizer and chat template, checked against the reference
-- [ ] M3: single-token forward pass on HIP, logits compared with llama.cpp on the same file
+- [x] M2: CPU reference forward pass (`extension/src/reference.cpp`), matching llama.cpp on the
+      native-precision file: same top-10 next tokens, log-probabilities within 0.05, identical
+      24-token greedy continuation, all 48 layer visits within about 1% (see
+      [docs/CORRECTNESS.md](docs/CORRECTNESS.md))
+- [ ] M3: tokenizer and chat template, checked against the reference
+- [ ] M3b: forward pass on HIP, compared with the CPU reference and llama.cpp
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [ ] M5: continuation cache, so conversations resume without reprocessing
 - [ ] M6: kernel work on the hot path, each change checked against M3's logit comparison

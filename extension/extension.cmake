@@ -6,9 +6,16 @@ gufo_extension_target(
   SOURCES
     src/config.cpp
     src/provider.cpp
+    src/reference.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
+    Threads::Threads
 )
+
+if(TARGET gufo_inkling2_native)
+  target_compile_options(gufo_inkling2_native PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+endif()
 
 install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
   DESTINATION share/licenses/gufo/extensions/inkling2_native)
