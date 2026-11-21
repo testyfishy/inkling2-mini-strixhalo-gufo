@@ -545,6 +545,41 @@ per 113 ms is 70 tokens/s, which is the case for text copied from the context (c
 quoting), where the drafts cost nothing. Loom's 42.7 tokens/s comes with 8-bit projection
 weights, which halve the largest read; that belongs to the later phase where weights change.
 
+## Drafts copied from the context, 2026-11-21
+
+`INKLING2_LOOKUP=15` in the development driver generates with drafts taken from the context:
+the longest recent match of the last tokens (3 to 16) is found, and the tokens that followed
+it there are proposed and verified by the model in one step of 1 + drafts rows. Nothing but
+the model decides the output; a wrong draft only costs the larger step. The number of drafts
+starts at 3, doubles while every draft is kept (up to 15) and falls back after a miss; after
+a step that kept none, four steps go without drafts unless the match is 8 tokens or longer.
+
+| Case (160 tokens generated) | Plain | With lookup | Drafts kept |
+|---|---:|---:|---:|
+| A 600-token passage given twice, then its first 100 tokens | 23.7 | 81.0 | 160 of 160 |
+| The same after 30,000 tokens of other text | 20.9 | 75.3 | 160 of 160 |
+| A 4,096-token article, continued | 23.0 | 30.0 | 65 of 87 |
+| 2,000 tokens of other prose, continued | 23.6 | 23.1 | 9 of 35 |
+
+With a fixed 15 drafts and no controller the copy case reaches 92.8 tokens/s and the prose
+case drops to 18.9. This is the regime where drafting pays on this machine (see "What bounds
+generation" above): long accepted runs, and drafts that cost nothing to make. It lives in the
+driver for now; a serving runner would run the same loop.
+
+## Things tried on the matrix-instruction kernels that did not help
+
+Recorded so they are not tried again blindly. The batched attention kernel does its products
+at about half the rate of the projection kernel, which itself is at a third of what this GPU
+is reported to sustain. Timing the attention kernel with parts switched off (1,024 rows at
+100,000 tokens, 1,930 ms): without the cache loads 1,850; without the score products 1,090;
+without the value products 1,310; without loads and products 370. So the time is in the
+matrix instructions themselves, not in memory. Then, none of these changed it: a cheaper
+exponential for the weights; two interleaved accumulators per product, to shorten dependency
+chains; padding the projection kernel's shared memory to the attention kernel's 60 KB (to
+test whether the footprint limits how many blocks run at once: it does not); and a
+projection kernel with 16 products per 8 operand reads instead of 8 per 6. What makes one
+instruction slower in one kernel than in the other is not understood yet.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

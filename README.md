@@ -81,6 +81,9 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [x] M4b5: prompt steps of up to 4,096 rows: 1,082 tokens/s at 2,048 rows per step on a
       4,096-token prompt (was 573), 550 on average over a real 102,400-token prompt (was 355).
       Quality unchanged (KLD 0.0015 at 4,096 tokens)
+- [x] M4c2: drafts copied from the context (prompt lookup), in the development driver: 81
+      tokens/s on text the model copies (75 at 30K context), 30 on an article continuation,
+      23 where nothing repeats (plain: 23.6)
 - [ ] M4b6: speed at depth is set by the 33 KB every generated token reads per token of
       context; on encyclopedia text the attention weights are too spread out to skip any of
       it (docs/BENCHMARKS.md; code and agent logs not measured yet). What is left: a single-pass generation kernel at the memory's rate,
