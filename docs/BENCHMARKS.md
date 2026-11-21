@@ -41,9 +41,14 @@ Qwen3.8 Flash-Next on GUFO 0.34.0 with MTP drafting, measured over HTTP on the s
 It is a different model, measured a different way; it only shows the gap between a generic
 backend and a model-specific GUFO runner.
 
+## Generation check
+
+`llama-cli --temp 0 --jinja -st` on the native-precision file (HIP) answers two short prompts
+correctly and coherently, with reasoning and answer separated, at 19.4 t/s. This is a smoke test,
+not a quality evaluation.
+
 ## Not measured yet
 
-- Output correctness of the native-precision file beyond the benchmark run (a greedy generation
-  check is pending).
+- Output quality beyond that smoke test (no perplexity or logit comparison yet).
 - Anything on GUFO: there is no Inkling runner yet.
 - DSpark speculative decoding.

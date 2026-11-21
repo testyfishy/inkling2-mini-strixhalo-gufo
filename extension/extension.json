@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "name": "inkling2_native",
+  "version": "0.0.1",
+  "api_version": ">= 0.3.0",
+  "entry": "inkling2_native_register",
+  "registration_target": "gufo_inkling2_native",
+  "depends": [],
+  "platforms": [
+    "linux"
+  ],
+  "providers": [
+    {
+      "id": "inkling2-mini-native",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:inkling2_loop"
+      ],
+      "model_ids": [
+        "inkling-2-mini"
+      ],
+      "target": "gufo_inkling2_native",
+      "entry": "inkling2_native_provider_register"
+    }
+  ],
+  "options": [],
+  "targets": {
+    "gufo_inkling2_native": {
+      "requires": []
+    }
+  },
+  "licenses": [
+    "LICENSE"
+  ]
+}

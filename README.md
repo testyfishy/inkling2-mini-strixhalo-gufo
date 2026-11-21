@@ -40,7 +40,9 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [x] Baseline: llama.cpp Vulkan and HIP builds and benchmarks on the target machine
 - [x] Native-precision GGUF identified (mainline `inkling2_loop` layout, NVFP4 experts kept as-is)
 - [x] Extension build loop proven: `gufo extension install <dir>` builds and loads a module in seconds
-- [ ] M1: probe and loader — accept only Inkling 2 Mini `inkling2_loop` files, map all tensors
+- [x] M1: probe and loader — GUFO routes Inkling 2 Mini `inkling2_loop` files to this extension,
+      which validates the hyperparameters and every tensor shape (`gufo prompt` reports the
+      inventory and then says the runner is missing)
 - [ ] M2: tokenizer and chat template, checked against the reference
 - [ ] M3: single-token forward pass on HIP, logits compared with llama.cpp on the same file
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
@@ -52,7 +54,23 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 
 - `docs/` — benchmarks and notes
 - `scripts/` — reproducible builds of the llama.cpp baselines and the benchmark run
-- `extension/` — the GUFO extension (not started)
+- `extension/` — the GUFO extension (probe and loader so far; no GPU code)
+
+## Building the extension
+
+GUFO's runtime image carries the extension SDK, so the extension builds as a loadable module:
+
+```sh
+podman volume create inkling-gufo-ext
+podman run --rm --userns=keep-id:uid=1000,gid=1000 --security-opt label=disable \
+  -v inkling-gufo-ext:/home/gufo/.local/share/gufo/extensions \
+  -v "$PWD/extension":/src/extension:ro \
+  ghcr.io/gufo-org/toolboxes/gufo-runtime:edge \
+  gufo extension install /src/extension --yes
+```
+
+`--yes` skips GUFO's prompt about building code its maintainers have not reviewed; read the
+source first.
 
 ## Related work
 
