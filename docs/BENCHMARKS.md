@@ -418,6 +418,57 @@ Generation on this build: 24.7 tokens/s for one session, 65.0 in total for 8 ses
 Memory: the FP16 copies of the full-attention caches add about 33 KB per token per session to
 the 65 KB of the F32 caches, which single-row steps still read.
 
+## FP16 cache for generation, real text at depth, and how dense attention is, 2026-11-21
+
+Generation for one session, tokens/s (context faked beyond the prompt):
+
+| Context | F32 cache | FP16 cache |
+|---|---:|---:|
+| short | 24.7 | 25.0 |
+| 4,000 | 21.3 | 23.7 |
+| 16,000 | 19.6 | 22.8 |
+| 100,000 | 13.3 | 15.4 |
+
+At 100,000 tokens attention is 25 ms of a 65 ms step (35 before). It reads 3.3 GB per token
+there, which the memory could deliver in about 17 ms, so the kernel is not at the limit yet.
+
+Real text at depth, for the first time: a 102,400-token prompt of wikitext at 256 rows per
+step takes 307 s (334 tokens/s on average from an empty context to 100K), and generation
+after it runs at 15.8 tokens/s.
+
+### What sets the speed at depth
+
+Each generated token reads every earlier position's keys and values in the 8 full-attention
+layer visits: 33 KB per token of context in FP16. That is 3.3 GB per generated token at
+100,000 tokens and 33 GB at 1,000,000, on a machine that moves about 190 GB/s. No kernel
+changes that; only reading less does.
+
+GUFO's own numbers show the same for a dense model. Its published table for Qwen 27B on this
+machine goes from 649 to 260 tokens/s for prompts and from 12.4 to 8.5 for generation between
+an empty context and 131,072 tokens. The model that stays flat there, Flash-Next, was trained
+with an index that picks 2,048 tokens to attend to; Inkling 2 Mini has nothing of the kind.
+
+### Is the attention sparse enough to skip most of the cache? No
+
+`INKLING2_ATTN_STATS` computes, for the last row of a step, the exact attention weights of
+all 24 query heads in the 8 full-attention visits (192 heads) and asks how few positions hold
+nearly all of the weight. On the wikitext prompt:
+
+| Context | Positions holding all but 1e-3 of the weight | All but 1e-4 | Slices of 64 positions, all but 1e-3 | All but 1e-4 |
+|---:|---:|---:|---:|---:|
+| 16,384 | 45% (median 42%) | 65% (72%) | 74% (82%) | 89% (96%) |
+| 32,768 | 35% (32%) | 54% (56%) | 60% (64%) | 76% (84%) |
+| 65,536 | 44% (46%) | 62% (71%) | 66% (79%) | 82% (94%) |
+| 98,304 | 42% (49%) | 61% (74%) | 65% (81%) | 81% (94%) |
+
+(Mean over the 192 heads, median in brackets.) On average 34% to 70% of the weight is on the
+last 1,024 positions, and the rest is spread thinly over the whole context: a typical head
+needs most of the 64-position slices to stay within one part in ten thousand. Skipping the
+values of positions that get no weight, or screening keys coarsely first, would therefore save
+a fifth of the reads at best while changing the result more than anything done so far. Those
+two ideas are dropped. This is one kind of text and one row per depth; code or dialogue may
+be more concentrated and can be measured the same way.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

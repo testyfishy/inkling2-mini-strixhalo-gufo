@@ -74,9 +74,15 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       and FP16 copies of the cache. Prompt processing at 256 rows per step: 573 tokens/s at
       short context, 523 / 470 / 273 at 4K / 16K / 100K tokens of context (was 258 / 126 / 31).
       Quality in the harness: KLD 0.0021 at 512 tokens, 0.0016 at 4,096 (0.0014 before)
-- [ ] M4b4: prompt processing at 100K still loses half its speed to the full-attention kernel,
-      and single-session generation at depth (13 tokens/s at 100K) still reads the F32 cache
-      row by row
+- [x] M4b4: the key/value cache is FP16 only (33 KB per token of context instead of 98) and
+      generation reads it: 23.7 / 22.8 / 15.4 tokens/s at 4K / 16K / 100K (was 21.3 / 19.6 /
+      13.3). First run on real text at depth: a 102,400-token prompt at 334 tokens/s on
+      average, generation after it at 15.8
+- [ ] M4b5: speed at depth is set by the 33 KB every generated token reads per token of
+      context; the attention weights were measured and are too spread out to skip any of it
+      (docs/BENCHMARKS.md). What is left: a single-pass generation kernel at the memory's rate,
+      drafts verified several per read, drafts copied from the context, and saved contexts so
+      that no prefix is processed twice
 - [ ] M4c: speculative decoding with the model's DSpark drafter. Done so far: tentative steps
       in the engine, and a CPU prototype of the drafter whose acceptance matches llama.cpp's
       (2.0 to 4.4 tokens per step depending on the text; [docs/DSPARK.md](docs/DSPARK.md)).

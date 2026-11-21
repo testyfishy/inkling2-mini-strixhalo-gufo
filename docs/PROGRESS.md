@@ -30,6 +30,7 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 16 | `8adc66c` | Matrix-instruction kernels (16x16x16 FP16, FP32 sums) for the projections in steps of 2+ rows and for the experts in steps of 16+ rows, staged through shared memory | 24.8 (single-row steps are unchanged) | 482 at 256 rows per step, 553 at 512 (was 145); at depth 258 / 126 / 31 at 4K / 16K / 100K (was 115 / 78 / 27) | 63.4 (was 56.2) | same greedy tokens; PPL 7.796 vs 7.778, KLD 0.0021, top token 97.99% (the previous kernels on the same run: 7.817, 0.0020, 98.24%); 4,096-token context at 256 rows per step: PPL 7.477 vs 7.483, KLD 0.0014, top token 98.19% |
 | 17 | `d34635c` | Full attention for several rows of a session at once: one block per (32 rows, key head, 1,024 positions) reads FP16 keys and values once and multiplies with the matrix instruction | not re-measured (single-row steps keep their kernels) | 485 short; at depth 326 / 301 / 206 at 4K / 16K / 100K (was 258 / 126 / 31) | not re-measured (steps of one row per session keep the per-row kernel) | attention output against the per-row kernel on the same steps: relative difference 2e-4 to 3e-4 at 4K real text and at 100K faked; 4,096-token context: PPL 7.481 vs 7.483, KLD 0.0016, top token 97.90% |
 | 18 | `72f32b9` | The sliding-window layers through the same kernel | 24.7 | 573 at 256 rows per step, 680 at 512 (was 485, 553); at depth 523 / 470 / 273 at 4K / 16K / 100K | 65.0 | relative difference 2e-4 on all 48 visits; 512-token context: PPL 7.798 vs 7.778, KLD 0.0021, top token 98.09%; 4,096-token context: PPL 7.465 vs 7.483, KLD 0.0016, top token 98.09% (per-row attention on the same build: 7.477, 0.0014, 98.19%) |
+| 19 | `d30bca9` | The key/value cache is FP16 only; steps of few rows read it with a per-row kernel (F32 queries, weights and sums) | 25.0 short; 23.7 / 22.8 / 15.4 at 4K / 16K / 100K faked (was 21.3 / 19.6 / 13.3); 15.8 after 102,400 tokens of real text | unchanged at depth (275 at 100K faked); a real 102,400-token prompt averages 334 | 67.7 | attention output against the F32 kernels: relative difference 2e-4; same greedy tokens as the F32 kernels on the test prompt (96 tokens); 4,096-token context with the per-row kernel on every step: PPL 7.484 vs 7.483, KLD 0.0015, top token 98.09% |
 
 Notes on reading this table:
 
@@ -62,3 +63,8 @@ Notes on reading this table:
   rows (batched kernel faster) were measured.
 - The depth numbers still come from a faked context (the caches are filled by repetition). With
   real text the batched kernels are checked up to 4,096 tokens.
+- Step 19 removes the F32 key/value caches: 33 KB per token of context per session instead of
+  98 (3.3 GB instead of 9.8 at 100,000 tokens). `INKLING2_F32_CACHE=1` keeps them, which the
+  F32 attention kernels and `INKLING2_ATTN_AB=1` need. From this step the faked context
+  repeats the first 1,024 positions of both keys and values (before, values repeated the
+  prompt), and the first run on real text at depth exists: 102,400 tokens of wikitext.

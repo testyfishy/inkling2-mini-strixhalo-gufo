@@ -104,6 +104,16 @@ the largest single difference 0.006 where the largest value is 10, on 4,096 toke
 text (steps of 250 rows, so groups of 32 and of 26 rows), on steps of 40 rows at 100,000
 tokens of faked context, and on three sessions in one step. Nothing was non-finite.
 
+## FP16 key/value cache (the only cache from PROGRESS.md step 19)
+
+Steps of few rows (generation) read the FP16 cache with F32 queries, weights and sums. To
+score that kernel, the 4,096-token chunk was run with it on every step
+(`INKLING2_WMMA_ATTN_MIN_ROWS=0`, 256 rows per step): perplexity 7.4837 against llama.cpp's
+7.4828, mean KLD 0.001507, median / 99% 0.000627 / 0.0156, same top token 98.09% (F32 cache:
+0.001419, 98.19%; batched FP16 kernel: 0.001573, 98.09%). Its attention output differs from
+the F32 kernels' by 2e-4 of its size, and greedy generation of 96 tokens after a 512-token
+prompt gives the same tokens with either cache.
+
 ## Longer context
 
 One chunk of 4,096 tokens, 2,047 scored positions (2,048 to 4,095), 64 rows per step. This
