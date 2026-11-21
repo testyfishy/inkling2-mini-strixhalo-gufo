@@ -336,13 +336,15 @@ struct GpuEngine::Impl {
     Check(hipMemset(wf, 0, std::size_t(rows) * cols * 4), "fill");
     Check(hipMemset(xf, 0, std::size_t(cols) * gpu::kGemmGroup * 4), "fill");
     for (const int rows_in_batch : {1, 4, 16}) {
-      for (int kind = 0; kind < 2; ++kind) {
+      for (int kind = 0; kind < 3; ++kind) {
         const int repeats = 20;
         Check(hipStreamSynchronize(stream), "synchronize");
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < repeats; ++i) {
           if (kind == 0)
             gpu::Dot4Bench(w8, x8, rows, words, rows_in_batch, y8, stream);
+          else if (kind == 2)
+            gpu::Dot2Bench(w8, x8, rows, words, rows_in_batch, yf, stream);
           else
             gpu::FloatBench(wf, xf, rows, cols, rows_in_batch, yf, stream);
         }
@@ -350,12 +352,17 @@ struct GpuEngine::Impl {
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
-        const double macs = double(rows) * cols * rows_in_batch * repeats;
-        const double bytes = double(rows) * cols * (kind == 0 ? 1 : 4) * repeats;
+        // The integer and BF16 runs read `words` 32-bit words per row: four
+        // 8-bit values or two BF16 values each.
+        const double per_row = kind == 0 ? cols : kind == 2 ? words * 2.0 : cols;
+        const double macs = per_row * rows * rows_in_batch * repeats;
+        const double bytes =
+            double(rows) * (kind == 1 ? cols * 4.0 : words * 4.0) * repeats;
         std::fprintf(stderr,
                      "dot bench: %-5s %2d row(s): %7.1f G multiply-adds/s, "
                      "%6.1f GB/s of weights\n",
-                     kind == 0 ? "int8" : "f32", rows_in_batch,
+                     kind == 0 ? "int8" : kind == 2 ? "bf16" : "f32",
+                     rows_in_batch,
                      macs / seconds / 1e9, bytes / seconds / 1e9);
       }
     }

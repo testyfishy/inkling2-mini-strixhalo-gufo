@@ -238,6 +238,8 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
     // Prompt: each session in turn, `prompt_batch` rows per step.
     std::vector<std::uint32_t> next(sessions);
     std::vector<float> first_logits;
+    const bool profile_prompt = std::getenv("INKLING2_PROFILE_PROMPT") != nullptr;
+    engine.SetProfile(profile_prompt);
     const auto start = std::chrono::steady_clock::now();
     for (int s = 0; s < sessions; ++s) {
       for (std::size_t i = 0; i < n; i += prompt_batch) {
@@ -260,6 +262,14 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                 "%d row(s) per step)\n",
                 n, sessions, seconds, n * sessions / seconds, prompt_batch);
 
+    if (profile_prompt) {
+      const double steps = std::ceil(double(n) / prompt_batch) * sessions;
+      for (const auto& [name, phase_seconds] : engine.phases())
+        std::printf("  %-34s %8.3f ms per prompt step", name.c_str(),
+                    phase_seconds / steps * 1e3),
+            std::printf("%c", 10);
+      engine.SetProfile(false);
+    }
     std::vector<std::uint32_t> order(first_logits.size());
     for (std::uint32_t i = 0; i < order.size(); ++i)
       order[i] = i;

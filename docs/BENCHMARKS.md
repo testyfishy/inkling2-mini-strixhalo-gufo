@@ -230,6 +230,33 @@ which is what llama.cpp's fast path does; the weights would stay exact (NVFP4 va
 integers times a scale). That is not built; it is the next candidate for prompt speed and would
 be judged by the quality harness.
 
+### BF16 expert layers, and a second instruction
+
+The four BF16 expert layers (20 to 23) got the same expert-major treatment. In a 64-row prompt
+step they drop from 152 ms to 28 ms, with identical logits.
+
+| | Before | After |
+|---|---:|---:|
+| 448-token prompt, 64 rows per step | 90 t/s | 109 t/s |
+| 8 sessions on real text, total | 46.5 t/s | 49.0 t/s |
+
+Where a 64-row prompt step goes now (about 590 ms, 9.2 ms per token):
+
+| Kernel group | ms per step |
+|---|---:|
+| NVFP4 experts | 271 |
+| Input projections | 143 |
+| Attention (context up to 448) | 65 |
+| Output projection | 49 |
+| BF16 experts | 28 |
+| Glue | about 30 |
+
+The GPU's two-way BF16 dot-product instruction (`v_dot2_f32_bf16`, which reads two BF16
+weights per instruction) was benchmarked for the projections: 564 billion multiply-adds per
+second at 16 rows against 420 for the F32 kernel, about 1.3 times. That is not enough to
+justify rounding activations to BF16, so it is not used. The 8-bit integer instruction
+(2.7 times) remains the candidate, for the NVFP4 experts.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

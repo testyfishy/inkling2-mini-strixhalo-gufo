@@ -234,7 +234,7 @@ struct BatchExpertArgs {
   int batch;
   // 0: a block per (row, output value); 1: a thread per output value;
   // 2: expert-major, where each expert's weights are decoded once and applied
-  //    to every row that selected it (NVFP4 only; BF16 uses 0).
+  //    to every row that selected it.
   int variant;
   // Expert-major scratch: for each expert, the (row * kTopK + slot) pairs that
   // selected it (group_list, max_batch entries per expert) and how many
@@ -288,6 +288,10 @@ void Copy(const CopyArgs& args, hipStream_t stream);
 /// of four values per row, kGemmGroup rows per column).
 void Dot4Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
                int words, int batch, int* y, hipStream_t stream);
+/// The same with BF16 pairs: each 32-bit word of w and of xt holds two BF16
+/// values, multiplied and accumulated by one instruction.
+void Dot2Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
+               int words, int batch, float* y, hipStream_t stream);
 /// The same shape in F32: y[r][b] = sum of w[r][c] * x[b][c].
 void FloatBench(const float* w, const float* xt, int rows, int cols, int batch,
                 float* y, hipStream_t stream);
