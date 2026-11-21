@@ -32,6 +32,7 @@
 #include "decoder.hpp"
 #include "model.hpp"
 #include "tokenizer.hpp"
+#include "tools.hpp"
 
 namespace inkling2 {
 namespace {
@@ -742,11 +743,21 @@ bool Adapter::Invalidate(cache::Slot& slot) noexcept {
 // ---- The runner -------------------------------------------------------------
 
 // What the model is writing, read off its control tokens. The server sees
-// reasoning as <think>...</think> and the answer as plain text.
-enum class Output { kNone, kThinking, kText, kOther };
+// reasoning as <think>...</think>, a tool call as <tool_call>...</tool_call>
+// and the answer as plain text. kHeader is between <|message_model|> and the
+// content type: only a name can stand there (the tool's, repeated inside the
+// call), and it is not shown.
+enum class Output { kNone, kHeader, kThinking, kText, kTool, kOther };
+struct Framing {
+  Output mode{Output::kNone};
+  // An answer message was already written in this response. The model may
+  // write several; they are shown as paragraphs.
+  bool text_before{false};
+};
 
 struct ControlIds {
-  std::uint32_t message_model, content_thinking, content_text, end_message;
+  std::uint32_t message_model, content_thinking, content_text, end_message,
+      invoke_tool;
 };
 
 using Lookup = gufo::speculative::PromptLookup<std::uint32_t>;
@@ -764,18 +775,21 @@ public:
     (void)adapter_->Invalidate(*slot_);
     tokens.clear();
     lookup.Clear();
-    output = Output::kNone;
+    output = {};
   }
   [[nodiscard]] Adapter::State& slot() const { return *slot_; }
   [[nodiscard]] std::uint32_t session() const { return slot_->session; }
 
   // The tokens of the context, as far as the runner has seen them.
   std::vector<std::uint32_t> tokens;
-  Output output{Output::kNone};
+  Framing output;
   // Drafts copied from the context: GUFO's index of the session's tokens,
   // and how many drafts the next verification step may carry.
   Lookup lookup;
   std::size_t draft_budget{kFirstDrafts};
+  // The context declares tools and switches thinking off: the token that
+  // opens a thinking block is not sampled (see Runner::Render).
+  bool no_thinking{false};
 
 private:
   Adapter* adapter_;
@@ -811,11 +825,24 @@ public:
         max_batch_(static_cast<std::uint32_t>(
             std::clamp(EnvInt("INKLING2_SERVE_BATCH", 2048), 16, 4096))),
         lookup_(EnvInt("INKLING2_SERVE_LOOKUP", 1) != 0),
+        lookup_min_(static_cast<std::size_t>(std::clamp(
+            EnvInt("INKLING2_SERVE_LOOKUP_MIN",
+                   static_cast<int>(Lookup::kMinMatch)),
+            static_cast<int>(Lookup::kKeyTokens),
+            static_cast<int>(Lookup::kMaxMatch)))),
         artifact_fingerprint_(std::move(artifact_fingerprint)),
         ids_{tokenizer_.RequireControl("<|message_model|>"),
              tokenizer_.RequireControl("<|content_thinking|>"),
              tokenizer_.RequireControl("<|content_text|>"),
-             tokenizer_.RequireControl("<|end_message|>")} {
+             tokenizer_.RequireControl("<|end_message|>"),
+             tokenizer_.RequireControl("<|content_invoke_tool_json|>")} {
+    effort_zero_ = {tokenizer_.RequireControl("<|message_system|>"),
+                    ids_.content_text};
+    tokenizer_.Encode("Thinking effort level: 0", &effort_zero_);
+    effort_zero_.push_back(ids_.end_message);
+    tool_declare_ = {tokenizer_.RequireControl("<|message_system|>")};
+    tokenizer_.Encode("tool_declare", &tool_declare_);
+    tool_declare_.push_back(tokenizer_.RequireControl("<|content_xml|>"));
     if (tokenizer_.size() != config_.n_vocab)
       throw std::runtime_error(
           "inkling2: the vocabulary and the output head differ in size");
@@ -871,14 +898,21 @@ public:
   BuildConstraintVocabulary() const override {
     return std::make_shared<const sampling::ConstraintVocabulary>(
         tokenizer_.size(), [this](std::uint32_t id) {
+          // What a grammar reads for each token. Control tokens are empty,
+          // so a grammar never forbids the model's own framing, except the
+          // one that opens a tool call.
           return sampling::ConstraintVocabulary::Piece{
-              tokenizer_.IsControl(id) ? std::string{}
-                                       : std::string(tokenizer_.Bytes(id)),
+              id == ids_.invoke_tool    ? std::string(kToolBlockOpen)
+              : tokenizer_.IsControl(id) ? std::string{}
+                                         : std::string(tokenizer_.Bytes(id)),
               id == tokenizer_.eos()};
         });
   }
   [[nodiscard]] std::uint32_t VocabularySize() const override {
     return tokenizer_.size();
+  }
+  [[nodiscard]] std::string ToolDialectId() const override {
+    return std::string(kToolDialectId);
   }
 
   // The reasoning budget works on tokens; the server's parsers on the text
@@ -910,13 +944,14 @@ public:
     return Render(request).text;
   }
 
-  // With thinking off the prompt ends in the header of the answer (see
-  // Render); that header is this request's own and not part of what a later
-  // turn continues from.
+  // An answer the prompt opened (thinking off, no tools) is this request's
+  // own framing, not part of what a later turn continues from.
   [[nodiscard]] std::optional<ext::TextPreparedPrompt> PreparePrompt(
       const ext::ChatRequest& request) const override {
     auto prepared = ext::TextModelRunner::PreparePrompt(request);
-    if (prepared && ThinkingOff(request) && prepared->tokens.size() > 2)
+    if (prepared && prepared->tokens.size() > 2 &&
+        prepared->tokens.back() == ids_.content_text &&
+        prepared->tokens[prepared->tokens.size() - 2] == ids_.message_model)
       prepared->cache_prefix_tokens = prepared->tokens.size() - 2;
     return prepared;
   }
@@ -930,7 +965,7 @@ public:
   [[nodiscard]] std::string Decode(
       std::span<const ext::TextRunnerToken> tokens) const override {
     std::string text;
-    Output output = Output::kNone;
+    Framing output;
     for (const ext::TextRunnerToken token : tokens)
       text += Piece(token, &output);
     return text;
@@ -975,7 +1010,8 @@ public:
     if (s.tokens.size() > position)
       s.tokens.resize(position);
     s.lookup.Clear();
-    s.output = Output::kNone;
+    s.no_thinking = false;
+    s.output = {};
   }
   [[nodiscard]] bool HasDecodeFrontier(
       const ext::TextRunnerState& state) const override {
@@ -989,6 +1025,9 @@ public:
       throw std::logic_error("inkling2: reused prefix does not match");
     s.tokens.assign(prefix.begin(), prefix.end());
     s.output = OutputAfter(prefix);
+    s.no_thinking = NoThinking(prefix);
+    if (s.slot().has_logits)
+      Mask(s, s.slot().logits.data());
     s.lookup.BeginRequest();
     s.draft_budget = kFirstDrafts;
   }
@@ -1021,6 +1060,7 @@ public:
     s.slot().has_logits = false;
     engine_->Step(rows,
                   final ? GpuEngine::Head::kLast : GpuEngine::Head::kNone);
+    s.no_thinking = NoThinking(prompt.first(end));
     if (final)
       KeepLogits(&s);
     s.tokens.assign(prompt.begin(), prompt.begin() + end);
@@ -1041,7 +1081,7 @@ public:
     const std::span<const float> logits(s.slot().logits);
     const std::uint32_t token = sampler.Sample(logits);
     const bool stop = s.stop_at_eos() && token == tokenizer_.eos();
-    Output output = s.output;
+    Framing output = s.output;
     return {.stop = stop,
             .token = token,
             .piece = stop ? std::string{} : Piece(token, &output),
@@ -1099,7 +1139,7 @@ public:
     const std::uint32_t tail[1] = {anchor};
     const auto match = s.lookup.Find(
         s.tokens, tail,
-        sampled ? Lookup::kSampledMinMatch : Lookup::kMinMatch);
+        sampled ? std::min(2 * lookup_min_, Lookup::kMaxMatch) : lookup_min_);
     std::size_t drafts = 0;
     if (match.length != 0 && match.start < s.lookup.IndexedTokens())
       drafts = std::min<std::size_t>(
@@ -1124,7 +1164,8 @@ public:
     (void)Piece(anchor, &s.output);
     std::size_t kept = 0;
     for (; kept < drafts; ++kept) {
-      const std::vector<float> logits = engine_->capped_logits(kept);
+      std::vector<float> logits = engine_->capped_logits(kept);
+      Mask(s, logits.data());
       const std::uint32_t token =
           sampler.Sample(std::span<const float>(logits.data(), tokenizer_.size()));
       if (token != rows[kept + 1].token) {
@@ -1145,6 +1186,7 @@ public:
       const std::vector<float> logits = engine_->capped_logits(kept);
       std::copy(logits.begin(), logits.begin() + tokenizer_.size(),
                 s.slot().logits.begin());
+      Mask(s, s.slot().logits.data());
       s.slot().has_logits = true;
     }
     s.lookup.Observe(match.start, drafts, kept);
@@ -1166,34 +1208,45 @@ private:
     const std::vector<float> capped = engine_->capped_logits(0);
     std::copy(capped.begin(), capped.begin() + tokenizer_.size(),
               s->slot().logits.begin());
+    Mask(*s, s->slot().logits.data());
     s->slot().has_logits = true;
   }
 
   // The text the server sees for a token, and what the model is writing
   // after it.
-  [[nodiscard]] std::string Piece(std::uint32_t token, Output* output) const {
+  [[nodiscard]] std::string Piece(std::uint32_t token, Framing* output) const {
     if (!tokenizer_.IsControl(token))
-      return std::string(tokenizer_.Bytes(token));
+      return output->mode == Output::kHeader
+                 ? std::string{}
+                 : std::string(tokenizer_.Bytes(token));
     if (token == ids_.message_model) {
-      *output = Output::kNone;
+      output->mode = Output::kHeader;
       return {};
     }
+    if (token == ids_.invoke_tool) {
+      output->mode = Output::kTool;
+      return std::string(kToolBlockOpen);
+    }
     if (token == ids_.content_thinking) {
-      *output = Output::kThinking;
+      output->mode = Output::kThinking;
       return "<think>";
     }
     if (token == ids_.content_text) {
-      *output = Output::kText;
-      return {};
+      output->mode = Output::kText;
+      const bool again = output->text_before;
+      output->text_before = true;
+      return again ? "\n\n" : std::string{};
     }
     if (token == ids_.end_message) {
-      const bool thinking = *output == Output::kThinking;
-      *output = Output::kNone;
-      return thinking ? "</think>" : std::string{};
+      const Output was = output->mode;
+      output->mode = Output::kNone;
+      return was == Output::kThinking ? "</think>"
+             : was == Output::kTool   ? std::string(kToolBlockClose)
+                                      : std::string{};
     }
     if (token == tokenizer_.eos())
       return {};
-    *output = Output::kOther;
+    output->mode = Output::kOther;
     return std::string(tokenizer_.Bytes(token));
   }
 
@@ -1266,10 +1319,16 @@ private:
       }
     }
     RenderedChat chat = RenderChat(tokenizer_, messages, tools, options);
-    // The model may still open a thinking block at effort 0. With thinking
-    // switched off the prompt therefore opens the answer itself, which is
-    // what the model would write next when it does not think.
-    if (ThinkingOff(request)) {
+    // Thinking off. The template writes "Thinking effort level: 0" for it,
+    // and the model may still open a thinking block. Two measures, each for
+    // the case where it was seen to work:
+    //  - Without tools, the prompt opens the answer itself, so the model
+    //    continues with the answer.
+    //  - With tools, the model must stay free to start with a call, so the
+    //    prompt is left alone and only the token that opens a thinking block
+    //    is taken out before sampling (NoThinking). Used without tools, that
+    //    made the model write its deliberation into the answer.
+    if (ThinkingOff(request) && tools.empty()) {
       chat.tokens.push_back(ids_.message_model);
       chat.tokens.push_back(ids_.content_text);
       chat.text += "<|message_model|><|content_text|>";
@@ -1277,20 +1336,38 @@ private:
     return chat;
   }
 
+  [[nodiscard]] static bool Declares(
+      std::span<const ext::TextRunnerToken> tokens,
+      const std::vector<std::uint32_t>& line) {
+    return std::search(tokens.begin(), tokens.end(), line.begin(),
+                       line.end()) != tokens.end();
+  }
+  // The context declares tools and switches thinking off.
+  [[nodiscard]] bool NoThinking(
+      std::span<const ext::TextRunnerToken> tokens) const {
+    return Declares(tokens, effort_zero_) && Declares(tokens, tool_declare_);
+  }
+  void Mask(const State& s, float* logits) const {
+    if (s.no_thinking)
+      logits[ids_.content_thinking] = -1e30F;
+  }
+
   [[nodiscard]] static bool ThinkingOff(const ext::ChatRequest& request) {
     return request.reasoning.enabled.has_value() && !*request.reasoning.enabled;
   }
 
   // What the model is writing when the context ends in `tokens`.
-  [[nodiscard]] Output OutputAfter(
+  [[nodiscard]] Framing OutputAfter(
       std::span<const ext::TextRunnerToken> tokens) const {
     if (tokens.empty())
-      return Output::kNone;
+      return {};
     if (tokens.back() == ids_.content_text)
-      return Output::kText;
+      return {Output::kText, true};
     if (tokens.back() == ids_.content_thinking)
-      return Output::kThinking;
-    return Output::kNone;
+      return {Output::kThinking, false};
+    if (tokens.back() == ids_.message_model)
+      return {Output::kHeader, false};
+    return {};
   }
 
   [[nodiscard]] cache::Identity Identity() const {
@@ -1322,8 +1399,12 @@ private:
   std::size_t sessions_;
   std::uint32_t max_batch_;
   bool lookup_;
+  // Tokens of the output that must repeat an earlier passage before a copy
+  // is drafted from it (greedy requests; sampled ones need twice as many).
+  std::size_t lookup_min_;
   std::string artifact_fingerprint_;
   ControlIds ids_;
+  std::vector<std::uint32_t> effort_zero_, tool_declare_;
   mutable std::shared_ptr<GpuEngine> engine_;
 };
 

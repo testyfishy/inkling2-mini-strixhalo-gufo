@@ -9,6 +9,7 @@ gufo_extension_target(
     src/model.cpp
     src/reference.cpp
     src/tokenizer.cpp
+    src/tools.cpp
     src/extension.cpp
   LINK_LIBRARIES
     gufo_ext_runtime

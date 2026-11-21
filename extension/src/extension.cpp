@@ -1,7 +1,10 @@
 #include <gufo/ext/registry.hpp>
 
-// The provider registers itself from the HIP target (provider.cpp); builds
-// without HIP have nothing to add yet.
+#include "tools.hpp"
+
+// The provider registers itself from the HIP target (provider.cpp); what
+// needs no GPU is registered here: the syntax of the model's tool calls.
 void inkling2_native_register(gufo::ext::Registry& registry) {
   (void)registry;
+  inkling2::RegisterToolDialect();
 }
