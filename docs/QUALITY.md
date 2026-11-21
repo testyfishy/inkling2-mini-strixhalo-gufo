@@ -65,6 +65,16 @@ llama.cpp reference:
 | FP16 projections and experts, 16 rows per step | 7.7899 | 0.002158 | 0.000775 / 0.0214 | 98.14% |
 | FP16 projections and experts, 64 rows per step | 7.7958 | 0.002137 | 0.000771 / 0.0214 | 97.99% |
 
+The "before" row is not identical to the 8-bit result further up (7.799, 97.99%), which was
+measured before the single-row and attention kernels changed (PROGRESS.md steps 11 to 13); it
+was rerun here so that all four rows come from the same build apart from the switches.
+
+With 4,096 tokens of context and 256 rows per step (one chunk, 4,095 scored positions), the
+new kernels give perplexity 7.4767 against llama.cpp's 7.4828, mean KLD 0.001419, median / 99%
+KLD 0.000628 / 0.0131, same top token 98.19% (the previous kernels at 16 rows per step: 7.496,
+0.0017, 97.56%). That run crosses the sliding window and the 1,024-position cache chunks with
+real text.
+
 All four sit in the same band around llama.cpp (mean KLD 0.0020 to 0.0022). The differences
 between them are within what this measurement can resolve: a percent of the 4,096 scored
 positions is 41 tokens, and the top-token rate moves by that much between any two arithmetic

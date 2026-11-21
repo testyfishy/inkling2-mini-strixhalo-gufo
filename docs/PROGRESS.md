@@ -27,7 +27,7 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 13 | `f92929d` | Attention over long contexts: chunked kernel, full-attention cache laid out per head | 25.0 short; 21.3 / 19.6 / 16.4 / 13.3 at 4K / 16K / 50K / 100K (was 2.0 at 100K) | 145 short; 115 / 78 / 27 at 4K / 16K / 100K | | 4,096-token context vs llama.cpp: PPL 7.496 vs 7.483, KLD 0.0017, top token 97.56% |
 | 14 | `da803a4` | Tentative steps: a run of rows can be computed, then only its first rows kept (groundwork for speculative decoding; no drafter yet) | 24.8 plain; with drafts supplied and no drafter cost: 44.0 (3 correct drafts per step), 66.6 (7), 36.7 (3, a third of blocks wrong) | | | verified output equals plain generation, including after rejected drafts (on the short test prompt of that step; step 15 found a prose prompt where the integer kernels of 8-row and single-row steps disagree) |
 | 15 | `1aeb4a0` | DSpark drafter, host prototype: the engine exports the four hidden states it reads; drafts are verified in one tentative step | plain 24.5. Tokens per step with 7 drafts: 4.38 and 2.46 on two coding chat prompts (llama.cpp's own drafter: 4.39 and 2.58), 2.0 to 2.5 on encyclopedia prose (llama.cpp: 2.1 to 2.2). Not a speed result yet: the drafter runs on the CPU | | | drafted output equals plain generation on both coding prompts; on prose only with float experts or the per-row integer kernel (see DSPARK.md) |
-| 16 | `8adc66c` | Matrix-instruction kernels (16x16x16 FP16, FP32 sums) for the projections in steps of 2+ rows and for the experts in steps of 16+ rows, staged through shared memory | 24.8 (single-row steps are unchanged) | 482 at 256 rows per step, 553 at 512 (was 145); at depth 258 / 126 / 31 at 4K / 16K / 100K (was 115 / 78 / 27) | 63.4 (was 56.2) | same greedy tokens; PPL 7.796 vs 7.778, KLD 0.0021, top token 97.99% (the previous kernels on the same run: 7.817, 0.0020, 98.24%) |
+| 16 | `8adc66c` | Matrix-instruction kernels (16x16x16 FP16, FP32 sums) for the projections in steps of 2+ rows and for the experts in steps of 16+ rows, staged through shared memory | 24.8 (single-row steps are unchanged) | 482 at 256 rows per step, 553 at 512 (was 145); at depth 258 / 126 / 31 at 4K / 16K / 100K (was 115 / 78 / 27) | 63.4 (was 56.2) | same greedy tokens; PPL 7.796 vs 7.778, KLD 0.0021, top token 97.99% (the previous kernels on the same run: 7.817, 0.0020, 98.24%); 4,096-token context at 256 rows per step: PPL 7.477 vs 7.483, KLD 0.0014, top token 98.19% |
 
 Notes on reading this table:
 
@@ -46,4 +46,6 @@ Notes on reading this table:
   representable in FP16, except BF16 values below about 1e-5 in magnitude (227,565 of 1.1
   billion projection weights), which are rounded with an absolute error below 3e-8.
   `INKLING2_WMMA_MIN_BATCH=0` and `INKLING2_WMMA_EXPERT_MIN_BATCH=0` restore the previous
-  kernels. Single-row steps (plain generation) still use the earlier kernels.
+  kernels. Single-row steps (plain generation) still use the earlier kernels, so this step did
+  not change generation speed for one session; a step that verifies 7 drafts went from about
+  131 to 118 ms. The FP16 copies of the projection weights take about 2.2 GB more on the device.

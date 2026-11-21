@@ -160,3 +160,11 @@ What this says:
 - All of this is at short context (at most about 300 tokens). At the 100K+ contexts this
   project is aimed at, each extra row of a verification step costs more and the drafter's
   middle layer attends over the whole history; none of that is measured yet.
+- The table above was measured before the FP16 matrix-instruction kernels (PROGRESS.md step
+  16), which changed the arithmetic of the verification steps again. With them, on the prose
+  prompt, the default settings give a drafted run equal to the plain one (29 of 140 drafts
+  kept, 2.45 tokens per step) and forcing the per-row integer expert kernel gives one that
+  differs from token 9: the opposite of before. The conclusion stands and is the general one:
+  whether a drafted run reproduces the plain run token for token depends on near-ties between
+  kernels that round differently, and is not guaranteed. A verification step of 8 rows now
+  costs about 118 ms.

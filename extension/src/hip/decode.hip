@@ -2224,17 +2224,27 @@ void Gemm(const GemmArgs& args, hipStream_t stream) {
                      : args.batch <= 32  ? 1
                      : args.batch <= 64  ? 2
                                          : 4;
-    if (wide == 0 || wide > 4) {
-      int tiles = 0;
-      for (int j = 0; j < args.count; ++j)
-        tiles += (args.jobs[j].rows + 15) / 16;
-      const dim3 grid((tiles + 7) / 8, (args.batch + 15) / 16);
-      WmmaGemmKernel<1><<<grid, 256, 0, stream>>>(args);
-      return;
-    }
     int blocks = 0;
     for (int j = 0; j < args.count; ++j)
       blocks += (args.jobs[j].rows + 127) / 128;
+    // A job of few rows makes too few staged blocks to fill the GPU; up to 64
+    // batch rows the direct kernel, with up to 4 batch tiles per wave, is
+    // faster there.
+    const bool few = args.wmma_tiles == 0 && args.batch <= 64 && blocks < 32;
+    if (wide == 0 || wide > 4 || few) {
+      int tiles = 0;
+      for (int j = 0; j < args.count; ++j)
+        tiles += (args.jobs[j].rows + 15) / 16;
+      const int wts = args.batch <= 16 ? 1 : args.batch <= 32 ? 2 : 4;
+      const dim3 grid((tiles + 7) / 8, (args.batch + 16 * wts - 1) / (16 * wts));
+      if (wts == 1)
+        WmmaGemmKernel<1><<<grid, 256, 0, stream>>>(args);
+      else if (wts == 2)
+        WmmaGemmKernel<2><<<grid, 256, 0, stream>>>(args);
+      else
+        WmmaGemmKernel<4><<<grid, 256, 0, stream>>>(args);
+      return;
+    }
     const int bn = 32 * wide;
     const dim3 grid(blocks, (args.batch + bn - 1) / bn);
     if (wide == 1)

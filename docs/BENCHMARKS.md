@@ -355,11 +355,11 @@ One step of prompt processing, per batch size (512 tokens of real text, short co
 | Rows per step | 16 before | 16 | 64 before | 64 | 256 before | 256 | 512 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Input projections | 36.1 | 12.2 | 139.8 | 12.9 | 3,831 | 33.0 | 60.7 |
-| Output projection | 15.2 | 5.5 | 49.5 | 11.0 | 1,582 | 19.9 | 20.4 |
+| Output projection | 15.2 | 5.5 | 49.5 | 6.2 | 1,582 | 19.9 | 20.4 |
 | Experts (NVFP4 + BF16) | 86.8 | 85.6 | 197.7 | 146.1 | 534.7 | 269.5 | 425.6 |
 | Attention | 8.5 | 8.0 | 28.8 | 27.0 | 109.0 | 104.5 | 208.4 |
 | Glue (mixes, norms, router, convolutions) | 12.4 | 11.5 | 30.3 | 28.0 | 107.5 | 99.5 | |
-| Prompt tokens/s | 100 | 130 | 143 | 284 | 42 | 482 | 553 |
+| Prompt tokens/s | 100 | 130 | 143 | 291 | 42 | 482 | 553 |
 
 The previous projection kernel fell apart above 64 rows; that is why prompts used to be fed 16
 rows at a time. What is left at 256 rows is the experts (about half, close to what reading
