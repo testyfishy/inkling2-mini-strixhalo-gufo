@@ -58,6 +58,14 @@ Vec LoadVec(const GgufReader& reader, const std::string& name) {
 
 }  // namespace
 
+Mat LoadMatrix(const GgufReader& reader, const std::string& name) {
+  return LoadMat(reader, name);
+}
+
+Vec LoadVector(const GgufReader& reader, const std::string& name) {
+  return LoadVec(reader, name);
+}
+
 Model LoadModel(const GgufReader& reader, const Config& config) {
   Model m;
   m.c = config;

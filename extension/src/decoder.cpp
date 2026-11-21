@@ -106,6 +106,13 @@ struct GpuEngine::Impl {
   const gpu::RowState* row_states{};
   const std::uint32_t* dev_tokens{};
   const std::int32_t* dev_heads{};
+  const std::int32_t* dev_identity{};
+  std::size_t off_identity{0};
+  // Feature capture: the residual stream entering executed visits 5, 23, 41
+  // (three blocks of max_batch rows) and the final hidden state of every row.
+  float *feat{}, *feat_final{};
+  std::vector<float> host_feat, host_feat_final;
+  int executed{0};
   int max_n{0};
 
   int batch{0};
@@ -342,13 +349,26 @@ struct GpuEngine::Impl {
 
     off_tokens = sizeof(gpu::RowState) * c.visits() * B;
     off_heads = off_tokens + 4 * B;
-    host_staging.resize(off_heads + 4 * heads_cap);
+    off_identity = off_heads + 4 * heads_cap;
+    host_staging.resize(off_identity + 4 * B);
+    for (std::size_t b = 0; b < B; ++b) {
+      const std::int32_t index = static_cast<std::int32_t>(b);
+      std::memcpy(host_staging.data() + off_identity + 4 * b, &index, 4);
+    }
+    if (opt.capture_features) {
+      feat = Floats(3 * B * kE);
+      feat_final = Floats(B * kE);
+      host_feat.resize(3 * B * kE);
+      host_feat_final.resize(B * kE);
+    }
     staging = Alloc(host_staging.size());
     row_states = static_cast<const gpu::RowState*>(staging);
     dev_tokens = reinterpret_cast<const std::uint32_t*>(
         static_cast<const std::uint8_t*>(staging) + off_tokens);
     dev_heads = reinterpret_cast<const std::int32_t*>(
         static_cast<const std::uint8_t*>(staging) + off_heads);
+    dev_identity = reinterpret_cast<const std::int32_t*>(
+        static_cast<const std::uint8_t*>(staging) + off_identity);
     if (std::getenv("INKLING2_DOTBENCH"))
       DotBench();
   }
@@ -408,6 +428,25 @@ struct GpuEngine::Impl {
       (void)hipFree(p);
     if (stream)
       (void)hipStreamDestroy(stream);
+  }
+
+  // Called before each layer visit, in execution order: keeps the residual
+  // stream entering visits 5, 23 and 41 when features are captured.
+  void Tap() {
+    const int visit = executed++;
+    if (!opt.capture_features)
+      return;
+    const int k = visit == 5 ? 0 : visit == 23 ? 1 : visit == 41 ? 2 : -1;
+    if (k < 0)
+      return;
+    gpu::CopyArgs copy{};
+    copy.dst[0] = feat + std::size_t(k) * opt.max_batch * kE;
+    copy.dst_stride[0] = kE;
+    copy.src[0] = cur;
+    copy.src_stride[0] = kE;
+    copy.count = 1;
+    copy.batch = batch;
+    gpu::Copy(copy, stream);
   }
 
   void Visit(std::uint32_t slot_index, std::uint32_t il, bool looped) {
@@ -699,6 +738,26 @@ struct GpuEngine::Impl {
     session.pos = position;
   }
 
+  std::uint32_t HeadArgmax(const float* hidden) {
+    Check(hipMemcpyAsync(final_x, hidden, kE * 4, hipMemcpyHostToDevice, stream),
+          "copy hidden");
+    gpu::GemmArgs g{};
+    const int vocab = static_cast<int>(c.n_vocab_padded);
+    g.jobs[0] = {output, final_x, kE, logits, vocab, vocab, kE};
+    g.count = 1;
+    g.batch = 1;
+    g.single_threads = head_threads;
+    gpu::Gemm(g, stream);
+    Check(hipMemcpyAsync(host_logits.data(), logits, std::size_t{c.n_vocab} * 4,
+                         hipMemcpyDeviceToHost, stream),
+          "copy logits");
+    Check(hipStreamSynchronize(stream), "synchronize");
+    n_heads = 1;
+    const float* raw = host_logits.data();
+    return static_cast<std::uint32_t>(std::max_element(raw, raw + c.n_vocab) -
+                                      raw);
+  }
+
   // Copies batch row `b`'s candidate histories into its session.
   void CommitHistory(Session& session, std::size_t b) {
     Check(hipMemcpyAsync(session.hist,
@@ -805,8 +864,11 @@ struct GpuEngine::Impl {
     gpu::Embed(e, stream);
 
     n_blocks = 0;
-    for (std::uint32_t il = 0; il < c.loop_start; ++il)
+    executed = 0;
+    for (std::uint32_t il = 0; il < c.loop_start; ++il) {
+      Tap();
       Visit(il, il, false);
+    }
     // Every pass starts from the prelude output.
     const int prelude_blocks = n_blocks;
     gpu::CopyArgs keep{};
@@ -843,11 +905,37 @@ struct GpuEngine::Impl {
       for (std::uint32_t ip = c.loop_start; ip < c.loop_end; ++ip) {
         const std::uint32_t slot =
             pass == 0 ? ip : c.n_layer + (pass - 1) * core + (ip - c.loop_start);
+        Tap();
         Visit(slot, ip, pass > 0);
       }
     }
-    for (std::uint32_t il = c.loop_end; il < c.n_layer; ++il)
+    for (std::uint32_t il = c.loop_end; il < c.n_layer; ++il) {
+      Tap();
       Visit(il, il, false);
+    }
+    if (opt.capture_features) {
+      gpu::FinalArgs f{};
+      f.stack = stack;
+      f.n_blocks = n_blocks;
+      f.cur = cur;
+      f.res_query = output_res_query;
+      f.norm = output_norm;
+      f.eps = c.norm_eps;
+      f.head_rows = dev_identity;
+      f.out = feat_final;
+      f.count = batch;
+      gpu::Final(f, stream);
+      for (int k = 0; k < 3; ++k)
+        Check(hipMemcpyAsync(host_feat.data() + std::size_t(k) * opt.max_batch * kE,
+                             feat + std::size_t(k) * opt.max_batch * kE,
+                             std::size_t(batch) * kE * 4, hipMemcpyDeviceToHost,
+                             stream),
+              "copy features");
+      Check(hipMemcpyAsync(host_feat_final.data(), feat_final,
+                           std::size_t(batch) * kE * 4, hipMemcpyDeviceToHost,
+                           stream),
+            "copy features");
+    }
 
     n_heads = 0;
     if (head != Head::kNone) {
@@ -943,6 +1031,23 @@ std::uint32_t GpuEngine::argmax(std::size_t i) const {
 
 std::uint32_t GpuEngine::position(std::uint32_t session) const {
   return impl_->sessions.at(session).pos;
+}
+
+std::vector<float> GpuEngine::features(std::size_t row) const {
+  const Impl& i = *impl_;
+  if (!i.opt.capture_features || row >= static_cast<std::size_t>(i.batch))
+    throw std::runtime_error("inkling2 gpu: no features for that row");
+  std::vector<float> out(4 * kE);
+  for (int k = 0; k < 3; ++k)
+    std::memcpy(out.data() + std::size_t(k) * kE,
+                i.host_feat.data() + (std::size_t(k) * i.opt.max_batch + row) * kE,
+                kE * 4);
+  std::memcpy(out.data() + 3 * kE, i.host_feat_final.data() + row * kE, kE * 4);
+  return out;
+}
+
+std::uint32_t GpuEngine::HeadArgmax(const float* hidden) {
+  return impl_->HeadArgmax(hidden);
 }
 
 std::uint32_t GpuEngine::vocab() const {

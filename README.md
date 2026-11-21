@@ -68,7 +68,10 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
 - [ ] M4b2: prompt processing at a competitive rate (llama.cpp: 346 to 520 tokens/s). Next
       candidate: 8-bit integer dot products in the expert kernels, measured at 2.7 times the
       float rate, judged by the quality harness
-- [ ] M4c: speculative decoding with the model's DSpark drafter
+- [ ] M4c: speculative decoding with the model's DSpark drafter. Done so far: tentative steps
+      in the engine, and a CPU prototype of the drafter whose acceptance matches llama.cpp's
+      (4.4 tokens per step on a coding prompt, about 2.2 on prose; [docs/DSPARK.md](docs/DSPARK.md)).
+      Still to do: the drafter on the GPU, and cheaper extra rows in a verification step
 - [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [ ] M5: continuation cache, so conversations resume without reprocessing

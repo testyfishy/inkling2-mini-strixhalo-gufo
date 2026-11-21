@@ -60,4 +60,7 @@ public:
   [[nodiscard]] virtual const char* name() const = 0;
 };
 
+/// y = W x on the CPU, for F32, BF16 and NVFP4 matrices.
+void CpuMul(const Mat& m, const float* x, float* y);
+
 }  // namespace inkling2

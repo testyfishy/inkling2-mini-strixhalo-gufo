@@ -259,6 +259,10 @@ struct Slot {
 
 }  // namespace
 
+void CpuMul(const Mat& m, const float* x, float* y) {
+  MulCpu(m, x, y);
+}
+
 struct Reference::Impl {
   Config c;
   Mat tok_embd, output;

@@ -16,6 +16,7 @@
 #include "backend.hpp"
 #include "config.hpp"
 #include "decoder.hpp"
+#include "drafter.hpp"
 #include "gpu.hpp"
 #include "model.hpp"
 #include "reference.hpp"
@@ -153,6 +154,10 @@ int RunReference(const gufo::core::GgufReader& reader, const char* ids) {
 //                       multi-session run on its own
 //   INKLING2_REF_GEN    greedy tokens to generate per session
 //   INKLING2_PROFILE    per-kernel timing of the generation phase
+//   INKLING2_DSPARK     path of the DSpark drafter file: after the plain
+//                       generation, generate again with drafts
+//                       (INKLING2_DRAFT_N per step, default 7) and report how
+//                       many the model accepted
 int EnvInt(const char* name, int fallback) {
   const char* v = std::getenv(name);
   return v && *v ? std::atoi(v) : fallback;
@@ -230,6 +235,13 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
     options.context = static_cast<std::uint32_t>(EnvInt("INKLING2_CONTEXT", 8192));
     options.int8_experts = EnvInt("INKLING2_INT8_EXPERTS", 1) != 0;
     options.int8_single = EnvInt("INKLING2_INT8_SINGLE", 1) != 0;
+    const char* dspark = std::getenv("INKLING2_DSPARK");
+    if (dspark && sessions == 1) {
+      options.capture_features = true;
+      options.max_batch = std::max<std::uint32_t>(options.max_batch, 8);
+    } else {
+      dspark = nullptr;
+    }
     inkling2::GpuEngine engine(model, options);
     std::printf("engine: %d session(s), weights on the device in %.1f s\n",
                 sessions,
@@ -404,6 +416,123 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                     truth.size() / verify_seconds, kept,
                     replay == truth ? "EQUALS" : "DIFFERS FROM");
         std::printf("%c", 10);
+      }
+      if (dspark) {
+        // Generate the same tokens again, this time with the drafter
+        // proposing tokens and the model verifying them in one step.
+        const int draft_n = std::clamp(EnvInt("INKLING2_DRAFT_N", 7), 1, 7);
+        inkling2::Drafter drafter(dspark, model);
+        const inkling2::Drafter::Head lm_head = [&](const float* hidden) {
+          return engine.HeadArgmax(hidden);
+        };
+        engine.Reset(0);
+        double sums[4] = {};
+        std::uint32_t current = 0;
+        bool head_ok = true;
+        const auto inject_start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n; i += prompt_batch) {
+          std::vector<inkling2::GpuEngine::Row> rows;
+          for (std::size_t j = i; j < std::min(n, i + prompt_batch); ++j)
+            rows.push_back({0, prompt_token(0, j)});
+          const bool final_chunk = i + prompt_batch >= n;
+          engine.Step(rows, final_chunk);
+          if (final_chunk)
+            current = engine.argmax(0);
+          std::vector<float> last;
+          for (std::size_t r = 0; r < rows.size(); ++r) {
+            last = engine.features(r);
+            for (int f = 0; f < 4; ++f)
+              for (std::size_t k = 0; k < 2304; ++k)
+                sums[f] += last[std::size_t(f) * 2304 + k];
+            drafter.Inject(last.data());
+          }
+          // The captured final state through the head must give the step's
+          // own prediction.
+          if (final_chunk)
+            head_ok = engine.HeadArgmax(last.data() + 3 * 2304) == current;
+        }
+        std::printf("drafter: %zu positions injected in %.2f s; feature sums "
+                    "f5 %.6f f23 %.6f f41 %.6f f48 %.6f; head check %s",
+                    n,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - inject_start)
+                        .count(),
+                    sums[0], sums[1], sums[2], sums[3],
+                    head_ok ? "ok" : "FAILED");
+        std::printf("%c", 10);
+        const std::vector<std::uint32_t>& truth = out[0];
+        std::vector<std::uint32_t> replay;
+        int steps = 0, drafted = 0, kept = 0;
+        int kept_at[8] = {};  // steps that kept at least i drafts
+        double draft_seconds = 0;
+        const auto spec_start = std::chrono::steady_clock::now();
+        while (replay.size() < truth.size()) {
+          replay.push_back(current);
+          const auto draft_start = std::chrono::steady_clock::now();
+          const std::vector<std::uint32_t> drafts =
+              drafter.Draft(current, draft_n, lm_head);
+          draft_seconds += std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - draft_start)
+                               .count();
+          std::vector<inkling2::GpuEngine::Row> rows{{0, current}};
+          for (const std::uint32_t draft : drafts)
+            rows.push_back({0, draft});
+          engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
+          std::size_t good = 0;
+          while (good + 1 < rows.size() &&
+                 engine.argmax(good) == rows[good + 1].token)
+            ++good;
+          current = engine.argmax(good);
+          if (steps < 4) {
+            std::printf("  step %d drafts:", steps);
+            for (const std::uint32_t draft : drafts)
+              std::printf(" %u", draft);
+            std::printf("  model:");
+            for (std::size_t r = 0; r + 1 < rows.size(); ++r)
+              std::printf(" %u", engine.argmax(r));
+            std::printf("  kept %zu%c", good, 10);
+          }
+          for (std::size_t r = 1; r <= good; ++r)
+            replay.push_back(rows[r].token);
+          // Features have to be read before the next head call or step.
+          std::vector<std::vector<float>> features;
+          for (std::size_t r = 0; r <= good; ++r)
+            features.push_back(engine.features(r));
+          engine.Accept(0, static_cast<std::uint32_t>(good + 1));
+          for (const auto& f : features)
+            drafter.Inject(f.data());
+          drafted += static_cast<int>(drafts.size());
+          kept += static_cast<int>(good);
+          for (std::size_t r = 1; r <= good; ++r)
+            ++kept_at[r];
+          ++steps;
+        }
+        const double spec_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          spec_start)
+                .count();
+        const std::size_t produced = replay.size();
+        replay.resize(truth.size());
+        for (std::size_t i = 0; i < truth.size(); ++i)
+          if (replay[i] != truth[i]) {
+            std::printf("  first difference at token %zu: drafted run %u, "
+                        "plain run %u%c",
+                        i, replay[i], truth[i], 10);
+            break;
+          }
+        std::printf("drafted generation: %zu tokens in %d steps (%.2f tokens "
+                    "per step), %d of %d drafts kept (%.1f%%); output %s plain "
+                    "generation",
+                    produced, steps, double(produced) / steps, kept, drafted,
+                    100.0 * kept / std::max(1, drafted),
+                    replay == truth ? "EQUALS" : "DIFFERS FROM");
+        std::printf("%c  steps keeping at least 1..7 drafts:", 10);
+        for (int r = 1; r <= draft_n; ++r)
+          std::printf(" %d", kept_at[r]);
+        std::printf("%c  time: %.2f s in all, %.2f s of it in the CPU drafter "
+                    "prototype; %.1f tokens/s if drafting were free%c",
+                    10, spec_seconds, draft_seconds,
+                    produced / std::max(1e-9, spec_seconds - draft_seconds), 10);
       }
       if (std::getenv("INKLING2_PROFILE"))
         for (const auto& [name, phase_seconds] : engine.phases())

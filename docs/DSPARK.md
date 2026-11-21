@@ -5,7 +5,8 @@ Inkling 2 Mini ships a small drafter for speculative decoding (`mtp.safetensors`
 These notes are the specification this project implements. They were distilled from the
 reference implementation in llama.cpp pull request ggml-org/llama.cpp#32218
 (`src/models/dspark.cpp`, `src/models/dflash.cpp`, `common/speculative.cpp`). Items marked
-UNVERIFIED could not be read from that source and have to be settled by experiment.
+UNVERIFIED in an earlier version have since been read from the source and confirmed by
+measurement (see "Measured" at the end).
 
 Sizes: width W = 2304, head dimension 128, 24 query heads, 8 key/value heads (query head h uses
 key/value head h / 3), 3 layers, FFN 9216, block of 8 rows, Markov rank R = 256, eps 1e-6.
@@ -76,12 +77,13 @@ Attention is not causal inside the block: every block row sees all 8 block rows.
 context, layers 0 and 2 are windowed and layer 1 is global:
 
 - Layers 0 and 2: all block rows see context positions pos0-1024 .. pos0-1 (measured from the
-  anchor, the same for every row). UNVERIFIED in detail: inferred from comments.
+  anchor, the same for every row). The loader adds one to the 1,024 window so the anchor row
+  reaches 1,024 positions back, and the block shares the anchor's window.
 - Layer 1: every cached context position.
 
 RoPE: absolute positions (p for context keys, pos0 + i for block rows), all 128 dimensions,
 `theta_j = 1e6^(-2j/128)`, rotation `x0' = x0 cos - x1 sin`, `x1' = x0 sin + x1 cos`.
-UNVERIFIED: whether pairs are (2j, 2j+1) or (j, j+64).
+Pairs are (j, j+64): llama.cpp gives this drafter its NeoX rotation.
 
 ## 4. The recurrent head
 
@@ -107,3 +109,43 @@ prev_{i+1} = argmax(logits), lowest id on ties
 - After verification the context caches gain the features of the rows that were kept. Features
   of rejected rows must not stay in the cache.
 - Nothing else persists between steps: the block pass and the head are recomputed every step.
+
+## 6. Measured
+
+`extension/src/drafter.cpp` implements the above on the CPU (a prototype to settle correctness
+and acceptance, not speed). `INKLING2_DSPARK=<drafter file>` makes the development driver
+generate a second time with drafts and compare with plain greedy generation.
+`scripts/dspark-oracle.sh` runs llama.cpp's implementation on the same prompt.
+
+Same machine, same native-precision file, greedy, 7 drafts per step unless noted. "Tokens per
+step" counts the token the model itself contributes plus the drafts it kept.
+
+| Prompt | Engine | Drafts kept | Tokens per step | Output |
+|---|---|---:|---:|---|
+| Chat request for a Python module (81 tokens), 160 generated | this extension | 125 of 259 (48.3%) | 4.38 | equals plain generation |
+| | llama.cpp | 122 of 247 (49.4%) | 4.39 | |
+| Encyclopedia prose (256 wikitext tokens), 48 generated | this extension, float experts | 29 of 154 (18.8%) | 2.32 | equals plain generation |
+| | this extension, integer experts | 24 of 168 (14.3%) | 2.00 | differs from token 18 (see below) |
+| | llama.cpp | 25 of 144 (17.4%) | 2.14 | |
+
+With fewer drafts per step on the coding prompt: 3 drafts give 3.24 tokens per step (74.7%
+kept), 5 give 3.86 (57.1%).
+
+What this says:
+
+- The drafter is reproduced faithfully: acceptance matches llama.cpp's on both kinds of text,
+  and llama.cpp's plain output on the prose prompt is token for token the same as ours.
+- Acceptance depends heavily on the text. Structured output (reasoning lists, code) is drafted
+  well; free prose is not. In llama.cpp the drafter turns 19.1 tokens/s into 25.4 on the coding
+  prompt and into 12.4 on the prose prompt.
+- Speed here is not yet a result. A verification step of 8 rows costs about 131 ms against
+  41 ms for a plain step, so 4.38 tokens per step would be about 33 tokens/s if drafting cost
+  nothing; the CPU prototype adds about 128 ms per step. What decides the final number is the
+  cost of the extra rows in a verification step (the same cost that limits prompt processing)
+  and a GPU drafter whose seven head evaluations do not each read the whole output matrix.
+- The integer difference: on the prose prompt, with 8-bit expert products on, the 8-row
+  verification step picked a different token than the single-row step at one position where two
+  candidates were nearly tied, and the two runs continued differently from there. Both are
+  outputs of the model within the integer path's known noise (see QUALITY.md); with float
+  expert products the drafted and plain runs are identical. It means drafted generation is only
+  guaranteed to reproduce plain generation exactly when both use the same arithmetic.

@@ -23,6 +23,7 @@ gufo_extension_target(
   NAME gufo_inkling2_native_gpu
   SOURCES
     src/decoder.cpp
+    src/drafter.cpp
     src/gpu.cpp
     src/provider.cpp
   LINK_LIBRARIES

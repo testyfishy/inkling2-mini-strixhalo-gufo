@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include <gufo/ext/gguf_reader.hpp>
@@ -36,5 +37,13 @@ struct Model {
 /// is missing or stored in a type other than F32, BF16 or NVFP4.
 [[nodiscard]] Model LoadModel(const gufo::core::GgufReader& reader,
                               const Config& config);
+
+/// One tensor of a GGUF file as a mapped matrix, or copied out as F32. Both
+/// throw std::runtime_error when the tensor is missing or stored otherwise
+/// than F32, BF16 or (matrices only) NVFP4.
+[[nodiscard]] Mat LoadMatrix(const gufo::core::GgufReader& reader,
+                             const std::string& name);
+[[nodiscard]] Vec LoadVector(const gufo::core::GgufReader& reader,
+                             const std::string& name);
 
 }  // namespace inkling2

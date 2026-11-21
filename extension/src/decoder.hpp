@@ -32,6 +32,9 @@ public:
     /// Whether the 8-bit products are also used in steps of fewer rows than
     /// the expert-major threshold, which includes single-session generation.
     bool int8_single{true};
+    /// Keep, for every row of a step, the hidden states the drafter reads
+    /// (see `features`).
+    bool capture_features{false};
   };
 
   /// Throws std::runtime_error when the model is not Inkling 2 Mini as the
@@ -80,6 +83,16 @@ public:
   [[nodiscard]] std::vector<float> capped_logits(std::size_t i) const;
   /// The most likely next token of run `i`.
   [[nodiscard]] std::uint32_t argmax(std::size_t i) const;
+
+  /// With `capture_features`: batch row `row`'s hidden states from the last
+  /// step, 4 * 2304 values: the residual stream entering executed layer visits
+  /// 5, 23 and 41, then the final hidden state (after the output mix and
+  /// norm, before the LM head).
+  [[nodiscard]] std::vector<float> features(std::size_t row) const;
+
+  /// The most likely token for a final hidden state (2304 values) put through
+  /// the LM head; ties go to the lowest id. Overwrites the last step's logits.
+  std::uint32_t HeadArgmax(const float* hidden);
 
   [[nodiscard]] std::uint32_t position(std::uint32_t session) const;
   [[nodiscard]] std::uint32_t vocab() const;
