@@ -122,30 +122,41 @@ step" counts the token the model itself contributes plus the drafts it kept.
 
 | Prompt | Engine | Drafts kept | Tokens per step | Output |
 |---|---|---:|---:|---|
-| Chat request for a Python module (81 tokens), 160 generated | this extension | 125 of 259 (48.3%) | 4.38 | equals plain generation |
+| Chat request A: a Python module (81 tokens), 160 generated | this extension | 125 of 259 (48.3%) | 4.38 | equals plain generation |
 | | llama.cpp | 122 of 247 (49.4%) | 4.39 | |
+| Chat request B: a short Python function (26 tokens), 64 generated | this extension | 38 of 182 (20.9%) | 2.46 | equals plain generation |
+| | llama.cpp | 38 of 161 (23.6%) | 2.58 | |
 | Encyclopedia prose (256 wikitext tokens), 48 generated | this extension, float experts | 29 of 154 (18.8%) | 2.32 | equals plain generation |
 | | this extension, integer experts | 24 of 168 (14.3%) | 2.00 | differs from token 18 (see below) |
+| | this extension, integer experts, per-row kernel | 30 of 140 (21.4%) | 2.50 | equals plain generation |
 | | llama.cpp | 25 of 144 (17.4%) | 2.14 | |
 
-With fewer drafts per step on the coding prompt: 3 drafts give 3.24 tokens per step (74.7%
+With fewer drafts per step on chat request A: 3 drafts give 3.24 tokens per step (74.7%
 kept), 5 give 3.86 (57.1%).
 
 What this says:
 
-- The drafter is reproduced faithfully: acceptance matches llama.cpp's on both kinds of text,
-  and llama.cpp's plain output on the prose prompt is token for token the same as ours.
-- Acceptance depends heavily on the text. Structured output (reasoning lists, code) is drafted
-  well; free prose is not. In llama.cpp the drafter turns 19.1 tokens/s into 25.4 on the coding
-  prompt and into 12.4 on the prose prompt.
+- The drafter is reproduced closely: acceptance is within a few points of llama.cpp's on all
+  three prompts, and llama.cpp's plain output on the prose prompt is token for token the same
+  as ours. This is a statistical match. Draft blocks were not compared token for token, and
+  llama.cpp's drafted runs do not produce exactly the plain output either.
+- Acceptance depends heavily on the text, and one good prompt is not the rule: 4.4 tokens per
+  step on request A, about 2.5 on request B and on prose. In llama.cpp the drafter turns
+  19.1 tokens/s into 25.4 on request A, and into 15.1 and 12.4 on request B and on prose,
+  which is slower than not drafting.
 - Speed here is not yet a result. A verification step of 8 rows costs about 131 ms against
   41 ms for a plain step, so 4.38 tokens per step would be about 33 tokens/s if drafting cost
   nothing; the CPU prototype adds about 128 ms per step. What decides the final number is the
   cost of the extra rows in a verification step (the same cost that limits prompt processing)
   and a GPU drafter whose seven head evaluations do not each read the whole output matrix.
-- The integer difference: on the prose prompt, with 8-bit expert products on, the 8-row
-  verification step picked a different token than the single-row step at one position where two
-  candidates were nearly tied, and the two runs continued differently from there. Both are
-  outputs of the model within the integer path's known noise (see QUALITY.md); with float
-  expert products the drafted and plain runs are identical. It means drafted generation is only
-  guaranteed to reproduce plain generation exactly when both use the same arithmetic.
+- The integer difference: steps of several rows use the expert-major 8-bit kernel, single-row
+  steps the per-row 8-bit kernel, and the two do not give identical results. On the prose prompt an
+  8-row verification step picked a different token than the single-row step at token 18 and
+  the runs continued differently from there. Sending the 8-row steps through the per-row
+  kernel (`INKLING2_MAJOR_MIN_BATCH=64`) or using float products makes the drafted run
+  identical to the plain one. How close the two candidates were at that position was not
+  measured. So with the default settings drafted generation is not guaranteed to reproduce
+  plain generation exactly; it did whenever both ran the same kernels.
+- All of this is at short context (at most about 300 tokens). At the 100K+ contexts this
+  project is aimed at, each extra row of a verification step costs more and the drafter's
+  middle layer attends over the whole history; none of that is measured yet.
