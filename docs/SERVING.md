@@ -85,12 +85,15 @@ What the runner does:
   plain text, so reasoning arrives as `reasoning_content`. `reasoning_effort` selects the
   template's effort level (minimal 0.1, low 0.2, medium 0.7, high 0.9, xhigh and max 0.99; the
   template's default is 0.9).
-- **Thinking off** (`reasoning_effort: "none"`). The template writes effort 0 for it, and this
-  model opens a thinking block anyway. The runner therefore enforces it, in two ways, each for
-  the case where it was seen to work: without tools the prompt opens the answer itself; with
-  tools the prompt is left alone, so the model can start with a call, and only the token that
-  opens a thinking block is never sampled. (Blocking that token without tools made the model
-  write its deliberation into the answer.)
+- **Thinking off** (`reasoning_effort: "none"`). The template writes effort 0 for it, and the
+  weights file tested here opened a thinking block anyway. The runner therefore enforces it,
+  in two ways, each for the case where it was seen to work: without tools the prompt opens the
+  answer itself; with tools the prompt is left alone, so the model can start with a call, and
+  only the token that opens a thinking block is never sampled. (Blocking that token without
+  tools made the model write its deliberation into the answer.)
+- **Response formats** (`response_format`) run with thinking off. GUFO's grammar reads the
+  model's framing tokens as empty text, and with a thinking block before the answer the
+  constrained output came out malformed (a repeated key, an invented key).
 - **Tool calls.** The model writes
   `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>`;
   the server sees `<tool_call>{"name":"NAME","args":{...}}</tool_call>`, a syntax registered as
@@ -105,8 +108,12 @@ What the runner does:
   GUFO's prompt lookup proposes them when the last 12 generated tokens (24 when sampling)
   repeat an earlier passage; the first copy carries 4 drafts and the number doubles, up to 16,
   while every draft is kept. At each drafted position the token is drawn from the model's own
-  distribution as always and the draft is kept only if it is the token drawn, so the output is
-  distributed as without drafts. Off with `INKLING2_SERVE_LOOKUP=0`.
+  distribution as always and the draft is kept only if it is the token drawn; a draft never
+  decides a token. Off with `INKLING2_SERVE_LOOKUP=0`. One qualification: a step of several
+  rows takes a different arithmetic path than a step of one row (see the notes in
+  [PROGRESS.md](PROGRESS.md)), so logits differ in their last bits and a near-tie can fall the
+  other way. In the three comparisons below the text was identical. The same holds for a
+  prompt restored from the cache against one processed again.
 
 ### Measured through the server, 2026-11-21
 
@@ -128,13 +135,13 @@ Speeds are the server's own figures.
 
 Generation with drafts copied from the context:
 
-| Output | Tokens | Without drafts | With drafts |
-|---|---:|---:|---:|
-| A 556-token passage repeated verbatim | 556 | about 24 | 92.6 |
-| The same, sampled at temperature 1.0 (one run) | 556 | about 24 | 76.7 |
-| 6 KB of C++ rewritten with one identifier changed | 1,500 | about 24 | 85.5 |
-| A new story (nothing to copy) | 300 | 23.9 | 23.9 |
-| An article continued | 300 | 22.6 | 22.6 |
+| Output | Tokens | Without drafts | With drafts | Text |
+|---|---:|---:|---:|---|
+| A 556-token passage repeated verbatim | 556 | 23.4 | 92.9 | identical |
+| The same, sampled at temperature 1.0 with a fixed seed (one seed) | 556 | 22.1 | 76.2 | identical |
+| 6 KB of C++ rewritten with one identifier changed | 1,500 | 23.0 | 85.7 | identical |
+| A new story (nothing to copy) | 300 | | 23.9 | no draft was proposed |
+| An article continued | 300 | | 22.6 | no draft was proposed |
 
 Lowering the 12-token threshold to 6 or 3 (`INKLING2_SERVE_LOOKUP_MIN`) moved these by a few
 percent in both directions (copy 97 and 99, rewrite 86 and 90, article 22.4 and 22.2), so
@@ -142,8 +149,14 @@ GUFO's value stays.
 
 Functional checks over HTTP: plain and streamed chat, reasoning at default and low effort,
 thinking off, a tool call as the first action, two parallel calls, a streamed call, an answer
-from a tool result, a JSON response format, and cache reuse within and across requests. The
-quality harness after these changes: KLD 0.0015 at 4,096 tokens, unchanged.
+from a tool result, a JSON response format (with thinking requested and not), cache reuse
+within and across requests, two requests at once on two sessions, and one request each on
+`/v1/messages` and `/v1/responses`. The quality harness after the engine changes: KLD 0.0015
+at 4,096 tokens, unchanged.
+
+`scripts/serve-requests.py` writes these requests and `scripts/serve-check.sh` posts them.
+The script collects what was run here in several separate sessions; it has not been run from
+start to end in this form.
 
 ### Not done, or known to be weak
 
@@ -154,10 +167,13 @@ quality harness after these changes: KLD 0.0015 at 4,096 tokens, unchanged.
 - GUFO keeps checkpoints at the end of a prompt and at a few pass boundaries inside it. A
   conversation that only grows resumes from its end; changing the end of a long prompt
   reprocesses from the last kept boundary (26,300 tokens in the 100K test).
-- Several sessions are served one after another: the engine's batched decode across sessions
-  is not wired to the server yet.
+- With several sessions, requests take turns step by step: two at once both finished
+  correctly, each slower than alone (4.4 s against 2.4 s for the short one). The engine's
+  batched decode across sessions, which would run them in one step, is not wired to the
+  server yet.
 - The 525 MB of private state per checkpoint could shrink to about a third by saving only the
   live part of each ring.
 - Not tested: the disk cache, log-probabilities, reasoning budgets, cancellation inside a
   step, GUFO's functional conformance suites, image input (not implemented).
-- The sampled copy figure is one run; acceptance of drafts when sampling was not studied.
+- Drafts when sampling were measured with one seed on one text; how often they are kept at
+  temperature 1.0 on real work was not studied.

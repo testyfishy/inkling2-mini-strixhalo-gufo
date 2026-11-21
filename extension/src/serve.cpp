@@ -1296,7 +1296,7 @@ private:
             {tool.name, tool.description, tool.parameters_json, "function"});
     ChatOptions options;
     const auto& reasoning = request.reasoning;
-    if (reasoning.enabled.has_value() && !*reasoning.enabled) {
+    if (ThinkingOff(request)) {
       options.effort = 0.0;
     } else if (reasoning.effort.has_value()) {
       switch (*reasoning.effort) {
@@ -1352,8 +1352,14 @@ private:
       logits[ids_.content_thinking] = -1e30F;
   }
 
+  // Thinking is off when the request says so, and for every request with a
+  // response format: GUFO's grammar for the format reads the model's framing
+  // tokens as empty text, and with a thinking block in front of the answer
+  // the constrained output came out malformed.
   [[nodiscard]] static bool ThinkingOff(const ext::ChatRequest& request) {
-    return request.reasoning.enabled.has_value() && !*request.reasoning.enabled;
+    return (request.reasoning.enabled.has_value() &&
+            !*request.reasoning.enabled) ||
+           request.response_format != nullptr;
   }
 
   // What the model is writing when the context ends in `tokens`.

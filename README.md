@@ -7,7 +7,8 @@ precision.
 
 **Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
 extension: 1,056 tokens/s on a 4K-token prompt, 555 on a 100K-token prompt, 24 tokens/s generation
-(85 to 93 where the output repeats its context), KLD 0.0015 against llama.cpp on the same file.
+(86 to 93 greedy and 76 sampled, one seed, where the output repeats its context), KLD 0.0015 against
+llama.cpp on the same file.
 See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Goal
@@ -104,7 +105,8 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       independent references ([docs/SERVING.md](docs/SERVING.md))
 - [x] M5: a runner for `gufo serve`: OpenAI-style API with streaming, reasoning and tool
       calls, GUFO's continuation cache (a repeated 100K-token request restores in 43 ms) and
-      drafts copied from the context (85 to 93 tokens/s on rewrites and copies). Measured
+      drafts copied from the context (86 to 93 tokens/s greedy on rewrites and copies, with
+      the same text as without drafts). Measured
       through the server: 1,056 tokens/s on a 4K prompt, 555 on a 100K prompt, 24.0 tokens/s
       generation ([docs/SERVING.md](docs/SERVING.md))
 - [ ] M5b: what serving still lacks: batched decode across sessions, smaller checkpoints,
