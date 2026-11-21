@@ -76,6 +76,8 @@ struct GpuEngine::Impl {
       *moe{}, *scratch{}, *final_x{}, *logits{}, *low{}, *router_logits{},
       *xt_in{}, *xt_attn{}, *contrib{};
   std::int32_t *group_list{}, *group_count{};
+  std::uint32_t *xq{}, *aq{};
+  float *xs{}, *as{};
   int major_min_batch{4};
   bool transpose{true};
   int gemm_variant{0}, expert_variant{0};
@@ -296,6 +298,12 @@ struct GpuEngine::Impl {
     if (const char* v = std::getenv("INKLING2_EXPERT_VARIANT"))
       expert_variant = std::atoi(v);
     contrib = Floats(B * kTopK * kE);
+    if (opt.int8_experts) {
+      xq = static_cast<std::uint32_t*>(Alloc(B * kE));
+      xs = Floats(B * kE / 16);
+      aq = static_cast<std::uint32_t*>(Alloc(B * kTopK * gpu::kFF));
+      as = Floats(B * kTopK * gpu::kFF / 16);
+    }
     group_list = static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * B * 4));
     group_count = static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * 4));
     if (const char* v = std::getenv("INKLING2_MAJOR_MIN_BATCH"))
@@ -584,8 +592,13 @@ struct GpuEngine::Impl {
     e.batch = batch;
     // Expert-major pays off once rows share experts; alone, a row's eight
     // experts are cheaper to visit directly.
-    e.variant = expert_variant == 0 && batch >= major_min_batch ? 2
-                                                               : expert_variant;
+    e.variant = expert_variant;
+    if (expert_variant == 0 && batch >= major_min_batch)
+      e.variant = opt.int8_experts ? 3 : 2;
+    e.xq = xq;
+    e.xs = xs;
+    e.aq = aq;
+    e.as = as;
     e.group_list = group_list;
     e.group_count = group_count;
     e.contrib = contrib;

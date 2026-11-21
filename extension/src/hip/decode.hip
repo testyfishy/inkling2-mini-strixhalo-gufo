@@ -900,6 +900,199 @@ __launch_bounds__(32) __global__ void ExpertDownNvfp4MajorKernel(
   }
 }
 
+// ---- 8-bit integer variant of the NVFP4 expert-major kernels ---------------
+
+// E2M1 values, doubled, as integers.
+constexpr int kFp4Int[16] = {0, 1,  2,  3,  4,  6,  8,  12,
+                             0, -1, -2, -3, -4, -6, -8, -12};
+
+// a . b over four signed 8-bit values each, added to c.
+__device__ inline int Dot4(std::uint32_t a, std::uint32_t b, int c) {
+  return __builtin_amdgcn_sudot4(true, static_cast<int>(a), true,
+                                 static_cast<int>(b), c, false);
+}
+
+// One 64-value NVFP4 block as four sub-blocks of 16 signed 8-bit values (four
+// per word, in element order) and each sub-block's scale. Exact.
+__device__ inline void DecodeNvfp4Int(const std::uint8_t* block,
+                                      std::uint32_t* q, float* d) {
+  const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(block);
+  const std::uint32_t scales = w[0];
+  for (int s = 0; s < 4; ++s) {
+    d[s] = Ue4m3((scales >> (8 * s)) & 0xFFu);
+    for (int half = 0; half < 2; ++half) {
+      const std::uint32_t word = w[1 + 2 * s + half];
+      std::uint32_t low = 0, high = 0;
+      for (int j = 0; j < 4; ++j) {
+        const std::uint32_t code = (word >> (8 * j)) & 0xFFu;
+        low |= (static_cast<std::uint32_t>(kFp4Int[code & 15u]) & 0xFFu)
+               << (8 * j);
+        high |= (static_cast<std::uint32_t>(kFp4Int[code >> 4]) & 0xFFu)
+                << (8 * j);
+      }
+      // Elements 0..7 are the low codes of the eight bytes, 8..15 the high.
+      q[s * 4 + half] = low;
+      q[s * 4 + 2 + half] = high;
+    }
+  }
+}
+
+// Rounds vectors to 8 bits per block of 16 values: q = round(x * 127 / max|x|)
+// and the scale max|x| / 127. One thread per block of 16.
+struct QuantizeArgs {
+  const float* x;
+  int x_stride;
+  int vectors;
+  int length;  // values per vector, a multiple of 16
+  std::uint32_t* q;  // length / 4 words per vector
+  float* s;          // length / 16 scales per vector
+};
+__global__ void QuantizeKernel(QuantizeArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int per_vector = a.length / 16;
+  const std::size_t v = idx / per_vector;
+  const int blk = static_cast<int>(idx % per_vector);
+  if (v >= static_cast<std::size_t>(a.vectors))
+    return;
+  const float* x = a.x + v * a.x_stride + blk * 16;
+  float amax = 0.0f;
+  for (int i = 0; i < 16; ++i)
+    amax = fmaxf(amax, fabsf(x[i]));
+  const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+  std::uint32_t* q = a.q + (v * per_vector + blk) * 4;
+  for (int w = 0; w < 4; ++w) {
+    std::uint32_t word = 0;
+    for (int j = 0; j < 4; ++j) {
+      const int value = static_cast<int>(rintf(x[w * 4 + j] * inv));
+      word |= (static_cast<std::uint32_t>(value) & 0xFFu) << (8 * j);
+    }
+    q[w] = word;
+  }
+  a.s[v * per_vector + blk] = amax * (1.0f / 127.0f);
+}
+
+__launch_bounds__(64) __global__ void ExpertUpNvfp4Int8Kernel(
+    BatchExpertArgs a) {
+  constexpr int kThreads = 64;
+  __shared__ float sg[kMajorRows][kThreads];
+  __shared__ float su[kMajorRows][kThreads];
+  const int t = threadIdx.x;
+  const int k = blockIdx.x % kFF;
+  const int e = blockIdx.x / kFF;
+  const int n = a.group_count[e];
+  if (n == 0)
+    return;
+  const std::int32_t* list =
+      a.group_list + static_cast<std::size_t>(e) * a.max_batch;
+  constexpr int kBlocks = kE / kNvfp4Values;
+  constexpr std::size_t kRowBytes = static_cast<std::size_t>(kBlocks) * kNvfp4Bytes;
+  const std::uint8_t* base =
+      a.gate_up + static_cast<std::size_t>(e) * 2 * kFF * kRowBytes;
+  const bool active = t < kBlocks;
+  std::uint32_t qg[16], qu[16];
+  float dg[4], du[4];
+  if (active) {
+    DecodeNvfp4Int(base + k * kRowBytes + t * kNvfp4Bytes, qg, dg);
+    DecodeNvfp4Int(base + (kFF + k) * kRowBytes + t * kNvfp4Bytes, qu, du);
+  }
+  for (int r0 = 0; r0 < n; r0 += kMajorRows) {
+    const int nr = n - r0 < kMajorRows ? n - r0 : kMajorRows;
+    for (int r = 0; r < nr; ++r) {
+      float g = 0.0f, u = 0.0f;
+      if (active) {
+        const std::size_t b = list[r0 + r] / kTopK;
+        // This thread's 64 inputs: 16 words and 4 scales.
+        const std::uint32_t* xq = a.xq + (b * kE + t * kNvfp4Values) / 4;
+        const float* xs = a.xs + (b * kE + t * kNvfp4Values) / 16;
+        for (int s = 0; s < 4; ++s) {
+          int ig = 0, iu = 0;
+          for (int w = 0; w < 4; ++w) {
+            ig = Dot4(qg[s * 4 + w], xq[s * 4 + w], ig);
+            iu = Dot4(qu[s * 4 + w], xq[s * 4 + w], iu);
+          }
+          g += static_cast<float>(ig) * dg[s] * xs[s];
+          u += static_cast<float>(iu) * du[s] * xs[s];
+        }
+      }
+      sg[r][t] = g;
+      su[r][t] = u;
+    }
+    __syncthreads();
+    for (int step = kThreads / 2; step > 0; step >>= 1) {
+      if (t < step)
+        for (int r = 0; r < nr; ++r) {
+          sg[r][t] += sg[r][t + step];
+          su[r][t] += su[r][t + step];
+        }
+      __syncthreads();
+    }
+    if (t == 0)
+      for (int r = 0; r < nr; ++r) {
+        const int pair = list[r0 + r];
+        const float scale = a.up_scale[pair];
+        a.act[static_cast<std::size_t>(pair) * kFF + k] = Situ(
+            sg[r][0] * scale, su[r][0] * scale, a.situ_beta, a.situ_linear_beta);
+      }
+    __syncthreads();
+  }
+}
+
+__launch_bounds__(32) __global__ void ExpertDownNvfp4Int8Kernel(
+    BatchExpertArgs a) {
+  constexpr int kThreads = 32;
+  __shared__ float sh[kMajorRows][kThreads];
+  const int t = threadIdx.x;
+  const int i = blockIdx.x % kE;
+  const int e = blockIdx.x / kE;
+  const int n = a.group_count[e];
+  if (n == 0)
+    return;
+  const std::int32_t* list =
+      a.group_list + static_cast<std::size_t>(e) * a.max_batch;
+  constexpr int kBlocks = kFF / kNvfp4Values;
+  constexpr std::size_t kRowBytes = static_cast<std::size_t>(kBlocks) * kNvfp4Bytes;
+  const bool active = t < kBlocks;
+  std::uint32_t q[16];
+  float d[4];
+  if (active)
+    DecodeNvfp4Int(a.down + (static_cast<std::size_t>(e) * kE + i) * kRowBytes +
+                       t * kNvfp4Bytes,
+                   q, d);
+  for (int r0 = 0; r0 < n; r0 += kMajorRows) {
+    const int nr = n - r0 < kMajorRows ? n - r0 : kMajorRows;
+    for (int r = 0; r < nr; ++r) {
+      float acc = 0.0f;
+      if (active) {
+        const std::size_t pair = list[r0 + r];
+        const std::uint32_t* aq = a.aq + (pair * kFF + t * kNvfp4Values) / 4;
+        const float* as = a.as + (pair * kFF + t * kNvfp4Values) / 16;
+        for (int s = 0; s < 4; ++s) {
+          int sum = 0;
+          for (int w = 0; w < 4; ++w)
+            sum = Dot4(q[s * 4 + w], aq[s * 4 + w], sum);
+          acc += static_cast<float>(sum) * d[s] * as[s];
+        }
+      }
+      sh[r][t] = acc;
+    }
+    __syncthreads();
+    for (int step = kThreads / 2; step > 0; step >>= 1) {
+      if (t < step)
+        for (int r = 0; r < nr; ++r)
+          sh[r][t] += sh[r][t + step];
+      __syncthreads();
+    }
+    if (t == 0)
+      for (int r = 0; r < nr; ++r) {
+        const int pair = list[r0 + r];
+        a.contrib[static_cast<std::size_t>(pair) * kE + i] =
+            a.coef[pair] * sh[r][0];
+      }
+    __syncthreads();
+  }
+}
+
 // The BF16 counterparts. A thread owns a contiguous run of columns, so the
 // weights it converts and each row's inputs are both contiguous reads.
 __launch_bounds__(64) __global__ void ExpertUpBf16MajorKernel(
@@ -1375,7 +1568,22 @@ void Router(const RouterArgs& args, hipStream_t stream) {
 }
 
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream) {
-  if (args.variant == 2) {
+  if (args.variant == 3 && args.nvfp4) {
+    ExpertGroupKernel<<<1, kNX, 0, stream>>>(args);
+    QuantizeArgs qx{args.x, kE, args.batch, kE, args.xq, args.xs};
+    QuantizeKernel<<<Blocks(std::size_t(args.batch) * kE / 16, 256), 256, 0,
+                     stream>>>(qx);
+    ExpertUpNvfp4Int8Kernel<<<kNX * kFF, 64, 0, stream>>>(args);
+    const int pairs = args.batch * kTopK;
+    QuantizeArgs qa{args.act, kFF, pairs, kFF, args.aq, args.as};
+    QuantizeKernel<<<Blocks(std::size_t(pairs) * kFF / 16, 256), 256, 0,
+                     stream>>>(qa);
+    ExpertDownNvfp4Int8Kernel<<<kNX * kE, 32, 0, stream>>>(args);
+    ExpertSumKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0,
+                      stream>>>(args);
+    return;
+  }
+  if (args.variant == 2 || args.variant == 3) {
     ExpertGroupKernel<<<1, kNX, 0, stream>>>(args);
     if (args.nvfp4) {
       ExpertUpNvfp4MajorKernel<<<kNX * kFF, 64, 0, stream>>>(args);

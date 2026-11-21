@@ -30,6 +30,28 @@ UD-IQ4_XS against their 8-bit reference, and the community design doc cites 0.00
 difference measured here, between two implementations running the same weights, is below all of
 those.
 
+## 8-bit expert products (on by default)
+
+In steps of four or more rows (prompts and several sessions decoding together), the NVFP4 expert
+products use the GPU's 8-bit integer dot product. The weights stay exact: NVFP4 values are small
+integers times a scale. What changes is that the inputs to those products are rounded to 8 bits
+per block of 16 values. llama.cpp's GPU path and GUFO's own kernels make the same kind of
+approximation. Single-row steps, which is single-session generation, always use the float path.
+
+Same reference file, 2,040 positions, 64 rows per step:
+
+| Measure | Float products | 8-bit products |
+|---|---:|---:|
+| Perplexity (llama.cpp: 7.7776) | 7.7928 | 7.7994 |
+| Mean KLD from llama.cpp | 0.00214 | 0.00199 |
+| 99th percentile KLD | 0.0203 | 0.0180 |
+| Same top token | 98.19% | 97.99% |
+
+The two columns differ by far less than the sample's uncertainty (perplexity has a standard error
+of about 0.44 here), so this measurement shows no quality cost. It is a small sample; a larger
+one could show a difference this one cannot. `INKLING2_INT8_EXPERTS=0` (or `INT8_EXPERTS=0` for
+`scripts/quality.sh`) selects the float products.
+
 ## What the remaining difference is, and is not, known to be
 
 - The two implementations use different arithmetic. llama.cpp's GPU path keeps its KV cache in

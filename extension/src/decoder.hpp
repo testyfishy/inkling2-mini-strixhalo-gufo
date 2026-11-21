@@ -23,6 +23,12 @@ public:
     std::uint32_t context{8192};  // positions per session
     std::uint32_t sessions{1};
     std::uint32_t max_batch{16};  // rows per step
+    /// On by default. When on, steps of several rows compute the NVFP4
+    /// expert products with 8-bit integer dot products: the weights stay
+    /// exact, the inputs to those products are rounded to 8 bits per block of
+    /// 16. Faster, and a small change in the arithmetic. Steps of fewer rows
+    /// than the expert-major threshold are never affected.
+    bool int8_experts{true};
   };
 
   /// Throws std::runtime_error when the model is not Inkling 2 Mini as the

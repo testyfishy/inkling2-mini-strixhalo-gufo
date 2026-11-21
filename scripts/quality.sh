@@ -31,6 +31,8 @@ if [ -z "$SKIP_BASE" ]; then
     -ngl "${NGL:-99}" $LLAMA_EXTRA --kl-divergence-base /out/kld-base.bin 2>&1 | grep -E "Final estimate|perplexity:|error" || true
 fi
 
+# INT8_EXPERTS=0 turns off the engine's 8-bit expert products (on by default).
 podman run $COMMON -v inkling-gufo-ext:/home/gufo/.local/share/gufo/extensions -v "$OUT":/out:ro \
+  -e INKLING2_INT8_EXPERTS="${INT8_EXPERTS:-1}" \
   -e INKLING2_KLD=/out/kld-base.bin -e INKLING2_KLD_CHUNKS="$CHUNKS" -e INKLING2_BATCH="$BATCH" \
   ghcr.io/gufo-org/toolboxes/gufo-runtime:edge gufo prompt --model "$MODEL" --prompt x

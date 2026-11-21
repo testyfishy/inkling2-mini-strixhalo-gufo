@@ -234,7 +234,10 @@ struct BatchExpertArgs {
   int batch;
   // 0: a block per (row, output value); 1: a thread per output value;
   // 2: expert-major, where each expert's weights are decoded once and applied
-  //    to every row that selected it.
+  //    to every row that selected it;
+  // 3: as 2, but the NVFP4 products use 8-bit integer dot products: the
+  //    weights stay exact (they are small integers times a scale) while the
+  //    inputs are rounded to 8 bits per block of 16. BF16 layers use 2.
   int variant;
   // Expert-major scratch: for each expert, the (row * kTopK + slot) pairs that
   // selected it (group_list, max_batch entries per expert) and how many
@@ -244,6 +247,12 @@ struct BatchExpertArgs {
   std::int32_t* group_count;
   float* contrib;
   int max_batch;
+  // Variant 3 scratch: the 8-bit inputs (four values per word) and their
+  // per-16 scales, for x (kE per row) and for act (kFF per pair).
+  std::uint32_t* xq;
+  float* xs;
+  std::uint32_t* aq;
+  float* as;
 };
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream);
 

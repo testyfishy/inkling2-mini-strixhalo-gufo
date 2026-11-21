@@ -257,6 +257,37 @@ second at 16 rows against 420 for the F32 kernel, about 1.3 times. That is not e
 justify rounding activations to BF16, so it is not used. The 8-bit integer instruction
 (2.7 times) remains the candidate, for the NVFP4 experts.
 
+### 8-bit expert products
+
+With the NVFP4 expert products on 8-bit integer dot products (on by default from here; see
+[QUALITY.md](QUALITY.md) for the quality comparison):
+
+| | Float products | 8-bit products |
+|---|---:|---:|
+| 448-token prompt, 64 rows per step | 109.5 t/s | 129.8 t/s |
+| 8 sessions on real text, total | 49.0 t/s | 56.2 t/s |
+| NVFP4 experts in a 64-row prompt step | 271 ms | 179 ms |
+
+The gain is 1.5 times on the expert kernels, not the 2.7 times of the bare instruction: decoding
+the 4-bit weights is now the larger part of that kernel.
+
+### Where this stands against the target
+
+The target is the speed GUFO gets from Qwen3.8 Flash-Next on this machine: about 1,400 to 1,650
+tokens/s on prompts and 34 to 38 tokens/s generating (with MTP drafting).
+
+| | This extension | Target | llama.cpp, same model |
+|---|---:|---:|---:|
+| Prompt | 130 | 1,400 to 1,650 | 346 to 520 |
+| Generation, one session | 18.5 to 20.9 | 34 to 38 | 19.5 |
+
+Generation is within reach of the target if speculative decoding with the model's drafter works
+as it does for Qwen; that is not built. Prompt speed is an order of magnitude short. GUFO's
+kernels for Qwen sustain several times the multiply-add rate of the kernels here (they keep
+tiles of weights and inputs in fast local memory and use the integer and half-float
+instructions throughout), so the remaining gap is kernel engineering of that kind, not a limit
+of the machine.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
