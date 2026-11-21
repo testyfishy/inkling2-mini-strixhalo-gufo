@@ -5,6 +5,7 @@ gufo_extension_target(
   NAME gufo_inkling2_native
   SOURCES
     src/config.cpp
+    src/model.cpp
     src/reference.cpp
     src/extension.cpp
   LINK_LIBRARIES
@@ -21,6 +22,7 @@ endif()
 gufo_extension_target(
   NAME gufo_inkling2_native_gpu
   SOURCES
+    src/decoder.cpp
     src/gpu.cpp
     src/provider.cpp
   LINK_LIBRARIES
@@ -33,6 +35,7 @@ gufo_extension_target(
 if(TARGET gufo_inkling2_native_gpu)
   gufo_extension_hip_sources(gufo_inkling2_native_gpu
     SOURCES
+      src/hip/decode.hip
       src/hip/ops.hip
   )
   target_compile_options(gufo_inkling2_native_gpu PRIVATE

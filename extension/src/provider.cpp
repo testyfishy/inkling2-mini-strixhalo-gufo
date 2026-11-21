@@ -14,7 +14,9 @@
 
 #include "backend.hpp"
 #include "config.hpp"
+#include "decoder.hpp"
 #include "gpu.hpp"
+#include "model.hpp"
 #include "reference.hpp"
 
 namespace {
@@ -140,11 +142,109 @@ int RunReference(const gufo::core::GgufReader& reader, const char* ids) {
   return 0;
 }
 
+// Development aid: INKLING2_GPU=2 decodes the same token ids entirely on the
+// GPU. INKLING2_COMPARE=1 also runs the CPU reference and prints both layer
+// traces side by side.
+int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
+  inkling2::Config config;
+  std::string error;
+  if (!inkling2::LoadConfig(reader, &config, &error) ||
+      !inkling2::CheckTensors(reader, config, nullptr, &error)) {
+    std::fprintf(stderr, "%s\n", error.c_str());
+    return 1;
+  }
+  std::vector<std::uint32_t> tokens;
+  for (const char* p = ids; *p;) {
+    char* end = nullptr;
+    tokens.push_back(static_cast<std::uint32_t>(std::strtoul(p, &end, 10)));
+    if (end == p)
+      break;
+    p = *end == ',' ? end + 1 : end;
+  }
+  if (tokens.empty())
+    return 1;
+  try {
+    const bool compare = std::getenv("INKLING2_COMPARE") != nullptr;
+    const inkling2::Model model = inkling2::LoadModel(reader, config);
+    const auto load_start = std::chrono::steady_clock::now();
+    inkling2::GpuDecoder decoder(model, 8192);
+    std::printf("decoder: weights on the device in %.1f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                              load_start)
+                    .count());
+    decoder.SetDebug(compare);
+    std::vector<float> logits;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      if (i + 1 == tokens.size())
+        logits = decoder.Feed(tokens[i]);
+      else
+        decoder.FeedSilent(tokens[i]);
+    }
+    const double seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+    if (compare) {
+      inkling2::Reference reference(reader, config);
+      for (std::size_t i = 0; i < tokens.size(); ++i)
+        (void)reference.Feed(tokens[i], false);
+      const auto& expected = reference.trace().l_out;
+      const auto& actual = decoder.layer_sums();
+      for (std::size_t s = 0; s < expected.size(); ++s)
+        std::printf("slot %2zu  l_out cpu %14.5f  gpu %14.5f  diff %10.5f\n", s,
+                    expected[s], actual[s], actual[s] - expected[s]);
+    }
+    std::vector<std::uint32_t> order(logits.size());
+    for (std::uint32_t i = 0; i < order.size(); ++i)
+      order[i] = i;
+    std::partial_sort(order.begin(), order.begin() + 10, order.end(),
+                      [&](std::uint32_t a, std::uint32_t b) {
+                        return logits[a] > logits[b];
+                      });
+    double norm = 0;
+    for (const float x : logits)
+      norm += std::exp(static_cast<double>(x) - logits[order[0]]);
+    const double log_norm = std::log(norm) + logits[order[0]];
+    for (int i = 0; i < 10; ++i)
+      std::printf("top %2d  token %6u  logit %10.5f  logprob %10.5f\n", i,
+                  order[i], logits[order[i]], logits[order[i]] - log_norm);
+    std::printf("prompt: %zu tokens in %.3f s (%.2f tokens/s, gpu decoder)\n",
+                tokens.size(), seconds, tokens.size() / seconds);
+    if (const char* n = std::getenv("INKLING2_REF_GEN")) {
+      const int count = std::atoi(n);
+      std::uint32_t next = order[0];
+      std::printf("greedy:");
+      const std::size_t launches_before = decoder.launches();
+      const auto gen_start = std::chrono::steady_clock::now();
+      for (int i = 0; i < count; ++i) {
+        std::printf(" %u", next);
+        next = decoder.FeedGreedy(next);
+      }
+      const double gen_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        gen_start)
+              .count();
+      std::printf("\ngeneration: %d tokens in %.2f s (%.2f tokens/s, gpu "
+                  "decoder, %.0f launches per token)\n",
+                  count, gen_seconds, count / gen_seconds,
+                  static_cast<double>(decoder.launches() - launches_before) /
+                      count);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
 int Prompt(const gufo::ext::TextPromptOptions&,
            const gufo::core::GgufReader& reader,
            std::chrono::steady_clock::time_point) {
-  if (const char* ids = std::getenv("INKLING2_REF_TOKENS"))
+  if (const char* ids = std::getenv("INKLING2_REF_TOKENS")) {
+    if (const char* v = std::getenv("INKLING2_GPU"); v && *v == '2')
+      return RunDecoder(reader, ids);
     return RunReference(reader, ids);
+  }
   return ReportOnly(reader);
 }
 

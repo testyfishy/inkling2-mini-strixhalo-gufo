@@ -1,6 +1,7 @@
 #include "reference.hpp"
 
 #include "backend.hpp"
+#include "model.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +16,6 @@ namespace {
 
 using gufo::core::GgufReader;
 using gufo::core::GgufTensorInfo;
-using Vec = std::vector<float>;
 
 constexpr std::uint16_t kF32 = 0;
 constexpr std::uint16_t kBF16 = 30;
@@ -162,46 +162,6 @@ public:
   [[nodiscard]] const char* name() const override { return "cpu"; }
 };
 
-const GgufTensorInfo& Find(const GgufReader& reader, const std::string& name) {
-  const GgufTensorInfo* t = reader.FindTensor(name);
-  if (!t)
-    throw std::runtime_error("inkling2: missing tensor " + name);
-  return *t;
-}
-
-Mat LoadMat(const GgufReader& reader, const std::string& name) {
-  const GgufTensorInfo& t = Find(reader, name);
-  const auto type = static_cast<std::uint16_t>(t.type);
-  if (type != kF32 && type != kBF16 && type != kGgmlTypeNvfp4)
-    throw std::runtime_error(
-        "inkling2: the reference reads F32, BF16 and NVFP4 only; " + name +
-        " is stored otherwise");
-  Mat m;
-  m.data = static_cast<const std::uint8_t*>(t.data);
-  m.cols = t.dimensions[0];
-  m.rows = t.dimensions.size() > 1 ? t.dimensions[1] : 1;
-  m.type = type;
-  return m;
-}
-
-/// A small tensor copied out as F32, in storage order.
-Vec LoadVec(const GgufReader& reader, const std::string& name) {
-  const GgufTensorInfo& t = Find(reader, name);
-  const auto type = static_cast<std::uint16_t>(t.type);
-  const std::size_t n = t.ElementCount();
-  Vec out(n);
-  if (type == kF32) {
-    std::memcpy(out.data(), t.data, n * 4);
-  } else if (type == kBF16) {
-    const auto* w = static_cast<const std::uint16_t*>(t.data);
-    for (std::size_t i = 0; i < n; ++i)
-      out[i] = Bf16(w[i]);
-  } else {
-    throw std::runtime_error("inkling2: unexpected storage of " + name);
-  }
-  return out;
-}
-
 // ---- small math --------------------------------------------------------
 
 inline float Sigmoid(float x) {
@@ -289,17 +249,7 @@ std::vector<Vec> Mix(const std::vector<Vec>& blocks, const Vec& cur,
 
 // ---- model -------------------------------------------------------------
 
-struct Layer {
-  bool swa{false};
-  Mat wq, wk, wv, wo, gate, sink, rel, k_conv_proj, v_conv_proj;
-  Mat gate_inp, gate_up, down;
-  Vec q_clip, rel_bias, rel_clip, k_conv, v_conv, attn_post_conv, ffn_post_conv;
-  Vec attn_norm, q_norm, k_norm, v_norm, attn_res_query, ffn_res_query;
-  Vec ffn_norm, exp_probs_b, gate_up_scale, down_scale;
-  // loop core only
-  Vec msg_query;
-  Mat ctrl_down[4], ctrl_gain[4], ctrl_forget[4];
-};
+using Layer = LayerWeights;
 
 /// State of one layer visit: its own KV rows and convolution history.
 struct Slot {
@@ -339,70 +289,13 @@ struct Reference::Impl {
       : c(config) {
     if (gpu)
       backend = gpu;
-    tok_embd = LoadMat(reader, "token_embd.weight");
-    output = LoadMat(reader, "output.weight");
-    tok_norm = LoadVec(reader, "token_embd_norm.weight");
-    output_norm = LoadVec(reader, "output_norm.weight");
-    output_res_query = LoadVec(reader, "output_res_query.weight");
-    layers.resize(c.n_layer);
-    for (std::uint32_t il = 0; il < c.n_layer; ++il) {
-      const std::string b = "blk." + std::to_string(il) + ".";
-      auto mat = [&](const char* n) {
-        return LoadMat(reader, b + n + ".weight");
-      };
-      auto vec = [&](const char* n) {
-        return LoadVec(reader, b + n + ".weight");
-      };
-      Layer& l = layers[il];
-      l.swa = c.is_swa[il];
-      l.wq = mat("attn_q");
-      l.wk = mat("attn_k");
-      l.wv = mat("attn_v");
-      l.wo = mat("attn_output");
-      l.gate = mat("attn_gate");
-      l.sink = mat("attn_sink_proj");
-      l.rel = mat("attn_rel");
-      l.q_clip = vec("attn_q_clip");
-      l.rel_bias = vec("attn_rel_bias");
-      l.rel_clip = vec("attn_rel_clip");
-      l.k_conv = vec("attn_k_conv");
-      l.v_conv = vec("attn_v_conv");
-      l.attn_post_conv = vec("attn_post_conv");
-      l.ffn_post_conv = vec("ffn_post_conv");
-      if (l.swa) {
-        l.attn_norm = vec("attn_norm");
-      } else {
-        l.q_norm = vec("attn_q_inp_norm");
-        l.k_norm = vec("attn_k_inp_norm");
-        l.v_norm = vec("attn_v_inp_norm");
-        l.k_conv_proj = mat("attn_k_conv_proj");
-        l.v_conv_proj = mat("attn_v_conv_proj");
-      }
-      if (il > 0)
-        l.attn_res_query = vec("attn_res_query");
-      l.ffn_res_query = vec("ffn_res_query");
-      l.ffn_norm = vec("ffn_norm");
-      l.gate_inp = mat("ffn_gate_inp");
-      l.gate_up = mat("ffn_gate_up_exps");
-      l.down = mat("ffn_down_exps");
-      if (reader.HasTensor(b + "exp_probs_b.bias"))
-        l.exp_probs_b = LoadVec(reader, b + "exp_probs_b.bias");
-      // Per-expert scales that accompany NVFP4 experts.
-      if (reader.HasTensor(b + "ffn_gate_up_exps.scale"))
-        l.gate_up_scale = LoadVec(reader, b + "ffn_gate_up_exps.scale");
-      if (reader.HasTensor(b + "ffn_down_exps.scale"))
-        l.down_scale = LoadVec(reader, b + "ffn_down_exps.scale");
-      if (il >= c.loop_start && il < c.loop_end) {
-        l.msg_query = vec("loop_msg_query");
-        const char* names[4] = {"q", "k", "v", "ffn"};
-        for (int k = 0; k < 4; ++k) {
-          const std::string p = b + "loop_" + names[k] + "_ctrl_";
-          l.ctrl_down[k] = LoadMat(reader, p + "down.weight");
-          l.ctrl_gain[k] = LoadMat(reader, p + "gain.weight");
-          l.ctrl_forget[k] = LoadMat(reader, p + "forget.weight");
-        }
-      }
-    }
+    Model model = LoadModel(reader, config);
+    tok_embd = model.tok_embd;
+    output = model.output;
+    tok_norm = std::move(model.tok_norm);
+    output_norm = std::move(model.output_norm);
+    output_res_query = std::move(model.output_res_query);
+    layers = std::move(model.layers);
     slots.resize(c.visits());
     trace.attn_out.assign(c.visits(), 0);
     trace.ffn_out.assign(c.visits(), 0);
