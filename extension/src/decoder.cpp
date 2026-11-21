@@ -51,14 +51,26 @@ struct GpuEngine::Impl {
   // kept twice: a step reads one copy and writes the other.
   struct Slot {
     float *k, *v;
-    float* hist[2][4];
     int cap;
   };
   struct Session {
     std::vector<Slot> slots;
     std::uint32_t pos{0};
-    int hist_current{0};
+    // The convolution histories of every layer visit, contiguous: per visit
+    // the last kNC - 1 inputs of K, V, attention output and feed-forward
+    // output (kHistFloats values).
+    float* hist{};
+    // The run of the last tentative step: its first batch row and length.
+    int pending_first{-1}, pending_count{0};
   };
+
+  static constexpr std::size_t kHistFloats = (kNC - 1) * (2 * kHK + 2 * kE);
+  static constexpr std::size_t kHistOffset[4] = {
+      0, (kNC - 1) * kHK, 2 * (kNC - 1) * kHK,
+      2 * (kNC - 1) * kHK + (kNC - 1) * kE};
+  // Each batch row's candidate histories for every visit, written by the rows
+  // that may end a run; committing a row copies its candidate to its session.
+  float* hist_candidates{};
 
   const Model& m;
   const Config& c;
@@ -252,6 +264,7 @@ struct GpuEngine::Impl {
     const int swa_cap = static_cast<int>(c.n_swa + opt.max_batch);
     sessions.resize(opt.sessions);
     for (Session& session : sessions) {
+      session.hist = Floats(kHistFloats * c.visits(), true);
       session.slots.resize(c.visits());
       for (std::uint32_t s = 0; s < c.visits(); ++s) {
         Slot& slot = session.slots[s];
@@ -259,16 +272,11 @@ struct GpuEngine::Impl {
             c.is_swa[Physical(s)] ? swa_cap : static_cast<int>(opt.context);
         slot.k = Floats(std::size_t(slot.cap) * kHK, true);
         slot.v = Floats(std::size_t(slot.cap) * kHK, true);
-        for (int copy = 0; copy < 2; ++copy) {
-          slot.hist[copy][0] = Floats((kNC - 1) * kHK, true);
-          slot.hist[copy][1] = Floats((kNC - 1) * kHK, true);
-          slot.hist[copy][2] = Floats((kNC - 1) * kE, true);
-          slot.hist[copy][3] = Floats((kNC - 1) * kE, true);
-        }
       }
     }
 
     const std::size_t B = opt.max_batch;
+    hist_candidates = Floats(B * c.visits() * kHistFloats);
     cur = Floats(B * kE);
     input = Floats(B * kE);
     in = Floats(B * 3 * kE);
@@ -649,13 +657,9 @@ struct GpuEngine::Impl {
   void Reset(std::uint32_t index) {
     Session& session = sessions.at(index);
     session.pos = 0;
-    for (Slot& slot : session.slots) {
-      float** hist = slot.hist[session.hist_current];
-      Check(hipMemsetAsync(hist[0], 0, (kNC - 1) * kHK * 4, stream), "clear");
-      Check(hipMemsetAsync(hist[1], 0, (kNC - 1) * kHK * 4, stream), "clear");
-      Check(hipMemsetAsync(hist[2], 0, (kNC - 1) * kE * 4, stream), "clear");
-      Check(hipMemsetAsync(hist[3], 0, (kNC - 1) * kE * 4, stream), "clear");
-    }
+    session.pending_first = -1;
+    Check(hipMemsetAsync(session.hist, 0, kHistFloats * c.visits() * 4, stream),
+          "clear");
     Check(hipStreamSynchronize(stream), "synchronize");
   }
 
@@ -695,7 +699,29 @@ struct GpuEngine::Impl {
     session.pos = position;
   }
 
-  void Step(const std::vector<Row>& rows, Head head) {
+  // Copies batch row `b`'s candidate histories into its session.
+  void CommitHistory(Session& session, std::size_t b) {
+    Check(hipMemcpyAsync(session.hist,
+                         hist_candidates + b * c.visits() * kHistFloats,
+                         kHistFloats * c.visits() * 4, hipMemcpyDeviceToDevice,
+                         stream),
+          "commit histories");
+  }
+
+  void Accept(std::uint32_t index, std::uint32_t rows_kept) {
+    Session& session = sessions.at(index);
+    if (session.pending_first < 0 ||
+        rows_kept > static_cast<std::uint32_t>(session.pending_count))
+      throw std::runtime_error("inkling2 gpu: nothing tentative to accept");
+    if (rows_kept > 0) {
+      CommitHistory(session, std::size_t(session.pending_first) + rows_kept - 1);
+      Check(hipStreamSynchronize(stream), "synchronize");
+      session.pos += rows_kept;
+    }
+    session.pending_first = -1;
+  }
+
+  void Step(const std::vector<Row>& rows, Head head, bool tentative) {
     if (rows.empty() || rows.size() > opt.max_batch)
       throw std::runtime_error("inkling2 gpu: batch size out of range");
     batch = static_cast<int>(rows.size());
@@ -745,15 +771,18 @@ struct GpuEngine::Impl {
         state.kv_k = slot.k;
         state.kv_v = slot.v;
         for (int k = 0; k < 4; ++k) {
-          state.hist_in[k] = slot.hist[session.hist_current][k];
-          state.hist_out[k] = slot.hist[1 - session.hist_current][k];
+          state.hist_in[k] = session.hist + s * kHistFloats + kHistOffset[k];
+          state.hist_out[k] = hist_candidates +
+                              (b * c.visits() + s) * kHistFloats +
+                              kHistOffset[k];
         }
         state.cap = slot.cap;
         state.first =
             swa && pos >= c.n_swa ? static_cast<int>(pos - c.n_swa + 1) : 0;
         state.pos = static_cast<int>(pos);
         state.run = run[b];
-        state.last = last[b];
+        // A tentative run may end at any of its rows.
+        state.last = last[b] || tentative ? 1 : 0;
         state.tau = swa ? 1.0f : tau;
         state.layout = swa ? 0 : 1;
         state.chunk_cap = slot.cap / 1024;
@@ -847,6 +876,10 @@ struct GpuEngine::Impl {
                            hipMemcpyDeviceToHost, stream),
             "copy logits");
     }
+    if (!tentative)
+      for (std::size_t b = 0; b < rows.size(); ++b)
+        if (last[b])
+          CommitHistory(sessions[rows[b].session], b);
     Check(hipStreamSynchronize(stream), "synchronize");
     Mark(10);
     n_launches += 6;
@@ -854,8 +887,13 @@ struct GpuEngine::Impl {
     for (std::size_t b = 0; b < rows.size(); ++b)
       if (last[b]) {
         Session& session = sessions[rows[b].session];
-        session.pos += static_cast<std::uint32_t>(run[b]) + 1;
-        session.hist_current = 1 - session.hist_current;
+        if (tentative) {
+          session.pending_first = static_cast<int>(b) - run[b];
+          session.pending_count = run[b] + 1;
+        } else {
+          session.pos += static_cast<std::uint32_t>(run[b]) + 1;
+          session.pending_first = -1;
+        }
       }
   }
 };
@@ -864,8 +902,12 @@ GpuEngine::GpuEngine(const Model& model, const Options& options)
     : impl_(std::make_unique<Impl>(model, options)) {}
 GpuEngine::~GpuEngine() = default;
 
-void GpuEngine::Step(const std::vector<Row>& rows, Head head) {
-  impl_->Step(rows, head);
+void GpuEngine::Step(const std::vector<Row>& rows, Head head, bool tentative) {
+  impl_->Step(rows, head, tentative);
+}
+
+void GpuEngine::Accept(std::uint32_t session, std::uint32_t rows_kept) {
+  impl_->Accept(session, rows_kept);
 }
 
 void GpuEngine::Reset(std::uint32_t session) {

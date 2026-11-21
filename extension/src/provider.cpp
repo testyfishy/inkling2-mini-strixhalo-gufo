@@ -350,6 +350,61 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                   generate * sessions / gen_seconds, generate / gen_seconds,
                   static_cast<double>(engine.launches() - launches_before) /
                       generate);
+      if (const int k = EnvInt("INKLING2_VERIFY_TEST", 0); k > 0 && sessions == 1) {
+        // Replay session 0 from scratch, verifying k "drafted" tokens per
+        // step. Every third draft block is corrupted from its second token.
+        engine.Reset(0);
+        for (std::size_t i = 0; i < n; i += prompt_batch) {
+          std::vector<inkling2::GpuEngine::Row> rows;
+          for (std::size_t j = i; j < std::min(n, i + prompt_batch); ++j)
+            rows.push_back({0, prompt_token(0, j)});
+          engine.Step(rows, i + prompt_batch >= n);
+        }
+        const std::vector<std::uint32_t>& truth = out[0];
+        std::vector<std::uint32_t> replay;
+        std::uint32_t current = engine.argmax(0);
+        int steps = 0, kept = 0;
+        // INKLING2_VERIFY_CORRUPT=0 keeps every draft correct (the best case).
+        const bool corrupt = EnvInt("INKLING2_VERIFY_CORRUPT", 1) != 0;
+        if (const int fake = EnvInt("INKLING2_FAKE_CONTEXT", 0); fake > 0)
+          engine.FakeContext(0, static_cast<std::uint32_t>(fake));
+        const auto verify_start = std::chrono::steady_clock::now();
+        while (replay.size() < truth.size()) {
+          replay.push_back(current);
+          const std::size_t at = replay.size();  // drafts for truth[at...]
+          std::vector<inkling2::GpuEngine::Row> rows{{0, current}};
+          for (int d = 0; d < k && at + d < truth.size(); ++d) {
+            std::uint32_t draft = truth[at + d];
+            if (corrupt && steps % 3 == 2 && d >= 1)
+              draft = (draft + 7) % engine.vocab();  // a wrong draft
+            rows.push_back({0, draft});
+          }
+          engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
+          // Row i's prediction is checked against the draft in row i + 1.
+          std::size_t good = 0;
+          while (good + 1 < rows.size() &&
+                 engine.argmax(good) == rows[good + 1].token)
+            ++good;
+          current = engine.argmax(good);
+          for (std::size_t i = 1; i <= good && replay.size() < truth.size(); ++i)
+            replay.push_back(rows[i].token);
+          engine.Accept(0, static_cast<std::uint32_t>(good + 1));
+          kept += static_cast<int>(good);
+          ++steps;
+        }
+        replay.resize(truth.size());
+        const double verify_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          verify_start)
+                .count();
+        std::printf("verify test: %d steps for %zu tokens in %.2f s (%.1f "
+                    "tokens/s with given drafts, no drafter cost), %d drafts "
+                    "kept, output %s plain generation",
+                    steps, truth.size(), verify_seconds,
+                    truth.size() / verify_seconds, kept,
+                    replay == truth ? "EQUALS" : "DIFFERS FROM");
+        std::printf("%c", 10);
+      }
       if (std::getenv("INKLING2_PROFILE"))
         for (const auto& [name, phase_seconds] : engine.phases())
           std::printf("  %-34s %7.3f ms per step\n", name.c_str(),

@@ -24,7 +24,8 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 10 | `7aa53c5` | 8-bit integer products for NVFP4 experts in batched steps | 18.5 | 130 | 56.2 | PPL 7.799, KLD 0.0020, top token 97.99% |
 | 11 | `1144caa` | Single-row matrix kernel; integer NVFP4 experts with bitwise decode for small steps | 23.7 | 133 | | one row per step: PPL 6.592 vs 6.573, KLD 0.0021, 98.43% (510 positions) |
 | 12 | `93172b8` | Attention kernel for up to 1,024 positions: a thread per position | 25.0 (short context), 23.3 (448 tokens of context; was 18.7) | 145 | | equals the previous kernel to 1e-5 on the float path |
-| 13 | this commit | Attention over long contexts: chunked kernel, full-attention cache laid out per head | 25.0 short; 21.3 / 19.6 / 16.4 / 13.3 at 4K / 16K / 50K / 100K (was 2.0 at 100K) | 145 short; 115 / 78 / 27 at 4K / 16K / 100K | | 4,096-token context vs llama.cpp: PPL 7.496 vs 7.483, KLD 0.0017, top token 97.56% |
+| 13 | `f92929d` | Attention over long contexts: chunked kernel, full-attention cache laid out per head | 25.0 short; 21.3 / 19.6 / 16.4 / 13.3 at 4K / 16K / 50K / 100K (was 2.0 at 100K) | 145 short; 115 / 78 / 27 at 4K / 16K / 100K | | 4,096-token context vs llama.cpp: PPL 7.496 vs 7.483, KLD 0.0017, top token 97.56% |
+| 14 | this commit | Tentative steps: a run of rows can be computed, then only its first rows kept (groundwork for speculative decoding; no drafter yet) | 24.8 plain; with drafts supplied and no drafter cost: 44.0 (3 correct drafts per step), 66.6 (7), 36.7 (3, a third of blocks wrong) | | | verified output equals plain generation, including after rejected drafts |
 
 Notes on reading this table:
 

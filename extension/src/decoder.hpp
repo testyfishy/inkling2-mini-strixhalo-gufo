@@ -51,7 +51,15 @@ public:
   /// Runs the rows. Rows of one session must be adjacent, in order, and a
   /// session may appear once. Read the logits with `logits(i)`, where i counts
   /// the runs in order of appearance (kLast) or the rows (kAll).
-  void Step(const std::vector<Row>& rows, Head head);
+  ///
+  /// A `tentative` step computes everything but does not move the sessions
+  /// forward: afterwards `Accept` keeps the first rows of a session's run and
+  /// drops the rest, which is how drafted tokens are verified. The next step
+  /// of a session overwrites whatever the dropped rows stored.
+  void Step(const std::vector<Row>& rows, Head head, bool tentative = false);
+  /// After a tentative step, keeps the first `rows_kept` rows of `session`'s
+  /// run (0 keeps none).
+  void Accept(std::uint32_t session, std::uint32_t rows_kept);
   void Step(const std::vector<Row>& rows, bool head) {
     Step(rows, head ? Head::kLast : Head::kNone);
   }
