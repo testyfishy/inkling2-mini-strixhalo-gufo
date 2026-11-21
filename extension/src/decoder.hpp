@@ -29,6 +29,9 @@ public:
     /// 16. Faster, and a small change in the arithmetic. Steps of fewer rows
     /// than the expert-major threshold are never affected.
     bool int8_experts{true};
+    /// Whether the 8-bit products are also used in steps of fewer rows than
+    /// the expert-major threshold, which includes single-session generation.
+    bool int8_single{true};
   };
 
   /// Throws std::runtime_error when the model is not Inkling 2 Mini as the

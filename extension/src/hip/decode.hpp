@@ -131,6 +131,8 @@ struct GemmArgs {
   int count;
   int batch;
   int variant;  // 0: a block per output row; 1: a thread per output row
+  // Threads per output row of the single-row kernel: 64 or 128 (0 = 128).
+  int single_threads;
 };
 /// Every job's y[b] = W x[b] for every row, in one launch.
 void Gemm(const GemmArgs& args, hipStream_t stream);
@@ -237,7 +239,9 @@ struct BatchExpertArgs {
   //    to every row that selected it;
   // 3: as 2, but the NVFP4 products use 8-bit integer dot products: the
   //    weights stay exact (they are small integers times a scale) while the
-  //    inputs are rounded to 8 bits per block of 16. BF16 layers use 2.
+  //    inputs are rounded to 8 bits per block of 16. BF16 layers use 2;
+  // 4: the 8-bit integer products with a block per (row, output value), for
+  //    steps of few rows. BF16 layers use 0.
   int variant;
   // Expert-major scratch: for each expert, the (row * kTopK + slot) pairs that
   // selected it (group_list, max_batch entries per expert) and how many

@@ -81,6 +81,7 @@ struct GpuEngine::Impl {
   int major_min_batch{4};
   bool transpose{true};
   int gemm_variant{0}, expert_variant{0};
+  int single_threads{128}, head_threads{64};
   std::uint32_t* sel_ids{};
   // Per-step staging: the row states of every visit, the tokens, the head rows.
   void* staging{};
@@ -297,6 +298,10 @@ struct GpuEngine::Impl {
       gemm_variant = std::atoi(v);
     if (const char* v = std::getenv("INKLING2_EXPERT_VARIANT"))
       expert_variant = std::atoi(v);
+    if (const char* v = std::getenv("INKLING2_GEMV_THREADS"))
+      single_threads = std::atoi(v);
+    if (const char* v = std::getenv("INKLING2_HEAD_THREADS"))
+      head_threads = std::atoi(v);
     contrib = Floats(B * kTopK * kE);
     if (opt.int8_experts) {
       xq = static_cast<std::uint32_t*>(Alloc(B * kE));
@@ -451,6 +456,7 @@ struct GpuEngine::Impl {
     }
     g.batch = batch;
     g.variant = gemm_variant;
+    g.single_threads = single_threads;
     // Above one row, the kernel reads a column-major copy of the inputs.
     const bool use_xt = transpose && batch > 1;
     if (use_xt) {
@@ -510,6 +516,7 @@ struct GpuEngine::Impl {
     o.count = 1;
     o.batch = batch;
     o.variant = gemm_variant;
+    o.single_threads = single_threads;
     if (use_xt) {
       gpu::TransposeArgs tr{};
       tr.x = attn;
@@ -595,6 +602,8 @@ struct GpuEngine::Impl {
     e.variant = expert_variant;
     if (expert_variant == 0 && batch >= major_min_batch)
       e.variant = opt.int8_experts ? 3 : 2;
+    else if (expert_variant == 0 && opt.int8_experts && opt.int8_single)
+      e.variant = 4;
     e.xq = xq;
     e.xs = xs;
     e.aq = aq;
@@ -772,6 +781,7 @@ struct GpuEngine::Impl {
       g.jobs[0] = {output, final_x, kE, logits, vocab, vocab, kE};
       g.count = 1;
       g.batch = static_cast<int>(n_heads);
+      g.single_threads = head_threads;
       gpu::Gemm(g, stream);
       Check(hipMemcpyAsync(host_logits.data(), logits,
                            n_heads * c.n_vocab_padded * 4,

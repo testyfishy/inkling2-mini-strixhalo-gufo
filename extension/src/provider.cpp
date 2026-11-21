@@ -229,6 +229,7 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
         static_cast<std::uint32_t>(std::max(sessions, prompt_batch));
     options.context = 8192;
     options.int8_experts = EnvInt("INKLING2_INT8_EXPERTS", 1) != 0;
+    options.int8_single = EnvInt("INKLING2_INT8_SINGLE", 1) != 0;
     inkling2::GpuEngine engine(model, options);
     std::printf("engine: %d session(s), weights on the device in %.1f s\n",
                 sessions,
@@ -379,6 +380,7 @@ int RunQuality(const gufo::core::GgufReader& reader, const char* path) {
     options.max_batch = static_cast<std::uint32_t>(batch);
     options.context = static_cast<std::uint32_t>(std::max(n_ctx, 1024));
     options.int8_experts = EnvInt("INKLING2_INT8_EXPERTS", 1) != 0;
+    options.int8_single = EnvInt("INKLING2_INT8_SINGLE", 1) != 0;
     inkling2::GpuEngine engine(model, options);
 
     double nll = 0, nll_base = 0, kld_sum = 0, kld_max = 0;
