@@ -23,6 +23,7 @@
 #include "decoder.hpp"
 #include "drafter.hpp"
 #include "gpu.hpp"
+#include "hip/bench.hpp"
 #include "model.hpp"
 #include "reference.hpp"
 #include "serve.hpp"
@@ -1118,6 +1119,8 @@ int Prompt(const gufo::ext::TextPromptOptions&,
     return RunTokenize(reader, text);
   if (const char* cases = std::getenv("INKLING2_CHAT"))
     return RunChatCases(reader, cases);
+  if (std::getenv("INKLING2_WMMA_BENCH"))
+    return inkling2::gpu::RunWmmaBench();
   if (const char* tokens = std::getenv("INKLING2_SWEEP"))
     return RunDepthSweep(reader, tokens);
   if (const char* kld = std::getenv("INKLING2_KLD"))
@@ -1133,7 +1136,8 @@ int Prompt(const gufo::ext::TextPromptOptions&,
 bool DevelopmentMode() {
   for (const char* name :
        {"INKLING2_REF_TOKENS", "INKLING2_KLD", "INKLING2_TOKENIZE",
-        "INKLING2_CHAT", "INKLING2_REPORT", "INKLING2_SWEEP"})
+        "INKLING2_CHAT", "INKLING2_REPORT", "INKLING2_SWEEP",
+        "INKLING2_WMMA_BENCH"})
     if (std::getenv(name))
       return true;
   return false;

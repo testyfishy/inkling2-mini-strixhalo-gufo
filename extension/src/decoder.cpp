@@ -209,6 +209,7 @@ struct GpuEngine::Impl {
   int attn_stats_every{EnvOr("INKLING2_ATTN_STATS", 0)};
   bool attn_stats_now{false};
   int attn_skip{EnvOr("INKLING2_ATTN_SKIP", 0)};
+  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 1)};
   std::uint32_t stats_pos{0};
   struct HeadStats {
     double sink, last_1024, top_2048, pos_999, pos_9999, slice_999, slice_9999,
@@ -1133,6 +1134,7 @@ struct GpuEngine::Impl {
     at.batched = batched;
     at.half = half;
     at.skip = attn_skip;
+    at.fast = attn_fast;
     if (swa && (batched || half))
       at.max_chunks = batched ? 2 : 1;
     if (!swa && batched) {

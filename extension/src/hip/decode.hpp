@@ -291,6 +291,9 @@ struct AttnArgs {
   // Timing experiments on the per-row FP16 kernel: 1 skips the value reads,
   // 2 the key reads. The output is then wrong.
   int skip;
+  // The batched kernel's short path for slices far before the rows (on by
+  // default; INKLING2_ATTN_FAST=0 gives the kernel as it was before).
+  int fast;
   const std::uint16_t* qh;  // stride kHQ
   const AttnGroup* groups;
   int group_count;

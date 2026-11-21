@@ -40,6 +40,7 @@ gufo_extension_target(
 if(TARGET gufo_inkling2_native_gpu)
   gufo_extension_hip_sources(gufo_inkling2_native_gpu
     SOURCES
+      src/hip/bench.hip
       src/hip/decode.hip
       src/hip/ops.hip
   )

@@ -1231,6 +1231,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
   __shared__ float s_red[8][kAQ];
   __shared__ float s_sum[8][kAQ];
   __shared__ float s_f[kAQ];
+  __shared__ int s_flag[2];
   const int tid = threadIdx.x;
   const int lane = tid & 31, wave = tid >> 5;
   const int sl = lane & 15, hi = lane >> 4;
@@ -1263,7 +1264,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
   const int pt = wave & 3, qt0 = (wave >> 2) * 3;
   const int red_slot = pt * 2 + hi;
   int q_index[3], q_pos[3];
-  float q_sink[3], run_max[3], run_sum[3];
+  float q_sink[3], run_max[3];
   const float* q_rel[3];
 #pragma unroll
   for (int i = 0; i < 3; ++i) {
@@ -1275,7 +1276,6 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
     q_sink[i] = a.sink[b * kNH + h];
     q_rel[i] = a.r + b * kNR + h * kNRel;
     run_max[i] = kLowest;
-    run_sum[i] = 0.0f;
   }
   // Keys of entry i (a position, or a ring entry): keys + i * key_stride.
   // Values of dimension d at entry i: values + d * value_stride + i.
@@ -1285,7 +1285,15 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
   const std::size_t key_stride = ring ? kHK : kHD;
   const std::size_t value_stride = ring ? row0.cap : kT;
   Float8 out[2 * kShare] = {};
+  // Each lane's share of its queries' weight sums; combined at the end.
+  float lane_sum[3] = {0.0f, 0.0f, 0.0f};
+  if (tid == 0) {
+    s_flag[0] = 0;
+    s_flag[1] = 0;
+  }
+  __syncthreads();
 
+  int slice = 0;
   for (int chunk = part * span; chunk < (part + 1) * span; ++chunk) {
   const int start = origin + chunk * kT;
   if (start > pos_last)
@@ -1294,29 +1302,47 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
       ring ? row0.vh + static_cast<std::size_t>(kv_head) * kHD * row0.cap
            : row0.vh + (static_cast<std::size_t>(kv_head) * row0.chunk_cap + chunk) *
                            kHD * kT;
-  for (int base = 0; base < kT && start + base <= pos_last; base += kAP) {
+  for (int base = 0; base < kT && start + base <= pos_last;
+       base += kAP, ++slice) {
     // The slice's first entry in the key and in the value arrays.
     const std::size_t key_entry = ring ? (start + base) % row0.cap : start + base;
     const std::size_t value_entry = ring ? key_entry : base;
-    // 1. Keys: s_kv[(position * 8 + step) * 8 ..] = 16 dimensions.
+    // A far slice lies at least `extent` positions before the group's first
+    // row: no row's causal limit and no relative bias reaches it. Almost
+    // every slice of a deep context is far, and for those the block does
+    // only what the arithmetic needs: keys and values go from the cache
+    // straight into the matrix instruction, and the running maximum is only
+    // recomputed when some score exceeds it (s_flag), which after the first
+    // slices is rare.
+    const bool far = a.fast != 0 && !ring &&
+                     pos0 - (start + base + kAP - 1) >= a.extent;
+    const int flag_slot = slice & 1;
+    if (!far) {
+      // 1. Keys: s_kv[(position * 8 + step) * 8 ..] = 16 dimensions.
 #pragma unroll
-    for (int p = 0; p < 2; ++p) {
-      const int unit = p * 256 + tid;
-      const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
-          keys + (key_entry + unit / 8) * key_stride + (unit % 8) * 16);
-      std::uint32_t* dst = s_kv + unit * 8;
+      for (int p = 0; p < 2; ++p) {
+        const int unit = p * 256 + tid;
+        const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
+            keys + (key_entry + unit / 8) * key_stride + (unit % 8) * 16);
+        std::uint32_t* dst = s_kv + unit * 8;
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        dst[i] = src[i];
+        for (int i = 0; i < 8; ++i)
+          dst[i] = src[i];
+      }
+      __syncthreads();
     }
-    __syncthreads();
 
     // 2. Scores.
     Float8 acc[3] = {};
+    const std::uint16_t* far_keys =
+        keys + (key_entry + pt * 16 + sl) * key_stride;
 #pragma unroll
     for (int ks = 0; ks < kHD / 16; ++ks) {
       Half16 xb;
-      __builtin_memcpy(&xb, s_kv + ((pt * 16 + sl) * 8 + ks) * 8, 32);
+      if (far)
+        __builtin_memcpy(&xb, far_keys + ks * 16, 32);
+      else
+        __builtin_memcpy(&xb, s_kv + ((pt * 16 + sl) * 8 + ks) * 8, 32);
 #pragma unroll
       for (int i = 0; i < 3; ++i) {
         Half16 wa;
@@ -1324,50 +1350,73 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
         acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[i]);
       }
     }
-    const int j0 = start + base + pt * 16 + hi;  // position of element 0
-    // Whether any row of the group is within the bias extent of this slice.
-    const bool near = pos0 - (start + base + kAP - 1) < a.extent;
     float val[3][8];
+    bool exceeds = false;
+    if (far) {
 #pragma unroll
-    for (int i = 0; i < 3; ++i) {
-      float local = kLowest;
+      for (int i = 0; i < 3; ++i) {
+        float local = kLowest;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const int j = j0 + 2 * e;
-        float v = kLowest;
-        // A window is the last `extent` positions.
-        if (j <= q_pos[i] && (!ring || q_pos[i] - j < a.extent)) {
-          v = acc[i][e] * a.scale - q_sink[i];
-          const int distance = q_pos[i] - j;
-          if (near && distance < a.extent) {
-            const float* table =
-                a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
-            float bias = 0.0f;
-            for (int x = 0; x < kNRel; ++x)
-              bias += table[x] * q_rel[i][x];
-            v += bias;
-          }
+        for (int e = 0; e < 8; ++e) {
+          const float v = acc[i][e] * a.scale - q_sink[i];
+          val[i][e] = v;
+          local = fmaxf(local, v);
         }
-        val[i][e] = v;
-        local = fmaxf(local, v);
+        s_red[red_slot][q_index[i]] = local;
+        exceeds = exceeds || local > run_max[i];
       }
-      s_red[red_slot][q_index[i]] = local;
+      if (exceeds)
+        s_flag[flag_slot] = 1;
+    } else {
+      const int j0 = start + base + pt * 16 + hi;  // position of element 0
+      // Whether any row of the group is within the bias extent of this slice.
+      const bool near = pos0 - (start + base + kAP - 1) < a.extent;
+#pragma unroll
+      for (int i = 0; i < 3; ++i) {
+        float local = kLowest;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int j = j0 + 2 * e;
+          float v = kLowest;
+          // A window is the last `extent` positions.
+          if (j <= q_pos[i] && (!ring || q_pos[i] - j < a.extent)) {
+            v = acc[i][e] * a.scale - q_sink[i];
+            const int distance = q_pos[i] - j;
+            if (near && distance < a.extent) {
+              const float* table =
+                  a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
+              float bias = 0.0f;
+              for (int x = 0; x < kNRel; ++x)
+                bias += table[x] * q_rel[i][x];
+              v += bias;
+            }
+          }
+          val[i][e] = v;
+          local = fmaxf(local, v);
+        }
+        s_red[red_slot][q_index[i]] = local;
+      }
     }
     __syncthreads();
 
-    // 3. Weights, and the values: s_kv[(tile * 128 + dim) * 8 ..] = 16
-    // positions.
-    float factor[3];
+    // 3. Weights (and, for a slice that is not far, the values:
+    // s_kv[(tile * 128 + dim) * 8 ..] = 16 positions).
+    const bool update = !far || s_flag[flag_slot] != 0;
+    if (tid == 0)
+      s_flag[flag_slot ^ 1] = 0;
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
       float m = run_max[i];
+      if (update) {
 #pragma unroll
-      for (int k = 0; k < 8; ++k)
-        m = fmaxf(m, s_red[k][q_index[i]]);
-      factor[i] = __expf(run_max[i] - m);
-      run_max[i] = m;
-      if (red_slot == 0)
-        s_f[q_index[i]] = factor[i];
+        for (int k = 0; k < 8; ++k)
+          m = fmaxf(m, s_red[k][q_index[i]]);
+        const float factor = __expf(run_max[i] - m);
+        run_max[i] = m;
+        if (red_slot == 0)
+          s_f[q_index[i]] = factor;
+        lane_sum[i] *= factor;
+      }
       float part = 0.0f;
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
@@ -1377,30 +1426,39 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
         s_p[q_index[i]][pt * 16 + 2 * e + hi] = h;
         part += static_cast<float>(h);
       }
-      s_sum[red_slot][q_index[i]] = part;
+      lane_sum[i] += part;
     }
+    if (!far) {
 #pragma unroll
-    for (int p = 0; p < 2; ++p) {
-      const int unit = p * 256 + tid, dim = unit / 4, tile = unit % 4;
-      const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
-          values + dim * value_stride + value_entry + tile * 16);
-      std::uint32_t* dst = s_kv + (tile * kHD + dim) * 8;
+      for (int p = 0; p < 2; ++p) {
+        const int unit = p * 256 + tid, dim = unit / 4, tile = unit % 4;
+        const std::uint32_t* src = reinterpret_cast<const std::uint32_t*>(
+            values + dim * value_stride + value_entry + tile * 16);
+        std::uint32_t* dst = s_kv + (tile * kHD + dim) * 8;
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        dst[i] = src[i];
+        for (int i = 0; i < 8; ++i)
+          dst[i] = src[i];
+      }
     }
     __syncthreads();
 
     // 4. Weighted values; this wave owns dimensions wave * 16 .. + 15.
+    if (update) {
 #pragma unroll
-    for (int qt = 0; qt < 2 * kShare; ++qt)
+      for (int qt = 0; qt < 2 * kShare; ++qt)
 #pragma unroll
-      for (int e = 0; e < 8; ++e)
-        out[qt][e] *= s_f[qt * 16 + 2 * e + hi];
+        for (int e = 0; e < 8; ++e)
+          out[qt][e] *= s_f[qt * 16 + 2 * e + hi];
+    }
+    const std::uint16_t* far_values =
+        values + (wave * 16 + sl) * value_stride + value_entry;
 #pragma unroll
     for (int tile = 0; tile < kAP / 16; ++tile) {
       Half16 wa;
-      __builtin_memcpy(&wa, s_kv + (tile * kHD + wave * 16 + sl) * 8, 32);
+      if (far)
+        __builtin_memcpy(&wa, far_values + tile * 16, 32);
+      else
+        __builtin_memcpy(&wa, s_kv + (tile * kHD + wave * 16 + sl) * 8, 32);
 #pragma unroll
       for (int qt = 0; qt < 2 * kShare; ++qt) {
         Half16 xb;
@@ -1408,15 +1466,10 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
         out[qt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, out[qt]);
       }
     }
-#pragma unroll
-    for (int i = 0; i < 3; ++i) {
-      float sum = 0.0f;
-#pragma unroll
-      for (int k = 0; k < 8; ++k)
-        sum += s_sum[k][q_index[i]];
-      run_sum[i] = run_sum[i] * factor[i] + sum;
-    }
-    __syncthreads();
+    // A slice that is not far reuses s_kv; a far one only needs the two
+    // barriers above (the next slice's weights wait for its first one).
+    if (!far)
+      __syncthreads();
   }
   }
 
@@ -1435,11 +1488,20 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
           part;
       a.chunk_out[slot * kHD + wave * 16 + sl] = out[qt][e] * kUnscale;
     }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < 3; ++i)
+    s_sum[red_slot][q_index[i]] = lane_sum[i];
+  __syncthreads();
   if (red_slot == 0)
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
       if (q_pos[i] < 0)
         continue;
+      float sum = 0.0f;
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        sum += s_sum[k][q_index[i]];
       const int qt = qt0 + i, row = (qt & 1) * 16 + sl;
       const std::size_t slot =
           (static_cast<std::size_t>(group.row0 + row) * kNH + kv_head * kShare +
@@ -1447,7 +1509,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
               a.max_chunks +
           part;
       a.chunk_max[slot] = run_max[i];
-      a.chunk_sum[slot] = run_sum[i] * kUnscale;
+      a.chunk_sum[slot] = sum * kUnscale;
     }
 }
 
