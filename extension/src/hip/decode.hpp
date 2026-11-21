@@ -120,6 +120,11 @@ struct GemmJob {
   float* y;
   int y_stride;
   int rows, cols;
+  // Optional column-major copy of the inputs (see Transpose): when set, the
+  // kernel reads it instead of x. `xt` points at this job's first column of
+  // group 0; groups are xt_group_stride floats apart.
+  const float* xt;
+  int xt_group_stride;
 };
 struct GemmArgs {
   GemmJob jobs[9];
@@ -128,6 +133,18 @@ struct GemmArgs {
 };
 /// Every job's y[b] = W x[b] for every row, in one launch.
 void Gemm(const GemmArgs& args, hipStream_t stream);
+
+/// Column-major copy of `cols` values per row for Gemm: the batch is cut into
+/// groups of kGemmGroup rows, and group g holds its rows' values of column c
+/// together at xt[(g * cols + c) * kGemmGroup + (b - g * kGemmGroup)].
+struct TransposeArgs {
+  const float* x;
+  int x_stride;
+  float* xt;
+  int cols;
+  int batch;
+};
+void Transpose(const TransposeArgs& args, hipStream_t stream);
 
 /// After the projections: K and V short convolutions, the per-head clips and
 /// norms, and the KV cache store.

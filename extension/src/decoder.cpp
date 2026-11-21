@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -71,7 +72,9 @@ struct GpuEngine::Impl {
   float *cur{}, *input{}, *in{}, *msgs{}, *stack{}, *prelude{}, *bank0{},
       *bank_out{}, *q{}, *r{}, *gate{}, *sink{}, *k_raw{}, *v_raw{}, *k_taps{},
       *v_taps{}, *attn{}, *proj{}, *xn{}, *sel_up{}, *sel_coef{}, *act{},
-      *moe{}, *scratch{}, *final_x{}, *logits{}, *low{}, *router_logits{};
+      *moe{}, *scratch{}, *final_x{}, *logits{}, *low{}, *router_logits{},
+      *xt_in{}, *xt_attn{};
+  bool transpose{true};
   std::uint32_t* sel_ids{};
   // Per-step staging: the row states of every visit, the tokens, the head rows.
   void* staging{};
@@ -279,6 +282,11 @@ struct GpuEngine::Impl {
     moe = Floats(B * kE);
     max_n = static_cast<int>(std::max<std::uint32_t>(opt.context, c.n_swa));
     scratch = Floats(B * kNH * std::size_t(max_n));
+    const std::size_t groups = (B + gpu::kGemmGroup - 1) / gpu::kGemmGroup;
+    xt_in = Floats(groups * 3 * kE * gpu::kGemmGroup);
+    xt_attn = Floats(groups * kHQ * gpu::kGemmGroup);
+    if (const char* v = std::getenv("INKLING2_NO_TRANSPOSE"); v && *v == '1')
+      transpose = false;
     low = Floats(B * 3 * kRank);
     router_logits = Floats(B * kNX);
     const std::size_t heads_cap = std::max<std::size_t>(opt.sessions, B);
@@ -371,6 +379,22 @@ struct GpuEngine::Impl {
       g.count = 8;
     }
     g.batch = batch;
+    // Above one row, the kernel reads a column-major copy of the inputs.
+    const bool use_xt = transpose && batch > 1;
+    if (use_xt) {
+      gpu::TransposeArgs tr{};
+      tr.x = in;
+      tr.x_stride = 3 * kE;
+      tr.xt = xt_in;
+      tr.cols = 3 * kE;
+      tr.batch = batch;
+      gpu::Transpose(tr, stream);
+      for (int j = 0; j < g.count; ++j) {
+        const std::size_t column = static_cast<std::size_t>(g.jobs[j].x - in);
+        g.jobs[j].xt = xt_in + column * gpu::kGemmGroup;
+        g.jobs[j].xt_group_stride = 3 * kE * gpu::kGemmGroup;
+      }
+    }
     gpu::Gemm(g, stream);
     Mark(1);
 
@@ -413,6 +437,17 @@ struct GpuEngine::Impl {
     o.jobs[0] = {l.wo, attn, kHQ, proj, kE, kE, kHQ};
     o.count = 1;
     o.batch = batch;
+    if (use_xt) {
+      gpu::TransposeArgs tr{};
+      tr.x = attn;
+      tr.x_stride = kHQ;
+      tr.xt = xt_attn;
+      tr.cols = kHQ;
+      tr.batch = batch;
+      gpu::Transpose(tr, stream);
+      o.jobs[0].xt = xt_attn;
+      o.jobs[0].xt_group_stride = kHQ * gpu::kGemmGroup;
+    }
     gpu::Gemm(o, stream);
     Mark(4);
 

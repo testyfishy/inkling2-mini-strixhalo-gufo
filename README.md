@@ -56,8 +56,15 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       norms, convolutions, attention over a device KV cache, routing). All 48 layer visits match
       the CPU reference to about 2.5e-4 and the greedy tokens are identical. **20.9 tokens/s**
       single stream at native precision, against 19.5 for llama.cpp HIP on the same file
-- [ ] M4: speed beyond single-stream decode: speculative decoding with the model's DSpark
-      drafter, and batched decode across sessions
+- [x] M4a: batched engine over (session, position) rows: several sessions decode together and
+      prompts are fed several tokens per step, with per-session KV caches on the device.
+      Verified equal to unbatched runs. 19.4 tokens/s for one session, 44.4 total for 16;
+      prompts at 49 tokens/s
+- [x] Quality harness: perplexity 7.793 vs 7.778, mean KLD 0.0021 and 98.19% top-token
+      agreement against llama.cpp on wikitext-2 (see [docs/QUALITY.md](docs/QUALITY.md))
+- [ ] M4b: expert kernels that share work across rows and decode NVFP4 faster (70% of a
+      batched step), then prompt processing at a competitive rate
+- [ ] M4c: speculative decoding with the model's DSpark drafter
 - [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [ ] M5: continuation cache, so conversations resume without reprocessing

@@ -347,14 +347,25 @@ __launch_bounds__(kGemmThreads) __global__ void GemmKernel(GemmArgs a) {
   const int b0 = group * kGemmGroup;
   const int nb = a.batch - b0 < kGemmGroup ? a.batch - b0 : kGemmGroup;
   const std::uint16_t* row = job.w + static_cast<std::size_t>(r) * job.cols;
-  const float* x = job.x + static_cast<std::size_t>(b0) * job.x_stride;
   float acc[kGemmGroup];
   for (int b = 0; b < nb; ++b)
     acc[b] = 0.0f;
-  for (int c = t; c < job.cols; c += kGemmThreads) {
-    const float w = Bf16(row[c]);
-    for (int b = 0; b < nb; ++b)
-      acc[b] += w * x[static_cast<std::size_t>(b) * job.x_stride + c];
+  if (job.xt) {
+    // Column-major inputs: one contiguous read per column for all rows.
+    const float* xt = job.xt + static_cast<std::size_t>(group) * job.xt_group_stride;
+    for (int c = t; c < job.cols; c += kGemmThreads) {
+      const float w = Bf16(row[c]);
+      const float* column = xt + static_cast<std::size_t>(c) * kGemmGroup;
+      for (int b = 0; b < nb; ++b)
+        acc[b] += w * column[b];
+    }
+  } else {
+    const float* x = job.x + static_cast<std::size_t>(b0) * job.x_stride;
+    for (int c = t; c < job.cols; c += kGemmThreads) {
+      const float w = Bf16(row[c]);
+      for (int b = 0; b < nb; ++b)
+        acc[b] += w * x[static_cast<std::size_t>(b) * job.x_stride + c];
+    }
   }
   for (int b = 0; b < nb; ++b)
     sh[b][t] = acc[b];
@@ -368,6 +379,19 @@ __launch_bounds__(kGemmThreads) __global__ void GemmKernel(GemmArgs a) {
   if (t == 0)
     for (int b = 0; b < nb; ++b)
       job.y[static_cast<std::size_t>(b0 + b) * job.y_stride + r] = sh[b][0];
+}
+
+// One thread per (row, column).
+__global__ void TransposeKernel(TransposeArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t b = idx / a.cols;
+  const int c = static_cast<int>(idx % a.cols);
+  if (b >= static_cast<std::size_t>(a.batch))
+    return;
+  const std::size_t group = b / kGemmGroup;
+  a.xt[(group * a.cols + c) * kGemmGroup + b % kGemmGroup] =
+      a.x[b * a.x_stride + c];
 }
 
 // One block per row.
@@ -772,6 +796,11 @@ void Gemm(const GemmArgs& args, hipStream_t stream) {
     rows += args.jobs[j].rows;
   const int groups = (args.batch + kGemmGroup - 1) / kGemmGroup;
   GemmKernel<<<rows * groups, kGemmThreads, 0, stream>>>(args);
+}
+
+void Transpose(const TransposeArgs& args, hipStream_t stream) {
+  TransposeKernel<<<Blocks(std::size_t(args.batch) * args.cols, 256), 256, 0,
+                    stream>>>(args);
 }
 
 void GlueB(const GlueBArgs& args, hipStream_t stream) {

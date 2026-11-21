@@ -130,6 +130,51 @@ context, and the 1,024-token sliding window wrap is untested on the GPU), prompt
 batches (prompts are currently fed one token at a time, about 24 tokens/s), sampling, and
 anything through GUFO's serving interface.
 
+## Extension, batched engine, 2026-11-21
+
+One step now runs a batch of rows, each a (session, position). Same file; greedy decode.
+
+### Several sessions decoded together
+
+| Sessions | Total (t/s) | Per session (t/s) |
+|---:|---:|---:|
+| 1 | 19.4 | 19.4 |
+| 4 | 35.3 | 8.8 |
+| 8 | 39.0 | 4.9 |
+| 16 | 44.4 | 2.8 |
+
+The 8-session figure predates the column-major input change below; the others include it.
+One session is slightly slower than the unbatched decoder (20.9) because the kernels are now
+general over the batch.
+
+### Prompt processing
+
+| Feeding | Prompt (t/s) |
+|---|---:|
+| One token per step | 21 |
+| 16 rows per step | 49 |
+| llama.cpp HIP, same file (baseline) | 346 to 520 |
+
+Prompt processing is far behind llama.cpp. Batching more rows does not fix it by itself, for
+the reason the profile below shows.
+
+### Where a 16-row step goes (360 ms)
+
+| Kernel group | ms per step | Note |
+|---|---:|---|
+| NVFP4 experts | 215 | 13 ms per row: every row decodes its own 8 experts |
+| Input projections | 39 | was 63 before reading the inputs column-major |
+| BF16 experts | 39 | |
+| Output head | 28 | decode only; prompts need it once |
+| Output projection | 16 | was 37 |
+| Everything else | about 23 | |
+
+With several rows the kernels are no longer limited by memory bandwidth but by how many
+multiply-adds per second they achieve: about 400 billion per second in the projections and
+about 190 billion in the experts. Both are well below what this GPU can do. The experts are
+70% of a batched step and are the next target: rows that select the same expert should share
+one decode of its weights, and the decode itself needs to be cheaper.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
