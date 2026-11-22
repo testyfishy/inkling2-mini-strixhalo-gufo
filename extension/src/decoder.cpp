@@ -209,11 +209,15 @@ struct GpuEngine::Impl {
   int attn_stats_every{EnvOr("INKLING2_ATTN_STATS", 0)};
   bool attn_stats_now{false};
   int attn_skip{EnvOr("INKLING2_ATTN_SKIP", 0)};
+  int expert_skip{EnvOr("INKLING2_EXPERT_SKIP", 0)};
   // Bit 16: the one-pass kernel (AttentionFlashKernel), whose blocks take
   // groups of up to 64 rows; the older batched kernels take 32.
   int attn_fast{EnvOr("INKLING2_ATTN_FAST", 31)};
-  std::size_t attn_group_rows{(attn_fast & 16) ? std::size_t{64}
-                                               : std::size_t(gpu::kAttnRows)};
+  // Steps of fewer rows (draft verification) keep the kernels that split a
+  // context into parts: one block walking a whole context for a handful of
+  // rows was slower.
+  int attn_flash_min{EnvOr("INKLING2_ATTN_FLASH_MIN", 64)};
+  bool flash_now{false};
   int wmma_direct{(gpu::SetWmmaDirect(EnvOr("INKLING2_WMMA_DIRECT", 0)), 0)};
   std::uint32_t stats_pos{0};
   struct HeadStats {
@@ -1139,7 +1143,7 @@ struct GpuEngine::Impl {
     at.batched = batched;
     at.half = half;
     at.skip = attn_skip;
-    at.fast = attn_fast;
+    at.fast = flash_now ? attn_fast : (attn_fast & ~16);
     if (swa && (batched || half))
       at.max_chunks = batched ? 2 : 1;
     if (!swa && batched) {
@@ -1338,6 +1342,7 @@ struct GpuEngine::Impl {
     e.contrib = contrib;
     e.xh = xh_x;
     e.wmma_tiles = expert_tiles;
+    e.timing = expert_skip;
     e.acth = acth;
     e.max_batch = static_cast<int>(opt.max_batch);
     gpu::BatchExperts(e, stream);
@@ -1601,6 +1606,10 @@ struct GpuEngine::Impl {
     // most kAttnRows rows.
     auto* groups =
         reinterpret_cast<gpu::AttnGroup*>(host_staging.data() + off_groups);
+    flash_now = (attn_fast & 16) != 0 &&
+                rows.size() >= static_cast<std::size_t>(attn_flash_min);
+    const std::size_t attn_group_rows =
+        flash_now ? std::size_t{64} : std::size_t(gpu::kAttnRows);
     n_groups = 0;
     for (std::size_t b = 0; b < rows.size();) {
       std::size_t end = b + 1;

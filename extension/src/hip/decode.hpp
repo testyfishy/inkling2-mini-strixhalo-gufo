@@ -378,6 +378,9 @@ struct BatchExpertArgs {
   float* as;
   // Variant 5: pairs per block / 32 (1, 2 or 4; 0 = by batch).
   int wmma_tiles;
+  // Timing experiments (INKLING2_EXPERT_SKIP): 1 no weight conversion, 2 no
+  // products. The output is then wrong.
+  int timing;
   // Variant 5 scratch: FP16 copies of x (kE per row) and act (kFF per pair).
   std::uint16_t* xh;
   std::uint16_t* acth;

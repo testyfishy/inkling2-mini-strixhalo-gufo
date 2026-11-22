@@ -11,6 +11,10 @@ namespace inkling2::gpu {
 namespace {
 
 // Slices of 16 columns the staged kernels hold in shared memory at once.
+#ifndef INKLING2_STAGE_ROW
+#define INKLING2_STAGE_ROW 8
+#endif
+constexpr int kStageRow = INKLING2_STAGE_ROW;
 #ifndef INKLING2_FLASH_PAD
 #define INKLING2_FLASH_PAD 8
 #endif
@@ -562,8 +566,10 @@ int g_direct = 0;
 template <int WTS, bool Direct>
 __launch_bounds__(256) __global__ void WmmaGemmBlockKernel(GemmArgs a) {
   constexpr int BM = 128, BN = 32 * WTS, BK = INKLING2_BK;
-  __shared__ std::uint32_t s_a[Direct ? 1 : BK][Direct ? 1 : BM][8];
-  __shared__ std::uint32_t s_b[Direct ? 1 : BK][Direct ? 1 : BN][8];
+  // Rows of 8 words padded to kStageRow, so that a wave's lanes read
+  // different banks of shared memory.
+  __shared__ std::uint32_t s_a[Direct ? 1 : BK][Direct ? 1 : BM][kStageRow];
+  __shared__ std::uint32_t s_b[Direct ? 1 : BK][Direct ? 1 : BN][kStageRow];
   const int tid = threadIdx.x;
   const int lane = tid & 31, wave = tid >> 5;
   const int sl = lane & 15, hi = lane >> 4;
@@ -2615,8 +2621,8 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
   constexpr int BM = 128, BN = 32 * WTS, BK = INKLING2_BK;
   constexpr int kCols = Up ? kE : kFF;
   constexpr int kPerExpert = Up ? kFF / 64 : kE / BM;
-  __shared__ std::uint32_t s_a[BK][BM][8];
-  __shared__ std::uint32_t s_b[DirectX ? 1 : BK][DirectX ? 1 : BN][8];
+  __shared__ std::uint32_t s_a[BK][BM][kStageRow];
+  __shared__ std::uint32_t s_b[DirectX ? 1 : BK][DirectX ? 1 : BN][kStageRow];
   const int tid = threadIdx.x;
   const int lane = tid & 31, wave = tid >> 5;
   const int sl = lane & 15, hi = lane >> 4;
@@ -2675,6 +2681,8 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
     for (int p = 0; p < UA; ++p) {
       const int unit = p * 256 + tid, ks = unit % BK;
       std::uint32_t* dst = s_a[ks][unit / BK];
+      if (a.timing & 1)  // timing: no weight conversion
+        continue;
       if constexpr (Nvfp4)
         LoadHalfNvfp4(w_row[p], k / 16 + ks, dst);
       else
@@ -2696,7 +2704,7 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
     }
     }
     __syncthreads();
-    if (live > 0) {
+    if (live > 0 && !(a.timing & 2)) {  // timing: no products
 #pragma unroll
       for (int ks = 0; ks < BK; ++ks) {
         Half16 wa[2];
