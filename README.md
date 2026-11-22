@@ -110,6 +110,8 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       the same text as without drafts). Measured
       through the server: 1,056 tokens/s on a 4K prompt, 555 on a 100K prompt, 24.0 tokens/s
       generation ([docs/SERVING.md](docs/SERVING.md))
+- [ ] M7: a standard benchmark panel comparing this model at released precision with a larger
+      4-bit model on the same machine: prepared, not run ([docs/EVALS.md](docs/EVALS.md))
 - [ ] M5b: what serving still lacks: batched decode across sessions, smaller checkpoints,
       `tool_choice: required` in the model's own framing, the disk cache and GUFO's
       conformance suites

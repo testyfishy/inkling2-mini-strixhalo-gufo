@@ -1,0 +1,12 @@
+# The environment the benchmark harnesses run in. Built once on the test machine:
+#   podman build -t localhost/inkling-evals:1 -f evals/Containerfile evals
+# The harness repositories and datasets are not baked in; evals/prepare.sh
+# downloads them into a directory that is mounted at /evals.
+FROM docker.io/library/python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir \
+    "openai>=1.40" "datasets>=2.20" "huggingface_hub>=0.24" pandas numpy tqdm requests \
+    jinja2 tenacity tiktoken blobfile scipy pebble annotated-types pydantic
+ENV HF_HOME=/evals/hf PYTHONUNBUFFERED=1
+WORKDIR /evals
