@@ -162,6 +162,42 @@ at 4,096 tokens, unchanged.
 The script collects what was run here in several separate sessions; it has not been run from
 start to end in this form.
 
+### Cache reuse with a large RAM budget and the disk tier, 2026-11-21
+
+The cache is GUFO's; nothing in it is fixed by this extension except what a checkpoint costs:
+525 MB of private state, plus 33 KB per token of rows that checkpoints of one conversation
+share. GUFO's own policy is dynamic: the RAM budget defaults to half of the free memory (at
+most 32 GiB), a request keeps up to four checkpoints on a 2,048-token grid with the last one
+within 2,048 tokens of the prompt's end, a point where two prompts diverge is learned and kept
+once a second prompt shows it, and under pressure the least useful checkpoints go first.
+
+With `--cache-ram-bytes 34359738368 --cache-disk DIR --cache-disk-bytes 42949672960`:
+
+| Request | From cache | Processed | Time to first token |
+|---|---:|---:|---:|
+| 32K prompt, cold | 0 | 33,851 | 39.5 s |
+| 32K prompt, other question at the end | 32,768 | 1,090 | 2.0 s |
+| 100K prompt (shares the first 32K) | 32,768 | 67,253 | 126 s |
+| 100K prompt, other question at the end | 98,304 | 1,724 | 4.4 s |
+| After a server restart: the 32K request | 33,858 from disk in 0.43 s | 0 | 0.52 s |
+| After a server restart: the 100K requests | 100,021 and 100,028 from disk in 0.86 and 0.98 s | 0 | 1.1 s |
+
+So the earlier figures in the table above (2,048 of 3,845, 24,576 of 33,860 and 73,728 of
+100,028 tokens from cache) were not the policy's limit: those runs had an 8 to 20 GB budget
+that earlier test requests had filled, and the newest grid checkpoints were the ones dropped.
+With room, changing the end of a long prompt costs at most one pass of 2,048 tokens. The disk
+directory held 19 GB after these requests.
+
+The adapter also gives GUFO this model's measured costs (`Cost()`): 0.94 ms per prompt token
+plus 1.35 ms per 100,000 tokens of depth, 90 GB/s to restore from RAM and 4 GB/s from disk.
+GUFO documents that estimate as diagnostic for now.
+
+What decides whether reuse pays here: restoring from RAM took 5 to 42 ms and from disk 0.4 to
+1.0 s, while reprocessing costs 1 ms per token near the start and 2.3 ms at 100,000 tokens. A
+RAM checkpoint therefore pays from a few dozen tokens on, a disk one from about a thousand,
+and the deeper the context the more a checkpoint is worth. The 2,048-token grid is GUFO's and
+equals this engine's pass size; one pass costs 2 s near the start and 4.7 s at 100,000 tokens.
+
 ### Not done, or known to be weak
 
 - `gufo prompt` and `gufo chat` reach a runner without drivers only in GUFO revisions newer than
@@ -169,16 +205,17 @@ start to end in this form.
 - `tool_choice: "required"` gave a direct call in 1.8 s once the grammar read the framing tokens
   as the text the server sees (one request tested; before that the model wrote several
   sentences first). Strict tool schemas were not tested.
-- GUFO keeps checkpoints at the end of a prompt and at a few pass boundaries inside it. A
-  conversation that only grows resumes from its end; changing the end of a long prompt
-  reprocesses from the last kept boundary (26,300 tokens in the 100K test).
+- Each checkpoint's 525 MB of private state limits how many fit: about 60 in the default
+  32 GiB. With a small budget the newest checkpoints inside a prompt are dropped first, and
+  changing the end of a long prompt then reprocesses from an earlier one (26,300 tokens in the
+  first 100K test).
 - With several sessions, requests take turns step by step: two at once both finished
   correctly, each slower than alone (4.4 s against 2.4 s for the short one). The engine's
   batched decode across sessions, which would run them in one step, is not wired to the
   server yet.
 - The 525 MB of private state per checkpoint could shrink to about a third by saving only the
   live part of each ring.
-- Not tested: the disk cache, log-probabilities, reasoning budgets, cancellation inside a
+- Not tested: log-probabilities, reasoning budgets, cancellation inside a
   step, GUFO's functional conformance suites, image input (not implemented).
 - Drafts when sampling were measured with one seed on one text; how often they are kept at
   temperature 1.0 on real work was not studied.
