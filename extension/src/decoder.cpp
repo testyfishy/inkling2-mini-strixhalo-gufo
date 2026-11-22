@@ -209,7 +209,8 @@ struct GpuEngine::Impl {
   int attn_stats_every{EnvOr("INKLING2_ATTN_STATS", 0)};
   bool attn_stats_now{false};
   int attn_skip{EnvOr("INKLING2_ATTN_SKIP", 0)};
-  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 1)};
+  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 15)};
+  int wmma_direct{(gpu::SetWmmaDirect(EnvOr("INKLING2_WMMA_DIRECT", 0)), 0)};
   std::uint32_t stats_pos{0};
   struct HeadStats {
     double sink, last_1024, top_2048, pos_999, pos_9999, slice_999, slice_9999,

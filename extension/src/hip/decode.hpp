@@ -433,4 +433,7 @@ void Dot2Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
 void FloatBench(const float* w, const float* xt, int rows, int cols, int batch,
                 float* y, hipStream_t stream);
 
+/// Experiment switch, see g_direct in decode.hip.
+void SetWmmaDirect(int bits);
+
 }  // namespace inkling2::gpu
