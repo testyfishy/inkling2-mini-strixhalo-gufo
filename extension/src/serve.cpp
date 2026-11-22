@@ -161,6 +161,13 @@ public:
       return {};
     return {{page, blocks, header + blocks * per_block}};
   }
+  // What reprocessing costs against restoring, measured on gfx1151 (see
+  // docs/BENCHMARKS.md and docs/SERVING.md): a prompt token takes 0.94 ms
+  // plus 1.35 ms per 100,000 tokens of depth; a checkpoint restores at about
+  // 90 GB/s from RAM and 4 GB/s from disk.
+  [[nodiscard]] std::optional<cache::CostEstimate> Cost() const override {
+    return cache::CostEstimate{0.00094, 0.00135, 90e9, 4e9};
+  }
   [[nodiscard]] cache::Capabilities GetCapabilities() const override {
     return {.continuation = true, .persistent_encoding = true};
   }
