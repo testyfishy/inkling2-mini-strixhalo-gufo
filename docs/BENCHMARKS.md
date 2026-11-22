@@ -692,6 +692,69 @@ worth its footprint. In the far attention kernel, turning the score products off
 nothing while turning the value products off saves 0.6 s and both 1.24 s; what the score phase
 waits for is not identified yet.
 
+## One-pass attention, and the sweep to 1,040,000 tokens, 2026-11-22
+
+Step 29 replaces the batched attention kernels for prompt steps with `AttentionFlashKernel`,
+which follows the prefill attention kernel of
+[headbouyJB/inkling2-gufo](https://github.com/headbouyJB/inkling2-gufo) (MIT; see
+`extension/THIRD_PARTY.md`). What it does differently from the kernels of steps 17 to 28:
+
+- A wave owns 16 rows of one query head and keeps their queries, their running softmax and
+  their output in registers for the whole context. The kernels before split a context into
+  16 parts and combined them in a second kernel.
+- The weights go from the first product to the second by an exchange between lane pairs,
+  not through shared memory. Step 28's timing switches had just shown that reading the
+  weights back from shared memory was most of the second product's cost (0.56 of 0.68 s).
+- The rows of keys and values staged in shared memory are padded by 16 bytes. With a row
+  stride that is a power of two, the 16 lanes of a wave read the same bank of shared memory
+  at once: without the padding this kernel ran at 420 tokens/s at 100,000 tokens (slower than
+  step 28), with it at 805. Paddings of 8, 16 and 24 bytes gave the same.
+
+Steps of fewer than 64 rows (verifying drafts) keep the older kernels: one block walking a
+whole context for a handful of rows was slower there (385 against 168 ms at 100,000 tokens).
+
+Prompt speed at depth, same real text and method as the baseline above (2,048 rows per step):
+
+| Depth | Step 25 | Step 28 | Step 29 | One token, step 29 | Generation |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 1,068 t/s | 1,113 | 1,189 | 43.4 ms | 23.1 t/s |
+| 16,384 | 847 | 981 | 1,121 | 44.6 | 22.4 |
+| 32,768 | 678 | 867 | 1,024 | 48.2 | 20.7 |
+| 65,536 | 486 | | 891 | 55.8 | 17.9 |
+| 100,000 | 378 | 594 | 787 | 63.3 | 15.8 |
+| 131,072 | 310 | | 708 | 70.2 | 14.3 |
+| 196,608 | 227 | | 584 | 84.6 | 11.8 |
+| 262,144 | | | 498 | 98.8 | 10.1 |
+| 393,216 | | | 384 | 127.5 | 7.8 |
+| 524,288 | | | 312 | 156.1 | 6.4 |
+| 655,360 | | | 263 | 184.7 | 5.4 |
+| 786,432 | | | 227 | 213.5 | 4.7 |
+| 917,504 | | | 199 | 242.1 | 4.1 |
+| 1,040,000 | | | 180 | 268.6 | 3.7 |
+
+Time to process a prompt from nothing: 4 s for 4,096 tokens, 30 s for 32,768, 106 s for
+100,000 (step 25: 180 s), 251 s for 196,608 (was 554 s), 373 s for 262,144, 1,057 s for
+524,288 and 3,323 s (55 minutes) for 1,040,000. This is the first run of the engine beyond
+196,608 tokens; it completed, and the most likely next token was the text's own at 9 of the
+15 depths, 1,040,000 included. Correctness against llama.cpp is still only checked to 4,096
+tokens. Generation was not touched: one token costs 42 ms plus 0.22 ms per 1,000 tokens of
+depth, which is reading the cache (33 KB per token of context).
+
+Quality: KLD 0.001490 at 4,096 tokens with 256 rows per step (perplexity 7.4847 against
+llama.cpp's 7.4828, same top token 97.70%) and 0.002124 at 512 tokens with 64 rows per step.
+
+A 2,048-row step at short context is now 1.73 s (1,185 tokens/s): NVFP4 experts 0.72 s,
+input projections 0.23, attention 0.16, loop controllers 0.19, the rest 0.43. At 100,000
+tokens attention is 0.99 s of 2.5 s.
+
+The expert kernel with parts switched off (`INKLING2_EXPERT_SKIP`): of its 0.71 s, 0.28 s is
+converting the 4-bit weights to FP16, 0.30 s the products, 0.22 s everything else. Tried on it
+and left out: padding its staged rows like the attention kernel's (0.74 s), doing the
+conversion's multiplication in FP16 (0.72 s, same output).
+
+Not built: using the CPU cores for part of the attention arithmetic. At 12e12 multiply-adds
+per second on the GPU, 16 cores would add well under a tenth, for a large change.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

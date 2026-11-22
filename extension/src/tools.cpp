@@ -144,7 +144,12 @@ void RegisterToolDialect() {
   sampling::JsonConstraint::ToolSyntax syntax;
   syntax.open = std::string(kToolOpen);
   syntax.name_suffix = std::string(kToolNameSuffix);
-  syntax.close = std::string(kToolClose);
+  // What a grammar must see at the end of a call. The model ends a call with
+  // <|end_message|>, and a grammar reads that token as "</think>" (it ends a
+  // thinking block the same way; see BuildConstraintVocabulary in serve.cpp),
+  // so that is the spelling here. The text the server parses still shows
+  // </tool_call>, which ScanToolCalls reads.
+  syntax.close = "}</think>";
   syntax.name_delimiters = "\"";
   syntax.values.whitespace = false;
   syntax.values.sorted_keys = true;

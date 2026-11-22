@@ -102,6 +102,10 @@ What the runner does:
   `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>`;
   the server sees `<tool_call>{"name":"NAME","args":{...}}</tool_call>`, a syntax registered as
   GUFO tool dialect `inkling2` with its scanner (`tools.cpp`).
+  The dialect tells GUFO's grammar that a call ends with `}</think>`: the model ends a call
+  with `<|end_message|>`, which a grammar reads as `</think>` (next point). With the visible
+  `</tool_call>` there instead, a second call in one turn derailed into junk text once
+  thinking was on.
 - **Continuation cache.** GUFO keeps checkpoints of a session and restores them when a later
   request shares a prefix. The adapter describes the engine's state to it: per full-attention
   layer visit and head, keys as one row per position and values as one row per 1,024 positions,
