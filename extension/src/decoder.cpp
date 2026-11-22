@@ -209,7 +209,11 @@ struct GpuEngine::Impl {
   int attn_stats_every{EnvOr("INKLING2_ATTN_STATS", 0)};
   bool attn_stats_now{false};
   int attn_skip{EnvOr("INKLING2_ATTN_SKIP", 0)};
-  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 15)};
+  // Bit 16: the one-pass kernel (AttentionFlashKernel), whose blocks take
+  // groups of up to 64 rows; the older batched kernels take 32.
+  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 31)};
+  std::size_t attn_group_rows{(attn_fast & 16) ? std::size_t{64}
+                                               : std::size_t(gpu::kAttnRows)};
   int wmma_direct{(gpu::SetWmmaDirect(EnvOr("INKLING2_WMMA_DIRECT", 0)), 0)};
   std::uint32_t stats_pos{0};
   struct HeadStats {
@@ -1600,7 +1604,7 @@ struct GpuEngine::Impl {
     n_groups = 0;
     for (std::size_t b = 0; b < rows.size();) {
       std::size_t end = b + 1;
-      while (end < rows.size() && end - b < std::size_t(gpu::kAttnRows) &&
+      while (end < rows.size() && end - b < attn_group_rows &&
              rows[end].session == rows[b].session)
         ++end;
       groups[n_groups++] = {static_cast<std::int32_t>(b),

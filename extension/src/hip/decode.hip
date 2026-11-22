@@ -11,6 +11,9 @@ namespace inkling2::gpu {
 namespace {
 
 // Slices of 16 columns the staged kernels hold in shared memory at once.
+#ifndef INKLING2_FLASH_PAD
+#define INKLING2_FLASH_PAD 8
+#endif
 #ifndef INKLING2_BK
 #define INKLING2_BK 4
 #endif
@@ -1429,9 +1432,11 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
         continue;
 #pragma unroll
       for (int i = 0; i < 3; ++i) {
-        Half16 wa;
-        if constexpr (QDirect)
-          __builtin_memcpy(&wa, q_ptr[i] + ks * 16, 32);
+        Half16 wa = {};
+        if constexpr (QDirect) {
+          if (!(far && (a.skip & 128)))  // timing: no query reads
+            __builtin_memcpy(&wa, q_ptr[i] + ks * 16, 32);
+        }
         else
           __builtin_memcpy(&wa, &s_q[q_index[i]][ks * 8], 32);
         acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, acc[i]);
@@ -1556,8 +1561,9 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
         continue;
 #pragma unroll
       for (int qt = 0; qt < 2 * kShare; ++qt) {
-        Half16 xb;
-        __builtin_memcpy(&xb, &s_p[qt * 16 + sl][tile * 16], 32);
+        Half16 xb = {};
+        if (!(far && (a.skip & 256)))  // timing: no weight reads
+          __builtin_memcpy(&xb, &s_p[qt * 16 + sl][tile * 16], 32);
         out[qt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(xb, wa, out[qt]);
       }
     }
@@ -1605,6 +1611,186 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
           part;
       a.chunk_max[slot] = run_max[i];
       a.chunk_sum[slot] = sum * kUnscale;
+    }
+}
+
+// ---- one pass over the keys, softmax and weights in registers ----------------
+//
+// The design of the prefill attention kernel in headbouyJB/inkling2-gufo
+// (lab/attn/attn_kernels.h, MIT), written for this engine's caches and
+// arithmetic. One block per (group of up to 64 consecutive rows, key head);
+// each of its 12 waves owns 16 rows of one query head and keeps, in
+// registers, those queries, their running softmax and their output. The
+// block walks the keys 64 at a time (keys and values staged once in shared
+// memory); per 16 keys a wave computes scores with the matrix instruction,
+// updates its maximum and sum, exchanges the weights between its lane pairs
+// to form the operand of the second product, and accumulates the weighted
+// values. No weights go through shared memory, nothing is left for a second
+// kernel, and a row's whole context is one stream.
+//
+// Arithmetic as in the kernels above: scores from FP16 queries and keys with
+// FP32 sums, times `scale`, minus the row's sink; the relative bias in FP32
+// within `extent`; weights as FP16 times 2^15; the zero sink as the initial
+// state (maximum 0, sum 1); the output gate at the end.
+constexpr int kFlashPad = INKLING2_FLASH_PAD;  // see s_k below
+constexpr int kFlashKeys = 64;  // keys staged at once
+
+__launch_bounds__(384) __global__ void AttentionFlashKernel(AttnArgs a) {
+  // Rows are padded by 16 bytes: with a stride that is a power of two, the
+  // 16 lanes of a wave would read the same bank of shared memory at once.
+  __shared__ __attribute__((aligned(16))) std::uint16_t s_k[kFlashKeys][kHD + kFlashPad];
+  __shared__ __attribute__((aligned(16))) std::uint16_t s_v[kHD][kFlashKeys + kFlashPad];
+  constexpr int kThreads = 384;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int q16 = lane & 15, half = lane >> 4;
+  const int hh = wave % kShare, tile_of_rows = wave / kShare;
+  const int kv_head = blockIdx.x / a.group_count;
+  const AttnGroup group = a.groups[blockIdx.x % a.group_count];
+  const RowState row0 = a.rows[group.row0];
+  const bool ring = row0.layout == 0;
+  const int h = kv_head * kShare + hh;
+  const int row = tile_of_rows * 16 + q16;
+  const bool valid = row < group.count;
+  const std::size_t b = group.row0 + (valid ? row : 0);
+  const int pos0 = row0.pos, pos_last = pos0 + group.count - 1;
+  const int q_pos = valid ? pos0 + row : -1;
+  // This wave's rows span positions wave_min .. wave_max.
+  const int wave_min = pos0 + tile_of_rows * 16, wave_max = wave_min + 15;
+
+  Half16 q[kHD / 16];
+#pragma unroll
+  for (int s = 0; s < kHD / 16; ++s)
+    __builtin_memcpy(&q[s], a.qh + b * kHQ + h * kHD + s * 16, 32);
+  const float* q_rel = a.r + b * kNR + h * kNRel;
+  const float sink = a.sink[b * kNH + h];
+  float run_max = 0.0f;                           // the zero sink's logit
+  float run_sum = half == 0 ? kProbScale : 0.0f;  // and its weight, once
+  Float8 out[kHD / 16] = {};
+
+  const int first = ring ? (row0.first / kFlashKeys) * kFlashKeys : 0;
+  const int tiles = (pos_last - first) / kFlashKeys + 1;
+  for (int tile = 0; tile < tiles; ++tile) {
+    const int base = first + tile * kFlashKeys;
+    __syncthreads();
+    // Keys: 16 bytes at a time, 16 pieces per key.
+    for (int unit = tid; unit < kFlashKeys * 16; unit += kThreads) {
+      const int key = unit >> 4, piece = unit & 15;
+      const std::size_t entry = ring ? (base + key) % row0.cap : base + key;
+      const std::uint16_t* src =
+          ring ? row0.kh + (entry * kNKV + kv_head) * kHD
+               : row0.kh + (static_cast<std::size_t>(kv_head) * row0.cap + entry) * kHD;
+      __builtin_memcpy(&s_k[key][piece * 8], src + piece * 8, 16);
+    }
+    // Values: a dimension's 64 positions are contiguous in the cache.
+    {
+      const std::size_t entry = ring ? base % row0.cap : base % kT;
+      const std::uint16_t* values =
+          ring ? row0.vh + static_cast<std::size_t>(kv_head) * kHD * row0.cap
+               : row0.vh + (static_cast<std::size_t>(kv_head) * row0.chunk_cap +
+                            base / kT) *
+                               kHD * kT;
+      const std::size_t stride = ring ? row0.cap : kT;
+      for (int unit = tid; unit < kHD * 8; unit += kThreads) {
+        const int dim = unit >> 3, piece = unit & 7;
+        __builtin_memcpy(&s_v[dim][piece * 8],
+                         values + dim * stride + entry + piece * 8, 16);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kt = 0; kt < kFlashKeys / 16; ++kt) {
+      const int key0 = base + kt * 16;
+      if (key0 > wave_max)
+        continue;  // after every row of this wave
+      if (ring && wave_min - (key0 + 15) >= a.extent)
+        continue;  // before every row's window
+      Float8 c = {};
+#pragma unroll
+      for (int s = 0; s < kHD / 16; ++s) {
+        Half16 kf;
+        __builtin_memcpy(&kf, &s_k[kt * 16 + q16][s * 16], 32);
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, q[s], c);
+      }
+      // Lane (q16, half) holds its row's scores for keys key0 + 2 i + half.
+      const bool near = valid && q_pos - (key0 + 15) < a.extent;
+      const bool any_near = __any(near);
+      float score[8], local = kLowest;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int j = key0 + 2 * i + half, distance = q_pos - j;
+        float v = kLowest;
+        if (distance >= 0 && (!ring || distance < a.extent)) {
+          v = c[i] * a.scale - sink;
+          if (any_near && distance < a.extent) {
+            const float* table =
+                a.rel_bias + static_cast<std::size_t>(distance) * kNRel;
+            float bias = 0.0f;
+            for (int x = 0; x < kNRel; ++x)
+              bias += table[x] * q_rel[x];
+            v += bias;
+          }
+        }
+        score[i] = v;
+        local = fmaxf(local, v);
+      }
+      local = fmaxf(local, __shfl_xor(local, 16, 32));
+      const float m = fmaxf(run_max, local);
+      const float factor = __expf(run_max - m);
+      run_max = m;
+      // The weights, as FP16 times 2^15, packed two to a word.
+      std::uint32_t mine[4], theirs[4];
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        union {
+          _Float16 f[2];
+          std::uint32_t u;
+        } pair;
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const float v = score[2 * i + e];
+          pair.f[e] = static_cast<_Float16>(
+              v > 0.5f * kLowest ? __expf(v - m) * kProbScale : 0.0f);
+          part += static_cast<float>(pair.f[e]);
+        }
+        mine[i] = pair.u;
+        theirs[i] = __shfl_xor(mine[i], 16, 32);
+      }
+      run_sum = run_sum * factor + part;
+      // As an operand a lane needs its row's 16 keys in order; it has the
+      // even ones (half 0) or the odd ones (half 1) and its pair the others.
+      union {
+        Half16 f;
+        std::uint16_t u[16];
+      } p;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const std::uint16_t m0 = mine[i] & 0xFFFFu, m1 = mine[i] >> 16;
+        const std::uint16_t t0 = theirs[i] & 0xFFFFu, t1 = theirs[i] >> 16;
+        p.u[4 * i + 0] = half ? t0 : m0;
+        p.u[4 * i + 1] = half ? m0 : t0;
+        p.u[4 * i + 2] = half ? t1 : m1;
+        p.u[4 * i + 3] = half ? m1 : t1;
+      }
+#pragma unroll
+      for (int dt = 0; dt < kHD / 16; ++dt) {
+        out[dt] *= factor;
+        Half16 vf;
+        __builtin_memcpy(&vf, &s_v[dt * 16 + q16][kt * 16], 32);
+        out[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf, p.f, out[dt]);
+      }
+    }
+  }
+  if (!valid)
+    return;
+  const float inverse = 1.0f / (run_sum + __shfl_xor(run_sum, 16, 32));
+#pragma unroll
+  for (int dt = 0; dt < kHD / 16; ++dt)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int dim = dt * 16 + 2 * i + half;
+      const std::size_t at = b * kHQ + h * kHD + dim;
+      a.out[at] = out[dt][i] * inverse * Sigmoid(a.gate[at]);
     }
 }
 
@@ -2999,6 +3185,10 @@ void GlueB(const GlueBArgs& args, hipStream_t stream) {
 }
 
 void Attention(const AttnArgs& args, hipStream_t stream) {
+  if (args.batched && (args.fast & 16)) {
+    AttentionFlashKernel<<<args.group_count * kNKV, 384, 0, stream>>>(args);
+    return;
+  }
   if (args.batched) {
     const int grid = args.group_count * kNKV * args.max_chunks;
     if (args.fast & 8)
