@@ -6,7 +6,8 @@ Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`, 128 GB unified memory) at
 precision.
 
 **Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
-extension: 1,056 tokens/s on a 4K-token prompt, 555 on a 100K-token prompt, 24 tokens/s generation
+extension: about 1,100 tokens/s on a 4K-token prompt, 775 on average over a 100K-token prompt (129 s),
+24 tokens/s generation
 (86 to 93 greedy and 76 sampled, one seed, where the output repeats its context), KLD 0.0015 against
 llama.cpp on the same file.
 See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).

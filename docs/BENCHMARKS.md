@@ -643,6 +643,55 @@ What follows from that, not done yet: more rows per cache read, tiles that use e
 for several products, and the same tiling in the expert and projection kernels, which is
 where the 1.9 s is.
 
+## Attention blocks that fit several to a compute unit, 2026-11-21
+
+Step 26 left the attention kernel far below its pattern's rate, and the estimate of where the
+time went (cache reads, instruction counts) was wrong: ordering the blocks so that concurrent
+ones read the same cache region changed nothing. Switches that turn parts of the kernel off at
+run time (`INKLING2_ATTN_SKIP` bits 4 to 64, so that the compiler cannot remove what depends
+on them) gave the real split of the 3.2 s that full attention took in a 2,048-row step at
+100,000 tokens: 2.3 s in the matrix products with their operand reads, nothing measurable in
+the exponentials, 0.2 s in reading keys and values.
+
+The products ran at a third of what the micro-benchmark gives for the same pattern, and the
+micro-benchmark had also shown blocks with 60 KB of shared memory at about two thirds of
+blocks with 16 KB. A compute unit has 64 KB, so a 60 KB block runs alone on it and its 8 waves
+have nothing to overlap their waits with. Step 28 therefore splits the kernel by footprint:
+
+- parts of the context wholly far before a group's rows: a variant with no queries, keys or
+  values in shared memory, 16 KB;
+- the rest (sliding-window layers, the part near the rows): queries read from device memory,
+  32 KB.
+
+| Depth | Prompt at depth, step 25 | Step 26 | Step 28 | Seconds from 0, step 25 | Step 28 |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 1,068 t/s | 1,064 | 1,113 | 4 | 3.6 |
+| 16,384 | 847 | | 981 | 17 | 15.5 |
+| 32,768 | 678 | 737 | 867 | 39 | 33 |
+| 100,000 | 378 | 437 | 594 | 180 | 129 |
+
+Quality figures are the same in every variant of steps 26 and 28 (KLD 0.001525 at 4,096
+tokens). A 2,048-row step at 100,000 tokens (context faked, 602 tokens/s) now spends 1.85 s in
+attention, 0.78 s in the experts, 0.24 s in the input projections and 0.53 s in everything
+else.
+
+Tried in the same session and left off, each measured on a 4,096 to 16,384-token prompt or at
+100,000 tokens:
+
+| Change | Result |
+|---|---|
+| Projection kernel reading weights and inputs straight from device memory, no shared memory (`INKLING2_WMMA_DIRECT=1`) | 1,084 to 620 tokens/s |
+| Expert kernel reading its inputs straight from device memory (`INKLING2_WMMA_DIRECT=2`) | 1,084 to 997 |
+| Staging 2 slices of 16 columns instead of 4 in those kernels (half the shared memory) | 1,084 to 1,007 |
+| Blocks ordered so that concurrent ones read the same keys and values (`INKLING2_ATTN_FAST` bit 2, still on) | no change |
+| Asking for the next slice's keys and values one slice early | attention 1.85 to 1.93 s |
+
+So what helped the attention kernel does not carry over to the projection and expert kernels:
+their weights come from memory in volume, and staging them once per block in shared memory is
+worth its footprint. In the far attention kernel, turning the score products off alone saves
+nothing while turning the value products off saves 0.6 s and both 1.24 s; what the score phase
+waits for is not identified yet.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
