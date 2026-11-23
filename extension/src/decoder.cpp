@@ -291,7 +291,13 @@ struct GpuEngine::Impl {
   int expert_skip{EnvOr("INKLING2_EXPERT_SKIP", 0)};
   // Bit 16: the one-pass kernel (AttentionFlashKernel), whose blocks take
   // groups of up to 64 rows; the older batched kernels take 32.
-  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 31)};
+  int attn_fast{EnvOr("INKLING2_ATTN_FAST", 63)};
+  // Bit 32 of INKLING2_ATTN_FAST: steps of at least this many rows, and
+  // fewer than the one-pass kernel takes whole, run full attention through
+  // the one-pass kernel with the context in parts.
+  int attn_few_min{EnvOr("INKLING2_ATTN_FEW_MIN", 2)};
+  int attn_few_parts{EnvOr("INKLING2_ATTN_FEW_PARTS", 32)};
+  bool few_now{false};
   // Steps of fewer rows (draft verification) keep the kernels that split a
   // context into parts: one block walking a whole context for a handful of
   // rows was slower.
@@ -1665,12 +1671,14 @@ struct GpuEngine::Impl {
     // session, else the per-row FP16 one; the F32 kernels only when the F32
     // cache is kept and a switch asks for them.
     const std::size_t chunks_now = max_pos / 1024 + 1;
+    const bool few = few_now && !swa;
     const bool batched =
-        (attn_batched_min > 0 && batch >= attn_batched_min * n_groups &&
-         (!swa || attn_batched_window)) ||
-        (!swa && std::size_t(batch) * chunks_now > partial_slots);
-    const bool half = !batched && (attn_half || !keep_f32);
-    if (batched) {
+        !few &&
+        ((attn_batched_min > 0 && batch >= attn_batched_min * n_groups &&
+          (!swa || attn_batched_window)) ||
+         (!swa && std::size_t(batch) * chunks_now > partial_slots));
+    const bool half = !batched && !few && (attn_half || !keep_f32);
+    if (batched || few) {
       gpu::ToHalfArgs h{};
       h.x = q;
       h.x_stride = kHQ;
@@ -1699,6 +1707,15 @@ struct GpuEngine::Impl {
       at.max_chunks = batched ? 2 : 1;
     if (!swa && batched) {
       at.span = static_cast<int>((chunks_now + 15) / 16);
+      at.max_chunks = static_cast<int>((chunks_now + at.span - 1) / at.span);
+    }
+    if (few) {
+      // As many parts as the partial scratch holds for this many rows.
+      const std::size_t parts = std::max<std::size_t>(
+          1, std::min<std::size_t>(std::size_t(attn_few_parts),
+                                   partial_slots / std::size_t(batch)));
+      at.few = true;
+      at.span = static_cast<int>((chunks_now + parts - 1) / parts);
       at.max_chunks = static_cast<int>((chunks_now + at.span - 1) / at.span);
     }
     gpu::Attention(at, stream);
@@ -2185,6 +2202,8 @@ struct GpuEngine::Impl {
         reinterpret_cast<gpu::AttnGroup*>(host_staging.data() + off_groups);
     flash_now = (attn_fast & 16) != 0 &&
                 rows.size() >= static_cast<std::size_t>(attn_flash_min);
+    few_now = !flash_now && (attn_fast & 32) != 0 &&
+              rows.size() >= static_cast<std::size_t>(attn_few_min);
     const std::size_t attn_group_rows =
         flash_now ? std::size_t{64} : std::size_t(gpu::kAttnRows);
     n_groups = 0;

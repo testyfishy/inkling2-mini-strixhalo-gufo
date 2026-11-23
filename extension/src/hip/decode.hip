@@ -1641,6 +1641,7 @@ __launch_bounds__(256) __global__ void AttentionBatchKernel(AttnArgs a) {
 constexpr int kFlashPad = INKLING2_FLASH_PAD;  // see s_k below
 constexpr int kFlashKeys = 64;  // keys staged at once
 
+template <bool Parts>
 __launch_bounds__(384) __global__ void AttentionFlashKernel(AttnArgs a) {
   // Rows are padded by 16 bytes: with a stride that is a power of two, the
   // 16 lanes of a wave would read the same bank of shared memory at once.
@@ -1650,10 +1651,16 @@ __launch_bounds__(384) __global__ void AttentionFlashKernel(AttnArgs a) {
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int q16 = lane & 15, half = lane >> 4;
   const int hh = wave % kShare, tile_of_rows = wave / kShare;
-  const int kv_head = blockIdx.x / a.group_count;
-  const AttnGroup group = a.groups[blockIdx.x % a.group_count];
+  // With Parts (layout 1 only): one block per (group, key head, part of
+  // `span` chunks); it leaves the part's maximum, sum and weighted values
+  // for AttentionCombineKernel, so a few rows over a long context are worked
+  // on by as many blocks as there are parts.
+  const int part = Parts ? blockIdx.x % a.max_chunks : 0;
+  const int unit_index = Parts ? blockIdx.x / a.max_chunks : blockIdx.x;
+  const int kv_head = unit_index / a.group_count;
+  const AttnGroup group = a.groups[unit_index % a.group_count];
   const RowState row0 = a.rows[group.row0];
-  const bool ring = row0.layout == 0;
+  const bool ring = !Parts && row0.layout == 0;
   const int h = kv_head * kShare + hh;
   const int row = tile_of_rows * 16 + q16;
   const bool valid = row < group.count;
@@ -1669,12 +1676,21 @@ __launch_bounds__(384) __global__ void AttentionFlashKernel(AttnArgs a) {
     __builtin_memcpy(&q[s], a.qh + b * kHQ + h * kHD + s * 16, 32);
   const float* q_rel = a.r + b * kNR + h * kNRel;
   const float sink = a.sink[b * kNH + h];
-  float run_max = 0.0f;                           // the zero sink's logit
-  float run_sum = half == 0 ? kProbScale : 0.0f;  // and its weight, once
+  // Whole context: the zero sink's logit, and its weight once. A part
+  // starts empty; the combine kernel adds the sink.
+  float run_max = Parts ? kLowest : 0.0f;
+  float run_sum = !Parts && half == 0 ? kProbScale : 0.0f;
   Float8 out[kHD / 16] = {};
+  // A wave without rows only helps staging.
+  const bool wave_rows = tile_of_rows * 16 < group.count;
 
-  const int first = ring ? (row0.first / kFlashKeys) * kFlashKeys : 0;
-  const int tiles = (pos_last - first) / kFlashKeys + 1;
+  const int per_part = kT * (a.span > 0 ? a.span : 1);
+  const int first =
+      Parts ? part * per_part : ring ? (row0.first / kFlashKeys) * kFlashKeys : 0;
+  const int stop = Parts && first + per_part - 1 < pos_last
+                       ? first + per_part - 1
+                       : pos_last;
+  const int tiles = stop < first ? 0 : (stop - first) / kFlashKeys + 1;
   for (int tile = 0; tile < tiles; ++tile) {
     const int base = first + tile * kFlashKeys;
     __syncthreads();
@@ -1706,7 +1722,7 @@ __launch_bounds__(384) __global__ void AttentionFlashKernel(AttnArgs a) {
 #pragma unroll
     for (int kt = 0; kt < kFlashKeys / 16; ++kt) {
       const int key0 = base + kt * 16;
-      if (key0 > wave_max)
+      if (key0 > wave_max || !wave_rows)
         continue;  // after every row of this wave
       if (ring && wave_min - (key0 + 15) >= a.extent)
         continue;  // before every row's window
@@ -1787,9 +1803,24 @@ __launch_bounds__(384) __global__ void AttentionFlashKernel(AttnArgs a) {
       }
     }
   }
+  const float total = run_sum + __shfl_xor(run_sum, 16, 32);
   if (!valid)
     return;
-  const float inverse = 1.0f / (run_sum + __shfl_xor(run_sum, 16, 32));
+  if (Parts) {
+    const std::size_t slot = (b * kNH + h) * a.max_chunks + part;
+    constexpr float kUnscale = 1.0f / kProbScale;
+    if (half == 0) {
+      a.chunk_max[slot] = run_max;
+      a.chunk_sum[slot] = total * kUnscale;
+    }
+#pragma unroll
+    for (int dt = 0; dt < kHD / 16; ++dt)
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        a.chunk_out[slot * kHD + dt * 16 + 2 * i + half] = out[dt][i] * kUnscale;
+    return;
+  }
+  const float inverse = 1.0f / total;
 #pragma unroll
   for (int dt = 0; dt < kHD / 16; ++dt)
 #pragma unroll
@@ -3193,8 +3224,15 @@ void GlueB(const GlueBArgs& args, hipStream_t stream) {
 }
 
 void Attention(const AttnArgs& args, hipStream_t stream) {
+  if (args.few) {
+    AttentionFlashKernel<true><<<args.group_count * kNKV * args.max_chunks, 384,
+                                 0, stream>>>(args);
+    AttentionCombineKernel<<<args.batch * kNH, kHD, 0, stream>>>(args);
+    return;
+  }
   if (args.batched && (args.fast & 16)) {
-    AttentionFlashKernel<<<args.group_count * kNKV, 384, 0, stream>>>(args);
+    AttentionFlashKernel<false><<<args.group_count * kNKV, 384, 0, stream>>>(
+        args);
     return;
   }
   if (args.batched) {

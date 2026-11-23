@@ -297,6 +297,13 @@ struct AttnArgs {
   const std::uint16_t* qh;  // stride kHQ
   const AttnGroup* groups;
   int group_count;
+  // Layout 1: the one-pass kernel with the context cut into parts, one block
+  // per (group, key head, part of `span` chunks). For steps of few rows over
+  // a long context (draft verification): the cache is read once for all rows
+  // and by as many blocks as there are parts. Leaves one partial per (row,
+  // head, part) for the combine kernel; needs qh, the groups and the chunk
+  // scratch.
+  bool few;
 };
 void Attention(const AttnArgs& args, hipStream_t stream);
 
