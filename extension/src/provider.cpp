@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -528,9 +529,19 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
     options.int8_experts = EnvInt("INKLING2_INT8_EXPERTS", 1) != 0;
     options.int8_single = EnvInt("INKLING2_INT8_SINGLE", 1) != 0;
     const char* dspark = std::getenv("INKLING2_DSPARK");
+    // INKLING2_DSPARK_GPU=1: the drafter on the device (2: also the host
+    // prototype beside it, to compare their proposals).
+    const int dspark_gpu = dspark ? EnvInt("INKLING2_DSPARK_GPU", 0) : 0;
     if (dspark && sessions == 1) {
-      options.capture_features = true;
+      options.capture_features = dspark_gpu != 1;
       options.max_batch = std::max<std::uint32_t>(options.max_batch, 8);
+      if (dspark_gpu) {
+        options.drafter = inkling2::LoadDrafter(dspark, model);
+        options.draft_window = static_cast<std::uint32_t>(
+            EnvInt("INKLING2_DRAFT_WINDOW", 8192));
+        options.draft_vocab = static_cast<std::uint32_t>(
+            EnvInt("INKLING2_DRAFT_VOCAB", 32768));
+      }
     } else {
       dspark = nullptr;
     }
@@ -668,11 +679,43 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
       const std::size_t launches_before = engine.launches();
       engine.SetProfile(std::getenv("INKLING2_PROFILE") != nullptr);
       const auto gen_start = std::chrono::steady_clock::now();
+      // INKLING2_SHORTLIST_SIM: how often the next token is among the prompt's
+      // tokens, the tokens generated so far and the K most likely tokens of
+      // every earlier step (K = 16, 64, 256, 1024).
+      const bool shortlist_sim = EnvInt("INKLING2_SHORTLIST_SIM", 0) != 0;
+      constexpr int kSimK[4] = {16, 64, 256, 1024};
+      std::vector<std::vector<char>> listed(
+          4, std::vector<char>(shortlist_sim ? engine.vocab() : 0, 0));
+      std::size_t sim_hits[4][2] = {}, sim_size[4] = {}, sim_late = 0;
+      if (shortlist_sim)
+        for (auto& set : listed)
+          for (std::size_t i = 0; i < n; ++i)
+            set[prompt_token(0, i)] = 1;
       for (int i = 0; i < generate; ++i) {
         std::vector<inkling2::GpuEngine::Row> rows;
         for (int s = 0; s < sessions; ++s) {
           out[s].push_back(next[s]);
           rows.push_back({static_cast<std::uint32_t>(s), next[s]});
+        }
+        if (shortlist_sim && i > 0) {
+          const float* raw = engine.logits(0);
+          std::vector<std::uint32_t> order(engine.vocab());
+          for (std::uint32_t t = 0; t < order.size(); ++t)
+            order[t] = t;
+          std::partial_sort(order.begin(), order.begin() + 1024, order.end(),
+                            [&](std::uint32_t a, std::uint32_t b) {
+                              return raw[a] > raw[b];
+                            });
+          sim_late += i >= 32 ? 1 : 0;
+          for (int k = 0; k < 4; ++k) {
+            // Drafts cover up to seven positions ahead; what matters is
+            // whether the token was listed before its own step.
+            sim_hits[k][0] += listed[k][next[0]];
+            sim_hits[k][1] += i >= 32 ? listed[k][next[0]] : 0;
+            for (int j = 0; j < kSimK[k]; ++j)
+              listed[k][order[j]] = 1;
+            listed[k][next[0]] = 1;
+          }
         }
         engine.Step(rows, true);
         for (int s = 0; s < sessions; ++s)
@@ -682,6 +725,18 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
           std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                         gen_start)
               .count();
+      if (shortlist_sim) {
+        for (int k = 0; k < 4; ++k) {
+          for (const char c : listed[k])
+            sim_size[k] += c;
+          std::printf("shortlist sim, %4d most likely per step: next token "
+                      "listed in %.1f%% of steps (%.1f%% after the first 32); "
+                      "%zu tokens listed%c",
+                      kSimK[k], 100.0 * sim_hits[k][0] / std::max(1, generate - 1),
+                      100.0 * sim_hits[k][1] / std::max<std::size_t>(1, sim_late),
+                      sim_size[k], 10);
+        }
+      }
       for (int s = 0; s < sessions; ++s) {
         std::printf("greedy session %d:", s);
         for (const std::uint32_t token : out[s])
@@ -839,13 +894,184 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
           std::printf(" (from token %zu)", same);
         std::printf("%c", 10);
       }
-      if (dspark) {
+      if (dspark && dspark_gpu) {
+        // Generate again with the drafter on the device proposing tokens:
+        // the engine keeps the drafter's context itself.
+        const int draft_n = std::clamp(EnvInt("INKLING2_DRAFT_N", 7), 1, 7);
+        const double gate = [] {
+          const char* v = std::getenv("INKLING2_DRAFT_GATE");
+          return v && *v ? std::atof(v) : 0.0;
+        }();
+        const double temp = [] {
+          const char* v = std::getenv("INKLING2_DRAFT_TEMP");
+          return v && *v ? std::atof(v) : 0.0;
+        }();
+        std::mt19937 rng(static_cast<unsigned>(EnvInt("INKLING2_DRAFT_SEED", 1)));
+        const auto pick = [&](std::size_t row) -> std::uint32_t {
+          if (temp <= 0)
+            return engine.argmax(row);
+          const std::vector<float> capped = engine.capped_logits(row);
+          const float top = *std::max_element(capped.begin(), capped.end());
+          std::vector<double> cum(capped.size());
+          double sum = 0;
+          for (std::size_t i = 0; i < capped.size(); ++i)
+            cum[i] = sum += std::exp((capped[i] - top) / temp);
+          const double u =
+              std::uniform_real_distribution<double>(0.0, sum)(rng);
+          return static_cast<std::uint32_t>(
+              std::lower_bound(cum.begin(), cum.end(), u) - cum.begin());
+        };
+        std::unique_ptr<inkling2::Drafter> host;
+        if (dspark_gpu == 2)
+          host = std::make_unique<inkling2::Drafter>(dspark, model);
+        const inkling2::Drafter::Head lm_head = [&](const float* hidden) {
+          return engine.HeadArgmax(hidden);
+        };
+        engine.Reset(0);
+        std::uint32_t current = 0;
+        const auto prompt_start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n; i += prompt_batch) {
+          std::vector<inkling2::GpuEngine::Row> rows;
+          for (std::size_t j = i; j < std::min(n, i + prompt_batch); ++j)
+            rows.push_back({0, prompt_token(0, j)});
+          const bool final_chunk = i + prompt_batch >= n;
+          engine.Step(rows, final_chunk);
+          if (final_chunk)
+            current = engine.argmax(0);
+          if (host)
+            for (std::size_t r = 0; r < rows.size(); ++r)
+              host->Inject(engine.features(r).data());
+        }
+        std::printf("prompt with the drafter's context kept: %zu tokens in "
+                    "%.3f s%c",
+                    n,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - prompt_start)
+                        .count(),
+                    10);
+        if (const int fake = EnvInt("INKLING2_FAKE_CONTEXT", 0);
+            fake > 0 && !host)
+          engine.FakeContext(0, static_cast<std::uint32_t>(fake));
+        const std::vector<std::uint32_t>& truth = out[0];
+        std::vector<std::uint32_t> replay;
+        int steps = 0, drafted = 0, kept = 0, plain_steps = 0;
+        int same_first = 0, same_all = 0, compared = 0;
+        double draft_seconds = 0;
+        const auto spec_start = std::chrono::steady_clock::now();
+        while (replay.size() < truth.size()) {
+          replay.push_back(current);
+          const auto draft_start = std::chrono::steady_clock::now();
+          const std::vector<inkling2::GpuEngine::DraftToken> drafts =
+              engine.Draft(0, current, draft_n, static_cast<float>(gate));
+          draft_seconds += std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - draft_start)
+                               .count();
+          if (host) {
+            const std::vector<std::uint32_t> ref =
+                host->Draft(current, draft_n, lm_head);
+            std::size_t same = 0;
+            while (same < drafts.size() && same < ref.size() &&
+                   drafts[same].token == ref[same])
+              ++same;
+            ++compared;
+            same_first += same >= 1 ? 1 : 0;
+            same_all += same == ref.size() ? 1 : 0;
+            if (steps < 3) {
+              std::printf("  step %d device:", steps);
+              for (const auto& d : drafts)
+                std::printf(" %u(%.2f)", d.token, d.confidence);
+              std::printf("  host:");
+              for (const std::uint32_t t : ref)
+                std::printf(" %u", t);
+              std::printf("%c", 10);
+            }
+          }
+          std::vector<inkling2::GpuEngine::Row> rows{{0, current}};
+          for (const auto& d : drafts)
+            rows.push_back({0, d.token});
+          plain_steps += drafts.empty() ? 1 : 0;
+          engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
+          std::size_t good = 0;
+          std::uint32_t drawn = pick(0);
+          while (good + 1 < rows.size() && drawn == rows[good + 1].token)
+            drawn = pick(++good);
+          current = drawn;
+          std::printf("S %zu", good);
+          for (const auto& d : drafts)
+            std::printf(" %.3f", d.confidence);
+          std::printf("%c", 10);
+          for (std::size_t r = 1; r <= good; ++r)
+            replay.push_back(rows[r].token);
+          std::vector<std::vector<float>> features;
+          if (host)
+            for (std::size_t r = 0; r <= good; ++r)
+              features.push_back(engine.features(r));
+          engine.Accept(0, static_cast<std::uint32_t>(good + 1));
+          for (const auto& f : features)
+            host->Inject(f.data());
+          drafted += static_cast<int>(drafts.size());
+          kept += static_cast<int>(good);
+          ++steps;
+        }
+        const double spec_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          spec_start)
+                .count();
+        const std::size_t produced = replay.size();
+        replay.resize(truth.size());
+        std::printf("device drafter: %zu tokens in %d steps (%d without a "
+                    "draft) in %.2f s: %.1f tokens/s; %d of %d drafts kept "
+                    "(%.1f%%); %.2f ms per draft call; output %s plain "
+                    "generation%c",
+                    produced, steps, plain_steps, spec_seconds,
+                    produced / spec_seconds, kept, drafted,
+                    100.0 * kept / std::max(1, drafted),
+                    1e3 * draft_seconds / std::max(1, steps),
+                    temp > 0 ? "is sampled, not compared with"
+                             : replay == truth ? "EQUALS" : "DIFFERS FROM",
+                    10);
+        if (host)
+          std::printf("  device against host prototype over %d steps: first "
+                      "draft the same in %d, all seven in %d%c",
+                      compared, same_first, same_all, 10);
+      } else if (dspark) {
         // Generate the same tokens again, this time with the drafter
         // proposing tokens and the model verifying them in one step.
         const int draft_n = std::clamp(EnvInt("INKLING2_DRAFT_N", 7), 1, 7);
         inkling2::Drafter drafter(dspark, model);
+        // The drafter's own probability of each token it proposes, to see
+        // how well it predicts which drafts the model keeps.
+        std::vector<float> confidence;
         const inkling2::Drafter::Head lm_head = [&](const float* hidden) {
-          return engine.HeadArgmax(hidden);
+          const std::uint32_t best = engine.HeadArgmax(hidden);
+          const std::vector<float> capped = engine.capped_logits(0);
+          double sum = 0;
+          for (const float x : capped)
+            sum += std::exp(static_cast<double>(x) - capped[best]);
+          confidence.push_back(static_cast<float>(1.0 / sum));
+          return best;
+        };
+        // INKLING2_DRAFT_TEMP: draw the model's tokens at this temperature
+        // instead of taking the most likely one (the run then has no plain
+        // run to equal).
+        const double temp = [] {
+          const char* v = std::getenv("INKLING2_DRAFT_TEMP");
+          return v && *v ? std::atof(v) : 0.0;
+        }();
+        std::mt19937 rng(static_cast<unsigned>(EnvInt("INKLING2_DRAFT_SEED", 1)));
+        const auto pick = [&](std::size_t row) -> std::uint32_t {
+          if (temp <= 0)
+            return engine.argmax(row);
+          const std::vector<float> capped = engine.capped_logits(row);
+          const float top = *std::max_element(capped.begin(), capped.end());
+          std::vector<double> cum(capped.size());
+          double sum = 0;
+          for (std::size_t i = 0; i < capped.size(); ++i)
+            cum[i] = sum += std::exp((capped[i] - top) / temp);
+          const double u =
+              std::uniform_real_distribution<double>(0.0, sum)(rng);
+          return static_cast<std::uint32_t>(
+              std::lower_bound(cum.begin(), cum.end(), u) - cum.begin());
         };
         engine.Reset(0);
         double sums[4] = {};
@@ -901,10 +1127,15 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
             rows.push_back({0, draft});
           engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
           std::size_t good = 0;
-          while (good + 1 < rows.size() &&
-                 engine.argmax(good) == rows[good + 1].token)
-            ++good;
-          current = engine.argmax(good);
+          std::uint32_t drawn = pick(0);
+          while (good + 1 < rows.size() && drawn == rows[good + 1].token)
+            drawn = pick(++good);
+          current = drawn;
+          std::printf("S %zu", good);
+          for (const float c : confidence)
+            std::printf(" %.3f", c);
+          std::printf("%c", 10);
+          confidence.clear();
           if (steps < 4) {
             std::printf("  step %d drafts:", steps);
             for (const std::uint32_t draft : drafts)
@@ -935,7 +1166,7 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                 .count();
         const std::size_t produced = replay.size();
         replay.resize(truth.size());
-        for (std::size_t i = 0; i < truth.size(); ++i)
+        for (std::size_t i = 0; i < truth.size() && temp <= 0; ++i)
           if (replay[i] != truth[i]) {
             std::printf("  first difference at token %zu: drafted run %u, "
                         "plain run %u%c",
@@ -1162,5 +1393,11 @@ void inkling2_native_provider_register(gufo::ext::Registry& registry) {
       // The NVFP4 expert tensors are a storage type GUFO's core reader does
       // not size; this provider reads them from their reserved bytes.
       .accepts_unsized_tensors = true,
+      // The runner decides how many drafts a step carries (serve.cpp).
+      .speculative_defaults = {{.backend = "dspark",
+                                .max_draft_tokens = 7,
+                                .min_draft_tokens = 1,
+                                .draft_policy = {},
+                                .draft_policies = {}}},
   });
 }

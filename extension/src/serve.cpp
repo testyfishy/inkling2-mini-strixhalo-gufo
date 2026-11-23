@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -30,6 +32,7 @@
 #include "chat.hpp"
 #include "config.hpp"
 #include "decoder.hpp"
+#include "drafter.hpp"
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "tools.hpp"
@@ -43,7 +46,7 @@ namespace sampling = gufo::sampling;
 using cache::Rows;
 using cache::TransferResult;
 
-constexpr std::string_view kStateAbi = "inkling2-native-fp16-v1";
+constexpr std::string_view kStateAbi = "inkling2-native-fp16-v2";
 constexpr std::size_t kMetaBytes = 64;
 constexpr Rows kValueBlock = 1024;  // positions per block of values
 
@@ -71,7 +74,8 @@ static_assert(sizeof(Meta) <= kMetaBytes);
 //   keys     rows     per full-attention visit and head: one row per position
 //   values   rows     per full-attention visit and head: one row per complete
 //                     block of 1,024 positions
-enum class PartKind { kFrame, kRing, kTail, kKeys, kValues };
+//   draft    private  with a drafter: its rings and its head feature
+enum class PartKind { kFrame, kRing, kTail, kKeys, kValues, kDraft };
 
 struct Part {
   cache::ComponentDescriptor descriptor;
@@ -111,6 +115,8 @@ std::vector<Part> BuildParts(const GpuEngine::StateLayout& layout,
       add(PartKind::kValues, layout.value_chunk_bytes, 1, 0, visit, head);
     }
   }
+  if (layout.draft_bytes)
+    add(PartKind::kDraft, 0, 0, layout.draft_bytes, 0, 0);
   return parts;
 }
 
@@ -481,6 +487,9 @@ std::vector<Adapter::Piece> Adapter::PrivatePieces(State& state,
       }
       break;
     }
+    case PartKind::kDraft:
+      add(engine_->DraftState(state.session), layout_.draft_bytes);
+      break;
     default:
       throw std::invalid_argument("inkling2: component is not private state");
   }
@@ -773,6 +782,53 @@ using Lookup = gufo::speculative::PromptLookup<std::uint32_t>;
 constexpr std::size_t kFirstDrafts = 4;
 constexpr std::size_t kMostDrafts = 16;
 
+// Whether proposing tokens with the drafter pays, decided from the clock.
+// A step with drafts costs the drafter's pass and a larger verification
+// step; when too few drafts are kept, that is slower than plain steps. The
+// controller compares each drafted step with what plain steps would have
+// produced in the same time and pauses drafting while it loses, for longer
+// each time, so text the drafter cannot predict costs a few percent at most.
+struct DraftControl {
+  double plain_ms{0};  // a plain step, smoothed
+  double gain{0.3};    // tokens gained per drafted step, smoothed
+  int pause{0}, next_pause{8}, since_plain{0};
+  // Counts for INKLING2_SERVE_DRAFT_LOG.
+  std::size_t steps{0}, calls{0}, empty{0}, pauses{0}, drafted{0}, kept{0};
+
+  // Whether this step may draft. The first step, and one in 64, is plain so
+  // that the cost of a plain step is known.
+  [[nodiscard]] bool Allows() {
+    ++steps;
+    if (plain_ms <= 0 || since_plain >= 64)
+      return false;
+    if (pause > 0) {
+      --pause;
+      return false;
+    }
+    return true;
+  }
+  void Plain(double ms) {
+    plain_ms = plain_ms > 0 ? 0.8 * plain_ms + 0.2 * ms : ms;
+    since_plain = 0;
+  }
+  void Drafted(std::size_t tokens, std::size_t drafts, double ms) {
+    ++since_plain;
+    ++calls;
+    empty += drafts == 0 ? 1 : 0;
+    drafted += drafts;
+    kept += tokens - 1;
+    gain = 0.9 * gain + 0.1 * (static_cast<double>(tokens) - ms / plain_ms);
+    if (gain < 0) {
+      pause = next_pause;
+      next_pause = std::min(2 * next_pause, 32);
+      gain = 0.15;
+      ++pauses;
+    } else if (gain > 0.3) {
+      next_pause = 8;
+    }
+  }
+};
+
 class State final : public ext::TextRunnerState {
 public:
   State(Adapter& adapter, Adapter::State& slot)
@@ -794,6 +850,7 @@ public:
   // and how many drafts the next verification step may carry.
   Lookup lookup;
   std::size_t draft_budget{kFirstDrafts};
+  DraftControl control;
   // The context declares tools and switches thinking off: the token that
   // opens a thinking block is not sampled (see Runner::Render).
   bool no_thinking{false};
@@ -822,10 +879,14 @@ class Runner final : public ext::HipTextModelRunner {
 public:
   Runner(std::shared_ptr<const gufo::core::GgufReader> reader, Config config,
          std::uint32_t max_context, std::size_t sessions,
-         std::string artifact_fingerprint)
+         std::string artifact_fingerprint, const std::string& drafter_path,
+         std::string drafter_id)
       : reader_(std::move(reader)),
         config_(std::move(config)),
         model_(LoadModel(*reader_, config_)),
+        drafter_(drafter_path.empty() ? nullptr
+                                      : LoadDrafter(drafter_path, model_)),
+        drafter_id_(std::move(drafter_id)),
         tokenizer_(*reader_),
         max_context_(max_context),
         sessions_(std::max<std::size_t>(sessions, 1)),
@@ -870,7 +931,7 @@ public:
                 .incremental_prefill = true,
                 .final_token_advance_required = true,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = lookup_,
+                .multi_token_decode = lookup_ || drafter_ != nullptr,
                 .prefix_reuse = true,
             },
         .sampling_defaults =
@@ -1003,6 +1064,10 @@ public:
       options.sessions =
           static_cast<std::uint32_t>(std::max(sessions, sessions_));
       options.max_batch = max_batch_;
+      options.drafter = drafter_;
+      options.draft_window = draft_window_;
+      options.draft_vocab = static_cast<std::uint32_t>(
+          std::clamp(EnvInt("INKLING2_DRAFT_VOCAB", 32768), 0, 1 << 20));
       engine_ = std::make_shared<GpuEngine>(model_, options);
     }
     return gufo::hip::CreateHipComponentCacheResources(
@@ -1026,6 +1091,7 @@ public:
     s.lookup.Clear();
     s.no_thinking = false;
     s.output = {};
+    s.control = {};
   }
   [[nodiscard]] bool HasDecodeFrontier(
       const ext::TextRunnerState& state) const override {
@@ -1044,6 +1110,7 @@ public:
       Mask(s, s.slot().logits.data());
     s.lookup.BeginRequest();
     s.draft_budget = kFirstDrafts;
+    s.control = {};
   }
 
   // ---- execution
@@ -1081,6 +1148,7 @@ public:
     s.output = OutputAfter(prompt.first(end));
     s.lookup.BeginRequest();
     s.draft_budget = kFirstDrafts;
+    s.control = {};
     return {.consumed_tokens = consumed, .decode_ready = final};
   }
 
@@ -1120,27 +1188,45 @@ public:
     (void)Piece(token, &s.output);
   }
 
-  // One step, with drafts copied from the context when the last tokens
-  // repeat an earlier passage (GUFO's prompt lookup decides when). The model
-  // verifies the drafts in the same step: at each drafted position the token
-  // is drawn from the model's own distribution as always, and the draft is
-  // kept only if it is the token drawn. The output is therefore distributed
-  // exactly as without drafts; a wrong draft only costs the larger step.
+  // One step, with drafts when there are any to try. Drafts come from the
+  // context when the last tokens repeat an earlier passage (GUFO's prompt
+  // lookup decides when), otherwise from the model's drafter when the engine
+  // has one and drafting currently pays (DraftControl). The model verifies
+  // the drafts in the same step: at each drafted position the token is drawn
+  // from the model's own distribution as always, and the draft is kept only
+  // if it is the token drawn. The output is therefore distributed exactly as
+  // without drafts; a wrong draft only costs the larger step.
   [[nodiscard]] ext::TextDecodeStep DecodeStep(
       ext::TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
     State& s = Require(state);
     const auto& config = sampler.config();
     const std::uint32_t position = engine_->position(s.session());
-    if (!lookup_ || max_tokens < 2 || config.logprobs || config.constraint ||
-        config.reasoning_budget || config.penalties_enabled() ||
-        sampler.ForcedToken() || s.tokens.size() != position ||
-        position + 2 > max_context_ || !s.slot().has_logits)
+    if ((!lookup_ && !drafter_) || max_tokens < 2 || config.logprobs ||
+        config.constraint || config.reasoning_budget ||
+        config.penalties_enabled() || sampler.ForcedToken() ||
+        s.tokens.size() != position || position + 2 > max_context_ ||
+        !s.slot().has_logits)
       return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    const auto start = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [&] {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - start)
+          .count();
+    };
     const bool sampled = config.uses_random_sampling();
-    s.lookup.Extend(s.tokens, sampled);
-    if (!s.lookup.Step(position))
-      return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    bool lookup_step = false;
+    if (lookup_) {
+      s.lookup.Extend(s.tokens, sampled);
+      lookup_step = s.lookup.Step(position);
+    }
+    const bool model_step = drafter_ && s.control.Allows();
+    if (!lookup_step && !model_step) {
+      auto step = ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+      if (step.selections.size() == 1 && !step.stop)
+        s.control.Plain(elapsed_ms());
+      return step;
+    }
 
     ext::TextDecodeStep step;
     auto first = SelectNext(state, sampler);
@@ -1150,26 +1236,62 @@ public:
       return step;
     }
     const std::uint32_t anchor = first.token;
-    const std::uint32_t tail[1] = {anchor};
-    const auto match = s.lookup.Find(
-        s.tokens, tail,
-        sampled ? std::min(2 * lookup_min_, Lookup::kMaxMatch) : lookup_min_);
-    std::size_t drafts = 0;
-    if (match.length != 0 && match.start < s.lookup.IndexedTokens())
-      drafts = std::min<std::size_t>(
-          {s.draft_budget, max_tokens - 1,
-           std::size_t{max_context_} - position - 1, std::size_t{max_batch_} - 1,
-           s.lookup.IndexedTokens() - match.start});
+    const std::size_t room = std::min<std::size_t>(
+        {max_tokens - 1, std::size_t{max_context_} - position - 1,
+         std::size_t{max_batch_} - 1});
+    std::vector<std::uint32_t> drafts;
+    Lookup::Match match{};
+    bool copied = false;
+    if (lookup_step) {
+      const std::uint32_t tail[1] = {anchor};
+      match = s.lookup.Find(
+          s.tokens, tail,
+          sampled ? std::min(2 * lookup_min_, Lookup::kMaxMatch) : lookup_min_);
+      if (match.length != 0 && match.start < s.lookup.IndexedTokens()) {
+        const std::size_t count = std::min<std::size_t>(
+            {s.draft_budget, room, s.lookup.IndexedTokens() - match.start});
+        drafts.assign(s.tokens.begin() + match.start,
+                      s.tokens.begin() + match.start + count);
+        copied = !drafts.empty();
+      }
+    }
+    const bool proposed = drafts.empty() && model_step;
+    if (proposed) {
+      // The drafter's probability of a token says how likely the model is to
+      // keep it. A row costs about a quarter of a plain step, the first one
+      // more, so a draft is tried while the chance that it and all before it
+      // are kept is worth that.
+      const float first_min = draft_first_ > 0 ? draft_first_
+                              : sampled        ? 0.6F
+                                               : 0.5F;
+      const float chain_min = draft_chain_ > 0 ? draft_chain_
+                              : sampled        ? 0.5F
+                                               : 0.45F;
+      const auto tokens = engine_->Draft(
+          s.session(), anchor, static_cast<int>(std::min<std::size_t>(room, 7)),
+          std::min(first_min, chain_min));
+      float chain = 1.0F;
+      for (const GpuEngine::DraftToken& token : tokens) {
+        chain *= token.confidence;
+        if (chain < (drafts.empty() ? first_min : chain_min))
+          break;
+        drafts.push_back(token.token);
+      }
+    }
     step.selections.push_back(std::move(first));
-    if (drafts == 0) {
+    if (drafts.empty()) {
       Advance(state, anchor);
+      if (proposed)
+        Drafted(s, 1, 0, elapsed_ms());
+      else
+        s.control.Plain(elapsed_ms());
       return step;
     }
 
     std::vector<GpuEngine::Row> rows;
     rows.push_back({s.session(), anchor});
-    for (std::size_t i = 0; i < drafts; ++i)
-      rows.push_back({s.session(), s.tokens[match.start + i]});
+    for (const std::uint32_t draft : drafts)
+      rows.push_back({s.session(), draft});
     s.slot().BeforeWrite(position,
                          position + static_cast<std::uint32_t>(rows.size()));
     s.slot().has_logits = false;
@@ -1177,7 +1299,7 @@ public:
     s.tokens.push_back(anchor);
     (void)Piece(anchor, &s.output);
     std::size_t kept = 0;
-    for (; kept < drafts; ++kept) {
+    for (; kept < drafts.size(); ++kept) {
       std::vector<float> logits = engine_->capped_logits(kept);
       Mask(s, logits.data());
       const std::uint32_t token =
@@ -1203,12 +1325,19 @@ public:
       Mask(s, s.slot().logits.data());
       s.slot().has_logits = true;
     }
-    s.lookup.Observe(match.start, drafts, kept);
-    s.draft_budget = kept == drafts ? std::min(s.draft_budget * 2, kMostDrafts)
-                                    : kFirstDrafts;
     step.draft_rounds = 1;
-    step.lookup_tokens = drafts;
-    step.lookup_accepted_tokens = kept;
+    if (copied) {
+      s.lookup.Observe(match.start, drafts.size(), kept);
+      s.draft_budget = kept == drafts.size()
+                           ? std::min(s.draft_budget * 2, kMostDrafts)
+                           : kFirstDrafts;
+      step.lookup_tokens = drafts.size();
+      step.lookup_accepted_tokens = kept;
+    } else {
+      Drafted(s, 1 + kept, drafts.size(), elapsed_ms());
+      step.draft_tokens = drafts.size();
+      step.draft_accepted_tokens = kept;
+    }
     return step;
   }
 
@@ -1218,6 +1347,18 @@ public:
   }
 
 private:
+  void Drafted(State& s, std::size_t tokens, std::size_t drafts,
+               double ms) const {
+    DraftControl& c = s.control;
+    c.Drafted(tokens, drafts, ms);
+    if (draft_log_ && c.calls % 64 == 0)
+      std::fprintf(stderr,
+                   "inkling2 draft: %zu steps, %zu draft calls (%zu without a "
+                   "draft), %zu of %zu drafts kept, %zu pauses, plain step "
+                   "%.1f ms, gain %.2f%c",
+                   c.steps, c.calls, c.empty, c.kept, c.drafted, c.pauses,
+                   c.plain_ms, c.gain, 10);
+  }
   void KeepLogits(State* s) const {
     const std::vector<float> capped = engine_->capped_logits(0);
     std::copy(capped.begin(), capped.begin() + tokenizer_.size(),
@@ -1409,6 +1550,9 @@ private:
                << "tokenizer=inkling2-bpe-v1\n"
                << "chat_template=inkling2-cpp-v1\n";
     }
+    if (drafter_)
+      identity << "drafter=" << drafter_id_ << '\n'
+               << "drafter_window=" << draft_window_ << '\n';
     identity << "state_abi=" << kStateAbi << '\n'
              << "payload_layout=inkling2-rings-whole-v1\n"
              << "context_tokens=" << max_context_ << '\n'
@@ -1420,6 +1564,17 @@ private:
   std::shared_ptr<const gufo::core::GgufReader> reader_;
   Config config_;
   Model model_;
+  // The model's drafter (docs/DSPARK.md), or null.
+  std::shared_ptr<const DrafterWeights> drafter_;
+  std::string drafter_id_;
+  std::uint32_t draft_window_{static_cast<std::uint32_t>(
+      std::clamp(EnvInt("INKLING2_DRAFT_WINDOW", 8192), 1024, 1 << 20))};
+  // Overrides of the confidence a first draft needs and of the chance a
+  // later one needs that it and all before it are kept (percent; 0 = the
+  // defaults in DecodeStep).
+  float draft_first_{EnvInt("INKLING2_DRAFT_FIRST", 0) / 100.0F};
+  float draft_chain_{EnvInt("INKLING2_DRAFT_CHAIN", 0) / 100.0F};
+  bool draft_log_{EnvInt("INKLING2_SERVE_DRAFT_LOG", 0) != 0};
   Tokenizer tokenizer_;
   std::uint32_t max_context_;
   std::size_t sessions_;
@@ -1456,8 +1611,23 @@ std::shared_ptr<gufo::ext::TextModelRunner> CreateTextRunner(
     }
     if (!options.vision_model_path.empty())
       return fail("Inkling 2 Mini: image input is not supported yet");
-    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled)
-      return fail("Inkling 2 Mini: no speculative backend is supported");
+    // The model's own drafter: `--speculative dspark --dspark-model <file>`.
+    // INKLING2_DRAFTER names the file for commands without those options.
+    std::string drafter_path;
+    if (options.speculative.backend == ext::TextSpeculativeBackend::kDSpark) {
+      drafter_path = options.speculative.draft_model_path;
+      if (drafter_path.empty())
+        return fail("Inkling 2 Mini: --speculative dspark needs --dspark-model");
+    } else if (options.speculative.backend !=
+               ext::TextSpeculativeBackend::kDisabled) {
+      return fail("Inkling 2 Mini: the speculative backend it supports is dspark");
+    } else if (const char* path = std::getenv("INKLING2_DRAFTER");
+               path && *path) {
+      drafter_path = path;
+    }
+    std::string drafter_id = options.disk_cache.draft_model_artifact_fingerprint;
+    if (drafter_id.empty())
+      drafter_id = drafter_path;
     Config config;
     std::string config_error;
     if (!LoadConfig(*reader, &config, &config_error))
@@ -1474,7 +1644,8 @@ std::shared_ptr<gufo::ext::TextModelRunner> CreateTextRunner(
       fingerprint = gufo::core::GgufIdentityHex(*reader);
     return std::make_shared<Runner>(std::move(reader), std::move(config),
                                     max_context, options.session_count,
-                                    std::move(fingerprint));
+                                    std::move(fingerprint), drafter_path,
+                                    std::move(drafter_id));
   } catch (const std::exception& e) {
     return fail(std::string("Inkling 2 Mini: ") + e.what());
   }

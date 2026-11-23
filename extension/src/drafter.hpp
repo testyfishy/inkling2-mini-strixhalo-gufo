@@ -10,6 +10,28 @@
 
 namespace inkling2 {
 
+/// The drafter's weights as they are in its file: the matrices stay mapped,
+/// the small tensors are copied out as F32.
+struct DrafterWeights {
+  static constexpr int kLayers = 3;
+  struct Layer {
+    Mat wq, wk, wv, wo, wk_ctx, wv_ctx, gate, up, down;
+    Vec ctx_norm, attn_norm, ffn_norm, q_norm, k_norm, k_ctx_norm;
+  };
+  std::shared_ptr<const gufo::core::GgufReader> reader;
+  Layer layers[kLayers];
+  /// Row r mixes the four hidden states for layer r (r < 3) or for the head
+  /// (r = 3); already softmaxed.
+  float fuse[kLayers + 1][4]{};
+  Vec head_norm, mask, output_norm, joint_bias, hidden_out_bias;
+  Mat markov, joint, hidden_out;
+};
+
+/// Opens a drafter file. Throws std::runtime_error when it is not the
+/// drafter this code expects for `target`.
+[[nodiscard]] std::shared_ptr<const DrafterWeights> LoadDrafter(
+    const std::string& path, const Model& target);
+
 /// The DSpark drafter that ships with Inkling 2 Mini (see docs/DSPARK.md): it
 /// reads four hidden states per position from the main model and proposes up
 /// to seven tokens at once, which the main model then verifies.

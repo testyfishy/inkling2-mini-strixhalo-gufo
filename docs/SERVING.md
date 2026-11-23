@@ -106,6 +106,12 @@ What the runner does:
   with `<|end_message|>`, which a grammar reads as `</think>` (next point). With the visible
   `</tool_call>` there instead, a second call in one turn derailed into junk text once
   thinking was on.
+- **The model's drafter.** `--speculative dspark --dspark-model <drafter file>` loads the
+  DSpark drafter that ships with the model; `INKLING2_DRAFTER=<file>` does the same for
+  commands without those options. Drafts copied from the context are tried first; when there
+  is none, the drafter proposes. How many drafts a step carries and when drafting pauses is
+  decided by the runner ([DSPARK.md](DSPARK.md), section 7); the server's draft-length options
+  are not used. `INKLING2_SERVE_DRAFT_LOG=1` prints the controller's counts.
 - **Continuation cache.** GUFO keeps checkpoints of a session and restores them when a later
   request shares a prefix. The adapter describes the engine's state to it: per full-attention
   layer visit and head, keys as one row per position and values as one row per 1,024 positions,

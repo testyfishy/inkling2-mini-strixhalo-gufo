@@ -69,82 +69,100 @@ float Dot(const float* a, const float* b, std::size_t n) {
   return sum;
 }
 
-struct Layer {
-  Mat wq, wk, wv, wo, wk_ctx, wv_ctx, gate, up, down;
-  Vec ctx_norm, attn_norm, ffn_norm, q_norm, k_norm, k_ctx_norm;
+struct Cache {
   // The context cache: one row of kKv values per injected position.
   Vec keys, values;
 };
 
 }  // namespace
 
+std::shared_ptr<const DrafterWeights> LoadDrafter(const std::string& path,
+                                                  const Model& model) {
+  auto out = std::make_shared<DrafterWeights>();
+  std::string error;
+  auto owner = gufo::core::GgufReader::OpenFile(path, &error);
+  if (!owner)
+    throw std::runtime_error("inkling2 drafter: cannot open " + path + ": " +
+                             error);
+  out->reader = std::shared_ptr<const gufo::core::GgufReader>(std::move(owner));
+  const auto& r = *out->reader;
+  const Vec raw = LoadVector(r, "dspark_fuse.weight");
+  if (raw.size() != (kLayers + 1) * 4)
+    throw std::runtime_error("inkling2 drafter: unexpected dspark_fuse");
+  for (int row = 0; row <= kLayers; ++row) {
+    const float* w = raw.data() + row * 4;
+    const float max = *std::max_element(w, w + 4);
+    float sum = 0;
+    for (int k = 0; k < 4; ++k)
+      sum += out->fuse[row][k] = std::exp(w[k] - max);
+    for (int k = 0; k < 4; ++k)
+      out->fuse[row][k] /= sum;
+  }
+  for (int il = 0; il < kLayers; ++il) {
+    const std::string b = "blk." + std::to_string(il) + ".";
+    auto mat = [&](const char* n) { return LoadMatrix(r, b + n + ".weight"); };
+    auto vec = [&](const char* n) { return LoadVector(r, b + n + ".weight"); };
+    DrafterWeights::Layer& l = out->layers[il];
+    l.wq = mat("attn_q");
+    l.wk = mat("attn_k");
+    l.wv = mat("attn_v");
+    l.wo = mat("attn_output");
+    l.wk_ctx = mat("attn_k_ctx");
+    l.wv_ctx = mat("attn_v_ctx");
+    l.gate = mat("ffn_gate");
+    l.up = mat("ffn_up");
+    l.down = mat("ffn_down");
+    l.ctx_norm = vec("dflare_norm");
+    l.attn_norm = vec("attn_norm");
+    l.ffn_norm = vec("ffn_norm");
+    l.q_norm = vec("attn_q_norm");
+    l.k_norm = vec("attn_k_norm");
+    l.k_ctx_norm = vec("attn_k_ctx_norm");
+    if (l.wq.cols != kW || l.wq.rows != kNq * kHd || l.wk.rows != kKv ||
+        l.wk_ctx.rows != kKv || l.gate.rows != kFf || l.q_norm.size() != kHd)
+      throw std::runtime_error("inkling2 drafter: unexpected layer shape");
+  }
+  out->head_norm = LoadVector(r, "dspark_norm.weight");
+  out->mask = LoadVector(r, "mask_embd.weight");
+  out->output_norm = LoadVector(r, "output_norm.weight");
+  out->joint_bias = LoadVector(r, "joint_proj.bias");
+  out->hidden_out_bias = LoadVector(r, "dspark_hidden_out.bias");
+  out->markov = LoadMatrix(r, "markov_w1.weight");
+  out->joint = LoadMatrix(r, "joint_proj.weight");
+  out->hidden_out = LoadMatrix(r, "dspark_hidden_out.weight");
+  if (out->markov.cols != kRank || out->markov.type != kGgmlTypeBf16 ||
+      out->joint.cols != 2 * kRank + 2 * kW || out->joint.rows != 3 * kRank ||
+      out->hidden_out.cols != kRank || out->hidden_out.rows != kW ||
+      model.tok_embd.type != kGgmlTypeBf16 || model.tok_embd.cols != kW)
+    throw std::runtime_error("inkling2 drafter: unexpected head shape");
+  return out;
+}
+
 struct Drafter::Impl {
-  std::unique_ptr<gufo::core::GgufReader> reader;
+  std::shared_ptr<const DrafterWeights> weights;
+  const DrafterWeights::Layer* layers{};
+  const float (*fuse)[4]{};
   const Model* target{};
-  Layer layers[kLayers];
-  float fuse[kLayers + 1][kFeatures]{};  // softmaxed mixing weights
-  Vec head_norm, mask, output_norm, joint_bias, hidden_out_bias;
-  Mat markov, joint, hidden_out;
+  Cache caches[kLayers];
+  const Vec &head_norm, &mask, &output_norm, &joint_bias, &hidden_out_bias;
+  const Mat &markov, &joint, &hidden_out;
   Vec f_rnn;  // of the last injected position
   std::uint32_t count{0};
   float freq[kHd / 2]{};
 
-  Impl(const std::string& path, const Model& model) : target(&model) {
-    std::string error;
-    reader = gufo::core::GgufReader::OpenFile(path, &error);
-    if (!reader)
-      throw std::runtime_error("inkling2 drafter: cannot open " + path + ": " +
-                               error);
-    const auto& r = *reader;
-    const Vec raw = LoadVector(r, "dspark_fuse.weight");
-    if (raw.size() != (kLayers + 1) * kFeatures)
-      throw std::runtime_error("inkling2 drafter: unexpected dspark_fuse");
-    for (int row = 0; row <= kLayers; ++row) {
-      const float* w = raw.data() + row * kFeatures;
-      const float max = *std::max_element(w, w + kFeatures);
-      float sum = 0;
-      for (int k = 0; k < kFeatures; ++k)
-        sum += fuse[row][k] = std::exp(w[k] - max);
-      for (int k = 0; k < kFeatures; ++k)
-        fuse[row][k] /= sum;
-    }
-    for (int il = 0; il < kLayers; ++il) {
-      const std::string b = "blk." + std::to_string(il) + ".";
-      auto mat = [&](const char* n) { return LoadMatrix(r, b + n + ".weight"); };
-      auto vec = [&](const char* n) { return LoadVector(r, b + n + ".weight"); };
-      Layer& l = layers[il];
-      l.wq = mat("attn_q");
-      l.wk = mat("attn_k");
-      l.wv = mat("attn_v");
-      l.wo = mat("attn_output");
-      l.wk_ctx = mat("attn_k_ctx");
-      l.wv_ctx = mat("attn_v_ctx");
-      l.gate = mat("ffn_gate");
-      l.up = mat("ffn_up");
-      l.down = mat("ffn_down");
-      l.ctx_norm = vec("dflare_norm");
-      l.attn_norm = vec("attn_norm");
-      l.ffn_norm = vec("ffn_norm");
-      l.q_norm = vec("attn_q_norm");
-      l.k_norm = vec("attn_k_norm");
-      l.k_ctx_norm = vec("attn_k_ctx_norm");
-      if (l.wq.cols != kW || l.wq.rows != kNq * kHd || l.wk.rows != kKv ||
-          l.wk_ctx.rows != kKv || l.gate.rows != kFf || l.q_norm.size() != kHd)
-        throw std::runtime_error("inkling2 drafter: unexpected layer shape");
-    }
-    head_norm = LoadVector(r, "dspark_norm.weight");
-    mask = LoadVector(r, "mask_embd.weight");
-    output_norm = LoadVector(r, "output_norm.weight");
-    joint_bias = LoadVector(r, "joint_proj.bias");
-    hidden_out_bias = LoadVector(r, "dspark_hidden_out.bias");
-    markov = LoadMatrix(r, "markov_w1.weight");
-    joint = LoadMatrix(r, "joint_proj.weight");
-    hidden_out = LoadMatrix(r, "dspark_hidden_out.weight");
-    if (markov.cols != kRank || markov.type != kGgmlTypeBf16 ||
-        joint.cols != 2 * kRank + 2 * kW || joint.rows != 3 * kRank ||
-        hidden_out.cols != kRank || hidden_out.rows != kW ||
-        model.tok_embd.type != kGgmlTypeBf16 || model.tok_embd.cols != kW)
-      throw std::runtime_error("inkling2 drafter: unexpected head shape");
+  Impl(const std::string& path, const Model& model)
+      : weights(LoadDrafter(path, model)),
+        layers(weights->layers),
+        fuse(weights->fuse),
+        target(&model),
+        head_norm(weights->head_norm),
+        mask(weights->mask),
+        output_norm(weights->output_norm),
+        joint_bias(weights->joint_bias),
+        hidden_out_bias(weights->hidden_out_bias),
+        markov(weights->markov),
+        joint(weights->joint),
+        hidden_out(weights->hidden_out) {
     for (std::size_t j = 0; j < kHd / 2; ++j)
       freq[j] = std::pow(1e6f, -2.0f * static_cast<float>(j) / kHd);
   }
@@ -161,15 +179,15 @@ struct Drafter::Impl {
       Rms(mixed.data(), kW, norm.data(), kEps);
     };
     for (int il = 0; il < kLayers; ++il) {
-      Layer& l = layers[il];
+      const DrafterWeights::Layer& l = layers[il];
       mix(il, l.ctx_norm);
       CpuMul(l.wk_ctx, mixed.data(), k.data());
       CpuMul(l.wv_ctx, mixed.data(), v.data());
       for (std::size_t h = 0; h < kNkv; ++h)
         Rms(k.data() + h * kHd, kHd, l.k_ctx_norm.data(), kEps);
       Rope(k.data(), kNkv, count, freq);
-      l.keys.insert(l.keys.end(), k.begin(), k.end());
-      l.values.insert(l.values.end(), v.begin(), v.end());
+      caches[il].keys.insert(caches[il].keys.end(), k.begin(), k.end());
+      caches[il].values.insert(caches[il].values.end(), v.begin(), v.end());
     }
     mix(kLayers, head_norm);
     f_rnn = mixed;
@@ -195,7 +213,8 @@ struct Drafter::Impl {
     Vec a(kW), q(kBlock * kNq * kHd), k(kBlock * kKv), v(kBlock * kKv);
     Vec o(kNq * kHd), proj(kW), gate(kFf), up(kFf);
     for (int il = 0; il < kLayers; ++il) {
-      const Layer& l = layers[il];
+      const DrafterWeights::Layer& l = layers[il];
+      const Cache& cache = caches[il];
       for (int b = 0; b < kBlock; ++b) {
         std::copy_n(x.begin() + b * kW, kW, a.begin());
         Rms(a.data(), kW, l.attn_norm.data(), kEps);
@@ -224,11 +243,11 @@ struct Drafter::Impl {
           const std::size_t g = h / (kNq / kNkv);
           const float* qh = q.data() + (b * kNq + h) * kHd;
           auto key = [&](std::size_t i) {
-            return i < n_ctx ? l.keys.data() + ((first + i) * kNkv + g) * kHd
+            return i < n_ctx ? cache.keys.data() + ((first + i) * kNkv + g) * kHd
                              : k.data() + ((i - n_ctx) * kNkv + g) * kHd;
           };
           auto value = [&](std::size_t i) {
-            return i < n_ctx ? l.values.data() + ((first + i) * kNkv + g) * kHd
+            return i < n_ctx ? cache.values.data() + ((first + i) * kNkv + g) * kHd
                              : v.data() + ((i - n_ctx) * kNkv + g) * kHd;
           };
           float max = -INFINITY;
@@ -310,9 +329,9 @@ std::uint32_t Drafter::size() const {
 void Drafter::Reset() {
   impl_->count = 0;
   impl_->f_rnn.clear();
-  for (Layer& l : impl_->layers) {
-    l.keys.clear();
-    l.values.clear();
+  for (Cache& cache : impl_->caches) {
+    cache.keys.clear();
+    cache.values.clear();
   }
 }
 

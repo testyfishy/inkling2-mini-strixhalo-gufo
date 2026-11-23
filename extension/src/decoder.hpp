@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "drafter.hpp"
 #include "model.hpp"
 
 namespace inkling2 {
@@ -35,6 +36,18 @@ public:
     /// Keep, for every row of a step, the hidden states the drafter reads
     /// (see `features`).
     bool capture_features{false};
+    /// The DSpark drafter (docs/DSPARK.md), or null. With one, every step
+    /// also keeps what the drafter reads of its rows, and `Draft` proposes
+    /// tokens.
+    std::shared_ptr<const DrafterWeights> drafter;
+    /// How many positions back the drafter's middle layer looks. Its file
+    /// lets that layer see the whole context; a window bounds its cost and
+    /// memory, and only proposals depend on it.
+    std::uint32_t draft_window{8192};
+    /// The drafter scores a shortlist of this many tokens instead of the
+    /// whole vocabulary: the tokens of the context and the tokens the model
+    /// itself found likely at recent steps. 0 scores the whole vocabulary.
+    std::uint32_t draft_vocab{32768};
   };
 
   /// Throws std::runtime_error when the model is not Inkling 2 Mini as the
@@ -66,6 +79,20 @@ public:
   void Step(const std::vector<Row>& rows, bool head) {
     Step(rows, head ? Head::kLast : Head::kNone);
   }
+
+  struct DraftToken {
+    std::uint32_t token;
+    float confidence;  // the drafter's probability of this token
+  };
+  [[nodiscard]] bool has_drafter() const;
+  /// Proposes the tokens that follow `anchor`, the token about to be placed
+  /// at the session's position: up to `max_tokens` (at most 7), ending before
+  /// the first one whose confidence is below `min_confidence`. Empty when the
+  /// engine has no drafter or the session nothing to draft from.
+  [[nodiscard]] std::vector<DraftToken> Draft(std::uint32_t session,
+                                              std::uint32_t anchor,
+                                              int max_tokens,
+                                              float min_confidence);
 
   /// Forgets a session's context: its next row is position 0 again.
   void Reset(std::uint32_t session);
@@ -99,6 +126,8 @@ public:
     std::uint32_t full_capacity{0};  // positions
     std::size_t key_row_bytes{0};
     std::size_t value_chunk_bytes{0};
+    /// The drafter's state of a session (0 without a drafter): copied whole.
+    std::size_t draft_bytes{0};
   };
   [[nodiscard]] StateLayout Layout() const;
   [[nodiscard]] void* History(std::uint32_t session) const;
@@ -109,6 +138,7 @@ public:
   /// head.
   [[nodiscard]] void* Full(std::uint32_t session, std::uint32_t visit,
                            std::uint32_t head, bool values) const;
+  [[nodiscard]] void* DraftState(std::uint32_t session) const;
   /// Declares that the session's state now is that of `position` tokens: the
   /// caller has put every piece in place.
   void SetPosition(std::uint32_t session, std::uint32_t position);

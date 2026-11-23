@@ -179,3 +179,98 @@ What this says:
   of their size, as everywhere else, so this is the same sensitivity to near-ties as before,
   on a context whose sliding windows are mostly empty; it is not a number to rely on in
   either direction.
+
+## 7. On the device, 2026-11-22
+
+The drafter now runs on the GPU inside the engine (`extension/src/hip/draft.hip`,
+`GpuEngine::Draft`) and through `gufo serve llm --speculative dspark --dspark-model <file>`.
+
+What the engine does:
+
+- **Context.** Every step of the main model keeps what the drafter reads of its rows: the
+  four hidden states are mixed and projected on the device and stored as FP16 keys and values
+  in three rings per session. Layers 0 and 2 keep their 1,024-position window. The middle
+  layer, which the file lets see the whole context, is given a window too (8,192 positions,
+  `INKLING2_DRAFT_WINDOW`): only proposals depend on it, and it bounds the drafter's memory
+  (32 MB per session) and cost at any depth. Prompt speed with this on is unchanged (a
+  4,096-token prompt in 3.41 s with it, 3.42 s without).
+- **A draft** is one chain of kernels without a host round trip: the block of 8 rows through
+  the three layers, then the recurrent head slot by slot. Each slot's token and the drafter's
+  own probability of it come back together.
+- **The head's correction is precomputed.** `output . (h + hidden_out . latent + bias)` is
+  linear, so `output . hidden_out` (200K x 256) is computed once at load and a slot reads that
+  instead of the whole output matrix.
+- **The head scores a shortlist, not the vocabulary.** 32,768 entries
+  (`INKLING2_DRAFT_VOCAB`; 0 = everything): the tokens of the context and, after every step
+  of the main model, the tokens within 12 of its best logit (at most 192 per row). A full
+  list gives up entries that were not asked for again. Measured before building it, on 400
+  generated tokens of three prompts: with the 256 most likely tokens of each earlier step
+  listed, the next token was on the list in 99.5% to 99.7% of steps after the first 32, with
+  6,000 to 19,000 tokens listed.
+- **Verification** is unchanged: a tentative step of the main model, which draws its own
+  token at every drafted position; a draft is kept only if it is the token drawn.
+
+Checked against the host prototype of section 6 with the whole vocabulary scored: all seven
+proposals identical in every one of 104 steps (two prompts).
+
+Cost of one draft call, short context:
+
+| Version | ms |
+|---|---:|
+| Products on the F32 kernels, head over the whole vocabulary | 45 |
+| Matrix-instruction kernel, 32 batch rows wide, for the layers and the output matrix | 20 |
+| Precomputed head product stored by column, as FP16 | 17 (layers 5.0, output matrix 7.4, slots 4.3) |
+| Shortlist of 32,768 tokens | 7 (layers 5.3, output matrix 1.2, slots 0.4 to 0.9) |
+
+(The matrix-instruction kernel that reads weights straight from memory, which the engine
+uses for steps of up to 16 rows, was slower here than the F32 kernel: 23 ms for the output
+matrix against 14.)
+
+What a verification step costs, which is what limits all of this: 40 ms for one row, 55 for
+2, 65 for 3, 81 for 4, 94 for 6, 105 for 8 at short context, because every extra row reads
+its own experts (2.1 GB). At 100,000 tokens of context: 63, 97, 143 (4 rows) and 157 (8
+rows).
+
+### How many drafts, and when not to draft
+
+Acceptance with seven drafts per step, greedy and at the model's default temperature of 1.0
+(host prototype, tokens per step): 4.38 and 3.86 on chat request A (a Python module), 2.48
+and 1.45 on request B, 2.42 and 1.47 on prose. At temperature 1.0 on ordinary text only one
+draft in fifteen is kept, and drafting seven tokens every step would halve the speed.
+
+The drafter's probability of a token predicts whether the model keeps it (request B, greedy,
+first draft: 1 of 12 kept below 0.3, 18 of 21 kept above 0.9). So:
+
+- **Gate.** A first draft is tried when its probability is at least 0.5 (0.6 when sampling);
+  each further one while the product of the probabilities so far is at least 0.45 (0.5). The
+  head stops at the first slot below the gate.
+- **Controller.** Every drafted step is compared with what plain steps would have produced in
+  the same time, from the clock. While drafting loses, it pauses (8 steps, then 16, then 32)
+  and probes again. One step in 64 is plain so the cost of a plain step stays known.
+
+Development driver, fixed gate of 0.6 on every slot, short context (plain: 24.8 tokens/s):
+
+| Prompt | Greedy | Temperature 1.0 |
+|---|---:|---:|
+| Request A (Python module) | 43.1 | 35.8 |
+| Request B (short function) | 31.6 | 20.4 |
+| Encyclopedia prose | 31.9 | 20.3 |
+
+Through the server, with gate and controller, thinking on, 700 tokens per request
+(`decode_tps` of the server's log, without and with the drafter):
+
+| Request | Greedy | Default sampling |
+|---|---:|---:|
+| A Python module with tests | 24.0 -> 31.4 | 22.3 -> 33.2 |
+| TCP against UDP, concise | 23.9 -> 26.8 | 22.4 -> 24.3 |
+| How tides work, 300 words | 23.7 -> 24.6 | 22.4 -> 22.9 |
+| Three-paragraph summary of a 33,854-token text | 20.3 -> 20.1 | 19.2 -> 18.4 |
+| The same of a 100,024-token text | 15.5 -> 15.6 | 14.9 -> 14.7 |
+
+So: a third to a half faster on code, about a tenth on technical answers, nothing on prose,
+and nothing at depth yet, where a verification step of a few rows reads the whole cache once
+per row. Prompt speed through the server is unchanged (1,094 and 1,087 tokens/s on the
+33,854-token prompt).
+
+The drafter's state (rings and head feature, 32 MB) is one more private part of a cache
+checkpoint, so a restored session drafts as it did before.

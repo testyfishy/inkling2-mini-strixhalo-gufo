@@ -755,8 +755,14 @@ conversion's multiplication in FP16 (0.72 s, same output).
 Not built: using the CPU cores for part of the attention arithmetic. At 12e12 multiply-adds
 per second on the GPU, 16 cores would add well under a tenth, for a large change.
 
+## The drafter on the GPU, 2026-11-22
+
+Step 30; the account and the tables are in [DSPARK.md](DSPARK.md), section 7. In short,
+through the server with thinking on: code 24.0 to 31.4 tokens/s greedy and 22.3 to 33.2 at
+the default temperature, technical answers about a tenth faster, prose and generation after
+long prompts unchanged, prompt speed unchanged.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).
 - Anything on GUFO: there is no Inkling runner yet.
-- DSpark speculative decoding.

@@ -96,10 +96,11 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       of the projection kernel's, cause unknown), fewer small kernels per token (about 8 of
       40 ms), a prefix cache, and a serving runner (tokenizer, chat template, API) so that all
       of this is usable outside the development driver
-- [ ] M4c: speculative decoding with the model's DSpark drafter. Done so far: tentative steps
-      in the engine, and a CPU prototype of the drafter whose acceptance matches llama.cpp's
-      (2.0 to 4.4 tokens per step depending on the text; [docs/DSPARK.md](docs/DSPARK.md)).
-      Still to do: the drafter on the GPU, and cheaper extra rows in a verification step
+- [x] M4c: speculative decoding with the model's DSpark drafter, on the GPU and in the server
+      (`--speculative dspark`): through the server with thinking on, code goes from 24.0 to
+      31.4 tokens/s greedy and from 22.3 to 33.2 at default sampling, technical answers gain
+      about a tenth, prose and generation after long prompts nothing yet
+      ([docs/DSPARK.md](docs/DSPARK.md), section 7)
 - [ ] M3c: tokenizer and chat template, checked against the reference
 - [ ] M4: prefill and decode through GUFO's text-runner interface (`gufo prompt`, `gufo bench`)
 - [x] M5a: the model's tokenizer and chat template in the extension, checked against

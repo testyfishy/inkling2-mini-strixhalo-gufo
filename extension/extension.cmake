@@ -42,6 +42,7 @@ if(TARGET gufo_inkling2_native_gpu)
     SOURCES
       src/hip/bench.hip
       src/hip/decode.hip
+      src/hip/draft.hip
       src/hip/ops.hip
   )
   target_compile_options(gufo_inkling2_native_gpu PRIVATE

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "hip/decode.hpp"
+#include "hip/draft.hpp"
 
 namespace inkling2 {
 namespace {
@@ -137,7 +138,85 @@ struct GpuEngine::Impl {
     float* hist{};
     // The run of the last tentative step: its first batch row and length.
     int pending_first{-1}, pending_count{0};
+    // With a drafter: per layer the key ring and the value ring, then the
+    // head's feature of the last kept row (kE floats). One allocation.
+    std::uint8_t* draft_state{};
+    bool draft_ready{false};
   };
+
+  // The drafter on the device.
+  struct DraftLayer {
+    const std::uint16_t *wq, *wk, *wv, *wo, *wk_ctx, *wv_ctx, *gate, *up, *down;
+    const float *ctx_norm, *attn_norm, *ffn_norm, *q_norm, *k_norm, *k_ctx_norm;
+  };
+  struct Draft {
+    DraftLayer layers[gpu::kDraftLayers];
+    const float *head_norm, *mask, *output_norm, *joint, *joint_bias;
+    const std::uint16_t* markov;
+    std::uint16_t* m;
+    float* m_bias;
+    int cap[gpu::kDraftLayers];
+    std::size_t ring_offset[gpu::kDraftLayers];  // of the key ring; values follow
+    std::size_t f_rnn_offset, state_bytes;
+    // Per batch row of a step.
+    float *mix, *k_raw, *v_raw;
+    std::uint16_t* mix_h;
+    // One draft block.
+    float *x, *a, *q, *k, *v, *o, *proj, *gate, *up, *h, *base, *logits,
+        *state, *j_raw, *latent, *block_max, *block_sum, *top, *confidence,
+        *scratch;
+    std::int32_t *block_arg, *alive;
+    std::uint32_t* tokens;
+    // FP16 copies of the inputs of a block's products.
+    std::uint16_t *a_h, *o_h, *gate_h, *h_h;
+    // The shortlist of the vocabulary the head scores (slots == 0: none).
+    // Host side: where each token is, what each slot holds, which slots were
+    // asked for again since the clock hand passed, and the entries not yet
+    // copied to the device.
+    int slots{0}, used{0}, hand{0};
+    std::vector<std::int32_t> slot_of;
+    std::vector<std::uint32_t> token_of;
+    std::vector<std::uint8_t> touched;
+    std::vector<gpu::DraftListEntry> pending;
+    std::uint16_t *list_output{}, *list_m{};
+    float* list_bias{};
+    std::uint32_t* list_ids{};
+    gpu::DraftListEntry* list_entries{};
+    std::size_t listed{0}, evicted{0};
+    // INKLING2_DRAFT_PROFILE: seconds in the layers, the output matrix and
+    // the slots, and calls.
+    double seconds[3] = {};
+    std::size_t calls{0};
+  };
+  bool draft_profile{EnvOr("INKLING2_DRAFT_PROFILE", 0) != 0};
+  // Experiments: which of a draft's products use the matrix instruction
+  // (1 the layers, 2 the output matrix) and which of its kernels (see
+  // GemmArgs::wmma_tiles).
+  int draft_wmma{EnvOr("INKLING2_DRAFT_WMMA", 3)};
+  int draft_tiles{EnvOr("INKLING2_DRAFT_TILES", 1)};
+  int draft_head_tiles{EnvOr("INKLING2_DRAFT_HEAD_TILES", 1)};
+  int head_tiles{EnvOr("INKLING2_WMMA_HEAD_TILES", -1)};
+  void DraftWmma(gpu::GemmArgs& g, const float* x, int cols, std::uint16_t* xh,
+                 bool head) {
+    if (!(draft_wmma & (head ? 2 : 1)))
+      return;
+    if (Wmma(g, x, cols, xh))
+      g.wmma_tiles = head ? draft_head_tiles : draft_tiles;
+  }
+  std::unique_ptr<Draft> draft;
+  const gpu::DraftRow* dev_draft_rows{};
+  std::size_t off_draft{0};
+  bool need_features{false};
+
+  [[nodiscard]] std::uint16_t* DraftRing(const Session& session, int layer,
+                                         bool values) const {
+    const std::size_t bytes = std::size_t(draft->cap[layer]) * kHK * 2;
+    return reinterpret_cast<std::uint16_t*>(
+        session.draft_state + draft->ring_offset[layer] + (values ? bytes : 0));
+  }
+  [[nodiscard]] float* DraftFeature(const Session& session) const {
+    return reinterpret_cast<float*>(session.draft_state + draft->f_rnn_offset);
+  }
 
   static constexpr std::size_t kHistFloats = (kNC - 1) * (2 * kHK + 2 * kE);
   static constexpr std::size_t kHistOffset[4] = {
@@ -691,18 +770,26 @@ struct GpuEngine::Impl {
     off_heads = off_tokens + 4 * B;
     off_identity = off_heads + 4 * heads_cap;
     off_groups = off_identity + 4 * B;
-    host_staging.resize(off_groups + sizeof(gpu::AttnGroup) * B);
+    off_draft = (off_groups + sizeof(gpu::AttnGroup) * B + 15) / 16 * 16;
+    host_staging.resize(off_draft + sizeof(gpu::DraftRow) * B);
+    need_features = opt.capture_features || opt.drafter != nullptr;
     for (std::size_t b = 0; b < B; ++b) {
       const std::int32_t index = static_cast<std::int32_t>(b);
       std::memcpy(host_staging.data() + off_identity + 4 * b, &index, 4);
     }
-    if (opt.capture_features) {
+    if (need_features) {
       feat = Floats(3 * B * kE);
       feat_final = Floats(B * kE);
+    }
+    if (opt.capture_features) {
       host_feat.resize(3 * B * kE);
       host_feat_final.resize(B * kE);
     }
     staging = Alloc(host_staging.size());
+    dev_draft_rows = reinterpret_cast<const gpu::DraftRow*>(
+        static_cast<const std::uint8_t*>(staging) + off_draft);
+    if (opt.drafter)
+      LoadDraft(*opt.drafter);
     row_states = static_cast<const gpu::RowState*>(staging);
     dev_tokens = reinterpret_cast<const std::uint32_t*>(
         static_cast<const std::uint8_t*>(staging) + off_tokens);
@@ -714,6 +801,470 @@ struct GpuEngine::Impl {
         static_cast<const std::uint8_t*>(staging) + off_groups);
     if (std::getenv("INKLING2_DOTBENCH"))
       DotBench();
+  }
+
+  void LoadDraft(const DrafterWeights& w) {
+    draft = std::make_unique<Draft>();
+    Draft& d = *draft;
+    const std::size_t B = opt.max_batch;
+    for (int l = 0; l < gpu::kDraftLayers; ++l) {
+      const DrafterWeights::Layer& from = w.layers[l];
+      DraftLayer& to = d.layers[l];
+      to.wq = UpBf16(from.wq, true);
+      to.wk = UpBf16(from.wk, true);
+      to.wv = UpBf16(from.wv, true);
+      to.wo = UpBf16(from.wo, true);
+      to.wk_ctx = UpBf16(from.wk_ctx, true);
+      to.wv_ctx = UpBf16(from.wv_ctx, true);
+      to.gate = UpBf16(from.gate, true);
+      to.up = UpBf16(from.up, true);
+      to.down = UpBf16(from.down, true);
+      to.ctx_norm = Up(from.ctx_norm);
+      to.attn_norm = Up(from.attn_norm);
+      to.ffn_norm = Up(from.ffn_norm);
+      to.q_norm = Up(from.q_norm);
+      to.k_norm = Up(from.k_norm);
+      to.k_ctx_norm = Up(from.k_ctx_norm);
+    }
+    d.head_norm = Up(w.head_norm);
+    d.mask = Up(w.mask);
+    d.output_norm = Up(w.output_norm);
+    d.joint = UpF32(w.joint);
+    d.joint_bias = Up(w.joint_bias);
+    d.markov = UpBf16(w.markov);
+
+    // A ring holds its window and the rows of a tentative step, so that rows
+    // which are then dropped never overwrite a position still in a window.
+    std::size_t at = 0;
+    for (int l = 0; l < gpu::kDraftLayers; ++l) {
+      const std::uint32_t window =
+          l == 1 ? std::clamp<std::uint32_t>(opt.draft_window, 64, opt.context)
+                 : gpu::kDraftWindow;
+      d.cap[l] = static_cast<int>((window + 64 + 63) / 64 * 64);
+      d.ring_offset[l] = at;
+      at += std::size_t(d.cap[l]) * kHK * 2 * 2;
+    }
+    d.f_rnn_offset = at;
+    d.state_bytes = at + kE * 4;
+    for (Session& session : sessions)
+      session.draft_state =
+          static_cast<std::uint8_t*>(Alloc(d.state_bytes, true));
+
+    d.mix = Floats(B * 4 * kE);
+    d.mix_h = static_cast<std::uint16_t*>(Alloc(B * 4 * kE * 2));
+    d.k_raw = Floats(B * gpu::kDraftLayers * kHK);
+    d.v_raw = Floats(B * gpu::kDraftLayers * kHK);
+    const std::size_t R = gpu::kDraftBlock;
+    d.x = Floats(R * kE);
+    d.a = Floats(R * kE);
+    d.q = Floats(R * kHQ);
+    d.k = Floats(R * kHK);
+    d.v = Floats(R * kHK);
+    d.o = Floats(R * kHQ);
+    d.proj = Floats(R * kE);
+    d.gate = Floats(R * gpu::kDraftFF);
+    d.up = Floats(R * gpu::kDraftFF);
+    d.h = Floats(R * kE);
+    d.slots = wmma_min_batch > 0 && (draft_wmma & 2) && opt.draft_vocab > 0 &&
+                      opt.draft_vocab < c.n_vocab
+                  ? static_cast<int>((opt.draft_vocab + 255) / 256 * 256)
+                  : 0;
+    d.base = Floats((R - 1) * c.n_vocab_padded);
+    d.logits = Floats(c.n_vocab_padded);
+    d.state = Floats(gpu::kDraftRank, true);
+    d.j_raw = Floats(gpu::kDraftJoint);
+    d.latent = Floats(gpu::kDraftRank);
+    const std::size_t vocab_blocks = (c.n_vocab + 255) / 256;
+    d.block_max = Floats(vocab_blocks);
+    d.block_sum = Floats(vocab_blocks);
+    d.block_arg = static_cast<std::int32_t*>(Alloc(vocab_blocks * 4));
+    d.top = Floats(1);
+    d.confidence = Floats(R, true);
+    d.tokens = static_cast<std::uint32_t*>(Alloc(R * 4, true));
+    d.alive = static_cast<std::int32_t*>(Alloc(4, true));
+    d.scratch = Floats(R * kNH * (std::size_t(d.cap[1]) + R));
+    d.a_h = static_cast<std::uint16_t*>(Alloc(R * kE * 2));
+    d.o_h = static_cast<std::uint16_t*>(Alloc(R * kHQ * 2));
+    d.gate_h = static_cast<std::uint16_t*>(Alloc(R * gpu::kDraftFF * 2));
+    d.h_h = static_cast<std::uint16_t*>(Alloc(R * kE * 2));
+
+    // The head's correction is linear before the output matrix:
+    //   output (h + hidden_out latent + bias)
+    //     = output h + (output hidden_out) latent + output bias.
+    // The second and third products are computed here, once, so that a slot
+    // of the recurrent head reads 200K rows of 256 values instead of the
+    // whole output matrix.
+    const int cols = gpu::kDraftRank + 1;
+    std::vector<float> columns(std::size_t(cols) * kE);
+    if (w.hidden_out.type != kGgmlTypeF32 && w.hidden_out.type != kGgmlTypeBf16)
+      throw std::runtime_error("inkling2 gpu: unsupported drafter head matrix");
+    const auto value = [&](std::size_t row, std::size_t col) {
+      const std::size_t i = row * w.hidden_out.cols + col;
+      float v;
+      if (w.hidden_out.type == kGgmlTypeF32) {
+        std::memcpy(&v, w.hidden_out.data + i * 4, 4);
+        return v;
+      }
+      std::uint16_t bits;
+      std::memcpy(&bits, w.hidden_out.data + i * 2, 2);
+      const std::uint32_t wide = std::uint32_t{bits} << 16;
+      std::memcpy(&v, &wide, 4);
+      return v;
+    };
+    for (std::size_t col = 0; col < gpu::kDraftRank; ++col)
+      for (std::size_t row = 0; row < kE; ++row)
+        columns[col * kE + row] = value(row, col);
+    std::copy(w.hidden_out_bias.begin(), w.hidden_out_bias.end(),
+              columns.begin() + std::size_t(gpu::kDraftRank) * kE);
+    const float* dev_columns =
+        static_cast<const float*>(Upload(columns.data(), columns.size() * 4));
+    // Kept in the order the product leaves it (column c at m + c * vocab),
+    // as FP16: a slot's cost is reading it.
+    void* product = nullptr;
+    Check(hipMalloc(&product, std::size_t(cols) * c.n_vocab_padded * 4),
+          "allocate");
+    gpu::GemmArgs g{};
+    const int vocab = static_cast<int>(c.n_vocab_padded);
+    g.jobs[0] = {output, dev_columns, kE, static_cast<float*>(product), vocab,
+                 vocab, kE};
+    g.count = 1;
+    g.batch = cols;
+    gpu::Gemm(g, stream);
+    d.m = static_cast<std::uint16_t*>(
+        Alloc(std::size_t(gpu::kDraftRank) * c.n_vocab_padded * 2));
+    d.m_bias = Floats(c.n_vocab_padded);
+    gpu::ToHalfArgs half{};
+    half.x = static_cast<const float*>(product);
+    half.x_stride = vocab;
+    half.out = d.m;
+    half.cols = vocab;
+    half.batch = gpu::kDraftRank;
+    gpu::ToHalf(half, stream);
+    Check(hipMemcpyAsync(d.m_bias,
+                         static_cast<const float*>(product) +
+                             std::size_t(gpu::kDraftRank) * c.n_vocab_padded,
+                         std::size_t(c.n_vocab_padded) * 4,
+                         hipMemcpyDeviceToDevice, stream),
+          "copy");
+    Check(hipStreamSynchronize(stream), "synchronize");
+    (void)hipFree(product);
+    if (d.slots > 0) {
+      const std::size_t S = static_cast<std::size_t>(d.slots);
+      d.slot_of.assign(c.n_vocab, -1);
+      d.token_of.assign(S, 0);
+      d.touched.assign(S, 0);
+      d.list_output = static_cast<std::uint16_t*>(Alloc(S * kE * 2, true));
+      d.list_m =
+          static_cast<std::uint16_t*>(Alloc(S * gpu::kDraftRank * 2, true));
+      // An empty slot can never be the best.
+      const std::vector<float> lowest(S, -3.0e38f);
+      d.list_bias =
+          static_cast<float*>(Upload(lowest.data(), lowest.size() * 4));
+      d.list_ids = static_cast<std::uint32_t*>(Alloc(S * 4, true));
+      d.list_entries = static_cast<gpu::DraftListEntry*>(
+          Alloc(kListBatch * sizeof(gpu::DraftListEntry)));
+      // The matrix kernel finds a job's FP16 weights by its pointer.
+      half_of[d.list_output] = d.list_output;
+    }
+  }
+
+  static constexpr std::size_t kListBatch = 4096;
+
+  // Puts a token on the shortlist. A full list gives up the slot the clock
+  // hand reaches first that was not asked for again since its last pass.
+  void List(std::uint32_t token) {
+    Draft& d = *draft;
+    const std::int32_t have = d.slot_of[token];
+    if (have >= 0) {
+      d.touched[have] = 1;
+      return;
+    }
+    int slot;
+    if (d.used < d.slots) {
+      slot = d.used++;
+    } else {
+      while (d.touched[d.hand]) {
+        d.touched[d.hand] = 0;
+        d.hand = (d.hand + 1) % d.slots;
+      }
+      slot = d.hand;
+      d.hand = (d.hand + 1) % d.slots;
+      d.slot_of[d.token_of[slot]] = -1;
+      ++d.evicted;
+    }
+    d.token_of[slot] = token;
+    d.slot_of[token] = slot;
+    d.pending.push_back({slot, token});
+    ++d.listed;
+  }
+
+  // The tokens the model finds likely after a row: those within a margin of
+  // the best logit, at most kListPerRow of them.
+  static constexpr std::size_t kListPerRow = 192;
+  void ListLikely(const float* raw) {
+    const std::size_t n = c.n_vocab;
+    float top = raw[0];
+    for (std::size_t i = 1; i < n; ++i)
+      top = std::max(top, raw[i]);
+    float floor = top - 12.0f;
+    likely.clear();
+    for (std::size_t i = 0; i < n; ++i)
+      if (raw[i] > floor)
+        likely.push_back(static_cast<std::uint32_t>(i));
+    if (likely.size() > kListPerRow) {
+      std::nth_element(likely.begin(), likely.begin() + kListPerRow,
+                       likely.end(), [&](std::uint32_t a, std::uint32_t b) {
+                         return raw[a] > raw[b];
+                       });
+      likely.resize(kListPerRow);
+    }
+    for (const std::uint32_t token : likely)
+      List(token);
+  }
+  std::vector<std::uint32_t> likely;
+
+  // Copies the shortlist's new entries to the device.
+  void FlushList() {
+    Draft& d = *draft;
+    std::size_t at = 0;
+    std::vector<gpu::DraftListEntry> batch;
+    while (at < d.pending.size()) {
+      batch.clear();
+      for (; at < d.pending.size() && batch.size() < kListBatch; ++at) {
+        const gpu::DraftListEntry& entry = d.pending[at];
+        // An entry whose slot was given to another token since is stale.
+        if (d.token_of[entry.slot] == entry.token)
+          batch.push_back(entry);
+      }
+      if (batch.empty())
+        continue;
+      Check(hipMemcpy(d.list_entries, batch.data(),
+                      batch.size() * sizeof(gpu::DraftListEntry),
+                      hipMemcpyHostToDevice),
+            "copy shortlist entries");
+      gpu::DraftListArgs a{};
+      a.entries = d.list_entries;
+      a.count = static_cast<int>(batch.size());
+      a.output = half_of.at(output);
+      a.m = d.m;
+      a.m_bias = d.m_bias;
+      a.vocab_stride = static_cast<int>(c.n_vocab_padded);
+      a.list_output = d.list_output;
+      a.list_m = d.list_m;
+      a.list_bias = d.list_bias;
+      a.list_ids = d.list_ids;
+      a.slots = d.slots;
+      gpu::DraftListFill(a, stream);
+      Check(hipStreamSynchronize(stream), "synchronize");
+    }
+    d.pending.clear();
+  }
+
+  // What the drafter reads of the step's rows, into their sessions' rings.
+  void StoreDraftContext() {
+    const Draft& d = *draft;
+    gpu::DraftMixArgs mix{};
+    mix.feat = feat;
+    mix.feat_block = std::size_t(opt.max_batch) * kE;
+    mix.feat_final = feat_final;
+    for (int r = 0; r <= gpu::kDraftLayers; ++r) {
+      for (int k = 0; k < 4; ++k)
+        mix.fuse[r][k] = opt.drafter->fuse[r][k];
+      mix.norm[r] = r < gpu::kDraftLayers ? d.layers[r].ctx_norm : d.head_norm;
+    }
+    mix.eps = 1e-6f;
+    mix.out = d.mix;
+    mix.batch = batch;
+    gpu::DraftMix(mix, stream);
+    gpu::GemmArgs g{};
+    for (int l = 0; l < gpu::kDraftLayers; ++l) {
+      g.jobs[2 * l] = {d.layers[l].wk_ctx, d.mix + l * kE, 4 * kE,
+                       d.k_raw + l * kHK, gpu::kDraftLayers * kHK, kHK, kE};
+      g.jobs[2 * l + 1] = {d.layers[l].wv_ctx, d.mix + l * kE, 4 * kE,
+                           d.v_raw + l * kHK, gpu::kDraftLayers * kHK, kHK, kE};
+    }
+    g.count = 2 * gpu::kDraftLayers;
+    g.batch = batch;
+    g.variant = gemm_variant;
+    Wmma(g, d.mix, 4 * kE, d.mix_h);
+    gpu::Gemm(g, stream);
+    gpu::DraftStoreArgs store{};
+    store.k_raw = d.k_raw;
+    store.v_raw = d.v_raw;
+    for (int l = 0; l < gpu::kDraftLayers; ++l)
+      store.k_norm[l] = d.layers[l].k_ctx_norm;
+    store.rows = dev_draft_rows;
+    store.eps = 1e-6f;
+    store.batch = batch;
+    gpu::DraftStore(store, stream);
+  }
+
+  // Batch row `b` is the last row its session keeps: its head feature is
+  // what the next draft reads.
+  void CommitDraft(Session& session, std::size_t b) {
+    if (!draft)
+      return;
+    Check(hipMemcpyAsync(DraftFeature(session),
+                         draft->mix + (b * 4 + gpu::kDraftLayers) * kE, kE * 4,
+                         hipMemcpyDeviceToDevice, stream),
+          "commit drafter feature");
+    session.draft_ready = true;
+  }
+
+  std::vector<DraftToken> DraftTokens(std::uint32_t index, std::uint32_t anchor,
+                                      int max_tokens, float min_confidence) {
+    Session& session = sessions.at(index);
+    if (!draft || !session.draft_ready || session.pos == 0 ||
+        session.pending_first >= 0 || max_tokens < 1 || anchor >= c.n_vocab)
+      return {};
+    max_tokens = std::min(max_tokens, gpu::kDraftBlock - 1);
+    Draft& d = *draft;
+    const int pos0 = static_cast<int>(session.pos);
+    gpu::DraftInitArgs init{};
+    init.tok_embd = tok_embd;
+    init.tok_norm = tok_norm;
+    init.tok_eps = c.norm_eps;
+    init.mask = d.mask;
+    init.anchor = anchor;
+    init.x = d.x;
+    init.state = d.state;
+    init.tokens = d.tokens;
+    init.alive = d.alive;
+    if (d.slots > 0)
+      FlushList();
+    auto mark = std::chrono::steady_clock::now();
+    const auto lap = [&](int part) {
+      if (!draft_profile)
+        return;
+      Check(hipStreamSynchronize(stream), "synchronize");
+      const auto now = std::chrono::steady_clock::now();
+      d.seconds[part] += std::chrono::duration<double>(now - mark).count();
+      mark = now;
+    };
+    gpu::DraftInit(init, stream);
+    const float eps = 1e-6f;
+    for (int l = 0; l < gpu::kDraftLayers; ++l) {
+      const DraftLayer& w = d.layers[l];
+      gpu::DraftResNorm({d.x, l > 0 ? d.proj : nullptr, w.attn_norm, eps, d.a},
+                        stream);
+      gpu::GemmArgs g{};
+      g.jobs[0] = {w.wq, d.a, kE, d.q, kHQ, kHQ, kE};
+      g.jobs[1] = {w.wk, d.a, kE, d.k, kHK, kHK, kE};
+      g.jobs[2] = {w.wv, d.a, kE, d.v, kHK, kHK, kE};
+      g.count = 3;
+      g.batch = gpu::kDraftBlock;
+      DraftWmma(g, d.a, kE, d.a_h, false);
+      gpu::Gemm(g, stream);
+      gpu::DraftQk({d.q, d.k, w.q_norm, w.k_norm, eps, pos0}, stream);
+      gpu::DraftAttnArgs at{};
+      at.q = d.q;
+      at.k_blk = d.k;
+      at.v_blk = d.v;
+      at.k_ring = DraftRing(session, l, false);
+      at.v_ring = DraftRing(session, l, true);
+      at.cap = d.cap[l];
+      at.first = std::max(0, pos0 - (d.cap[l] - 64));
+      at.pos0 = pos0;
+      at.scratch = d.scratch;
+      at.out = d.o;
+      gpu::DraftAttn(at, stream);
+      gpu::GemmArgs o{};
+      o.jobs[0] = {w.wo, d.o, kHQ, d.proj, kE, kE, kHQ};
+      o.count = 1;
+      o.batch = gpu::kDraftBlock;
+      DraftWmma(o, d.o, kHQ, d.o_h, false);
+      gpu::Gemm(o, stream);
+      gpu::DraftResNorm({d.x, d.proj, w.ffn_norm, eps, d.a}, stream);
+      gpu::GemmArgs f{};
+      f.jobs[0] = {w.gate, d.a, kE, d.gate, gpu::kDraftFF, gpu::kDraftFF, kE};
+      f.jobs[1] = {w.up, d.a, kE, d.up, gpu::kDraftFF, gpu::kDraftFF, kE};
+      f.count = 2;
+      f.batch = gpu::kDraftBlock;
+      DraftWmma(f, d.a, kE, d.a_h, false);
+      gpu::Gemm(f, stream);
+      gpu::DraftSilu(d.gate, d.up, stream);
+      gpu::GemmArgs down{};
+      down.jobs[0] = {w.down, d.gate, gpu::kDraftFF, d.proj, kE, kE,
+                      gpu::kDraftFF};
+      down.count = 1;
+      down.batch = gpu::kDraftBlock;
+      DraftWmma(down, d.gate, gpu::kDraftFF, d.gate_h, false);
+      gpu::Gemm(down, stream);
+    }
+    lap(0);
+    gpu::DraftResNorm({d.x, d.proj, d.output_norm, eps, d.h}, stream);
+    // output . h for the slots in one pass over the output matrix.
+    gpu::GemmArgs head{};
+    const int vocab = static_cast<int>(c.n_vocab_padded);
+    head.jobs[0] = {output, d.h + kE, kE, d.base, vocab, vocab, kE};
+    if (d.slots > 0)
+      head.jobs[0] = {d.list_output, d.h + kE, kE,     d.base,
+                      d.slots,       d.slots,  kE};
+    head.count = 1;
+    head.batch = max_tokens;
+    head.single_threads = head_threads;
+    DraftWmma(head, d.h + kE, kE, d.h_h, true);
+    gpu::Gemm(head, stream);
+    lap(1);
+    gpu::DraftSlotArgs slot{};
+    slot.joint = d.joint;
+    slot.joint_bias = d.joint_bias;
+    slot.markov = d.markov;
+    slot.h = d.h;
+    slot.f_rnn = DraftFeature(session);
+    slot.state = d.state;
+    slot.j_raw = d.j_raw;
+    slot.latent = d.latent;
+    slot.base = d.base;
+    slot.m = d.m;
+    slot.m_bias = d.m_bias;
+    slot.logits = d.logits;
+    slot.block_max = d.block_max;
+    slot.block_arg = d.block_arg;
+    slot.block_sum = d.block_sum;
+    slot.top = d.top;
+    slot.tokens = d.tokens;
+    slot.confidence = d.confidence;
+    slot.alive = d.alive;
+    slot.softcap = c.logit_softcap;
+    slot.min_confidence = min_confidence;
+    slot.vocab = static_cast<int>(c.n_vocab);
+    slot.vocab_stride = vocab;
+    if (d.slots > 0) {
+      slot.m = d.list_m;
+      slot.m_bias = d.list_bias;
+      slot.vocab = slot.vocab_stride = d.slots;
+      slot.ids = d.list_ids;
+    }
+    for (int i = 1; i <= max_tokens; ++i) {
+      slot.slot = i;
+      gpu::DraftSlot(slot, stream);
+    }
+    std::uint32_t tokens[gpu::kDraftBlock];
+    float confidence[gpu::kDraftBlock];
+    Check(hipMemcpyAsync(tokens, d.tokens, sizeof tokens, hipMemcpyDeviceToHost,
+                         stream),
+          "copy drafts");
+    Check(hipMemcpyAsync(confidence, d.confidence, sizeof confidence,
+                         hipMemcpyDeviceToHost, stream),
+          "copy drafts");
+    Check(hipStreamSynchronize(stream), "synchronize");
+    lap(2);
+    if (draft_profile && ++d.calls % 32 == 0)
+      std::fprintf(stderr,
+                   "inkling2 gpu: draft, ms per call: layers %.2f, output "
+                   "matrix %.2f, slots %.2f; shortlist %d of %d, %zu listed, "
+                   "%zu given up\n",
+                   1e3 * d.seconds[0] / d.calls, 1e3 * d.seconds[1] / d.calls,
+                   1e3 * d.seconds[2] / d.calls, d.used, d.slots, d.listed,
+                   d.evicted);
+    std::vector<DraftToken> out;
+    for (int i = 1; i <= max_tokens; ++i) {
+      if (!(confidence[i] >= min_confidence))
+        break;
+      out.push_back({tokens[i], confidence[i]});
+    }
+    return out;
   }
 
   // Tuning aid: throughput of 8-bit integer dot products against F32
@@ -784,7 +1335,7 @@ struct GpuEngine::Impl {
   // stream entering visits 5, 23 and 41 when features are captured.
   void Tap() {
     const int visit = executed++;
-    if (!opt.capture_features)
+    if (!need_features)
       return;
     const int k = visit == 5 ? 0 : visit == 23 ? 1 : visit == 41 ? 2 : -1;
     if (k < 0)
@@ -1363,6 +1914,7 @@ struct GpuEngine::Impl {
     Session& session = sessions.at(index);
     session.pos = 0;
     session.pending_first = -1;
+    session.draft_ready = false;
     Check(hipMemsetAsync(session.hist, 0, kHistFloats * c.visits() * 4, stream),
           "clear");
     Check(hipStreamSynchronize(stream), "synchronize");
@@ -1523,6 +2075,7 @@ struct GpuEngine::Impl {
       throw std::runtime_error("inkling2 gpu: nothing tentative to accept");
     if (rows_kept > 0) {
       CommitHistory(session, std::size_t(session.pending_first) + rows_kept - 1);
+      CommitDraft(session, std::size_t(session.pending_first) + rows_kept - 1);
       Check(hipStreamSynchronize(stream), "synchronize");
       session.pos += rows_kept;
     }
@@ -1602,6 +2155,30 @@ struct GpuEngine::Impl {
       throw std::runtime_error("inkling2 gpu: too many rows want logits");
     for (std::size_t i = 0; i < heads.size(); ++i)
       head_rows[i] = heads[i];
+    if (draft) {
+      auto* draft_rows =
+          reinterpret_cast<gpu::DraftRow*>(host_staging.data() + off_draft);
+      std::uint32_t run_end = 0;
+      for (std::size_t b = rows.size(); b-- > 0;) {
+        const Session& session = sessions[rows[b].session];
+        const std::uint32_t pos =
+            session.pos + static_cast<std::uint32_t>(run[b]);
+        if (last[b])
+          run_end = pos;
+        gpu::DraftRow& row = draft_rows[b];
+        for (int l = 0; l < gpu::kDraftLayers; ++l) {
+          row.k[l] = DraftRing(session, l, false);
+          row.v[l] = DraftRing(session, l, true);
+          row.cap[l] = draft->cap[l];
+          // Rows further back than a ring is long would share its slots
+          // with later rows of the step.
+          row.store[l] =
+              run_end - pos + 48 < static_cast<std::uint32_t>(draft->cap[l]);
+        }
+        row.pos = static_cast<std::int32_t>(pos);
+        row.pad = 0;
+      }
+    }
     // Groups for the batched attention kernel: runs cut into pieces of at
     // most kAttnRows rows.
     auto* groups =
@@ -1692,7 +2269,7 @@ struct GpuEngine::Impl {
       Visit(il, il, false);
     }
     ReportAttnStats(stats_pos);
-    if (opt.capture_features) {
+    if (need_features) {
       gpu::FinalArgs f{};
       f.stack = stack;
       f.n_blocks = n_blocks;
@@ -1704,6 +2281,10 @@ struct GpuEngine::Impl {
       f.out = feat_final;
       f.count = batch;
       gpu::Final(f, stream);
+      if (draft)
+        StoreDraftContext();
+    }
+    if (opt.capture_features) {
       for (int k = 0; k < 3; ++k)
         Check(hipMemcpyAsync(host_feat.data() + std::size_t(k) * opt.max_batch * kE,
                              feat + std::size_t(k) * opt.max_batch * kE,
@@ -1739,8 +2320,9 @@ struct GpuEngine::Impl {
       g.single_threads = head_threads;
       // Few rows: the F32 kernel, which reads a weight row once for all of
       // them, is several times faster on this 200K-row matrix.
-      if (static_cast<int>(n_heads) >= head_wmma_min)
-        Wmma(g, final_x, kE, xh_head);
+      if (static_cast<int>(n_heads) >= head_wmma_min &&
+          Wmma(g, final_x, kE, xh_head) && head_tiles >= 0)
+        g.wmma_tiles = head_tiles;
       gpu::Gemm(g, stream);
       Check(hipMemcpyAsync(host_logits.data(), logits,
                            n_heads * c.n_vocab_padded * 4,
@@ -1749,12 +2331,20 @@ struct GpuEngine::Impl {
     }
     if (!tentative)
       for (std::size_t b = 0; b < rows.size(); ++b)
-        if (last[b])
+        if (last[b]) {
           CommitHistory(sessions[rows[b].session], b);
+          CommitDraft(sessions[rows[b].session], b);
+        }
     Check(hipStreamSynchronize(stream), "synchronize");
     Mark(10);
     n_launches += 6;
 
+    if (draft && draft->slots > 0) {
+      for (const Row& row : rows)
+        List(row.token);
+      for (std::size_t i = 0; i < n_heads; ++i)
+        ListLikely(host_logits.data() + i * c.n_vocab_padded);
+    }
     for (std::size_t b = 0; b < rows.size(); ++b)
       if (last[b]) {
         Session& session = sessions[rows[b].session];
@@ -1802,6 +2392,7 @@ GpuEngine::StateLayout GpuEngine::Layout() const {
   layout.history_bytes = Impl::kHistFloats * impl.c.visits() * 4;
   layout.key_row_bytes = std::size_t(gpu::kHD) * 2;
   layout.value_chunk_bytes = std::size_t(gpu::kHD) * 1024 * 2;
+  layout.draft_bytes = impl.draft ? impl.draft->state_bytes : 0;
   const Impl::Session& session = impl.sessions.at(0);
   for (std::uint32_t s = 0; s < impl.c.visits(); ++s) {
     const bool ring = impl.c.is_swa[impl.Physical(s)];
@@ -1812,6 +2403,21 @@ GpuEngine::StateLayout GpuEngine::Layout() const {
       layout.full_capacity = static_cast<std::uint32_t>(session.slots[s].cap);
   }
   return layout;
+}
+
+void* GpuEngine::DraftState(std::uint32_t session) const {
+  return impl_->sessions.at(session).draft_state;
+}
+
+bool GpuEngine::has_drafter() const {
+  return impl_->draft != nullptr;
+}
+
+std::vector<GpuEngine::DraftToken> GpuEngine::Draft(std::uint32_t session,
+                                                    std::uint32_t anchor,
+                                                    int max_tokens,
+                                                    float min_confidence) {
+  return impl_->DraftTokens(session, anchor, max_tokens, min_confidence);
 }
 
 void* GpuEngine::History(std::uint32_t session) const {
@@ -1843,6 +2449,7 @@ void GpuEngine::SetPosition(std::uint32_t session, std::uint32_t position) {
     throw std::runtime_error("inkling2 gpu: position beyond the context");
   state.pos = position;
   state.pending_first = -1;
+  state.draft_ready = position > 0;
 }
 
 void GpuEngine::Synchronize() {
