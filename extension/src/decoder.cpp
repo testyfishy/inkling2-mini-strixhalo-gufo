@@ -1660,6 +1660,14 @@ struct GpuEngine::Impl {
         ctrl.down[j] = l.ctrl_down[j];
         ctrl.gain[j] = l.ctrl_gain[j];
         ctrl.forget[j] = l.ctrl_forget[j];
+        ctrl.down_cur_h[j] = l.down_cur[j].hi;
+        ctrl.down_cur_l[j] = l.down_cur[j].lo;
+        ctrl.down_msg_h[j] = l.down_msg[j].hi;
+        ctrl.down_msg_l[j] = l.down_msg[j].lo;
+        ctrl.gain_h[j] = l.gain_split[j].hi;
+        ctrl.gain_l[j] = l.gain_split[j].lo;
+        ctrl.forget_h[j] = l.forget_split[j].hi;
+        ctrl.forget_l[j] = l.forget_split[j].lo;
       }
       ctrl.low = low;
       ctrl.count = 3;
@@ -1936,6 +1944,14 @@ struct GpuEngine::Impl {
       ctrl.down[0] = l.ctrl_down[3];
       ctrl.gain[0] = l.ctrl_gain[3];
       ctrl.forget[0] = l.ctrl_forget[3];
+      ctrl.down_cur_h[0] = l.down_cur[3].hi;
+      ctrl.down_cur_l[0] = l.down_cur[3].lo;
+      ctrl.down_msg_h[0] = l.down_msg[3].hi;
+      ctrl.down_msg_l[0] = l.down_msg[3].lo;
+      ctrl.gain_h[0] = l.gain_split[3].hi;
+      ctrl.gain_l[0] = l.gain_split[3].lo;
+      ctrl.forget_h[0] = l.forget_split[3].hi;
+      ctrl.forget_l[0] = l.forget_split[3].lo;
       ctrl.low = low;
       ctrl.count = 1;
       ctrl.batch = batch;

@@ -1083,6 +1083,27 @@ cost 2.5 tokens/s by itself (the compiler then has fewer registers per thread).
 `INKLING2_WMMA_DIRECT=4` gives the kernel of before. The input projections now read their
 1.9 GB at about 220 GB/s, more than the 190 GB/s taken as the limit until now.
 
+**Step 37: router, loop controllers and norms of a one-token step.** The same layout for the
+small kernels: a thread owns values next to each other and reads them 16 bytes per load, and
+a wave adds its lanes' sums by exchange. Alone and with warm caches (`INKLING2_LAUNCH_BENCH=1`)
+a norm of 2,304 values takes 2.3 us this way against 3.1 to 3.8 us, and the router's 128
+products of 2,304 take 2.9 us against 6.1 us. The loop controllers also read their weights in
+FP16 here (the values are the same: what FP16 cannot hold of a weight is kept beside it and
+added), half the bytes of the 32-bit copies.
+
+| One-token step | Tokens/s |
+|---|---:|
+| Step 36 | 29.7 |
+| Router products only (`INKLING2_SMALL_LANE=1`) | 30.1 |
+| Controllers, rank-64 projection only (2) | 29.9 |
+| Controllers, gain and forget only (4) | 29.9 |
+| Norms only (8) | 30.1 |
+| All four (default) | 31.0 |
+
+KLD from llama.cpp at one row per step, 2,047 scored positions of a 4,096-token chunk:
+0.001703 with the kernels of step 35, 0.001539 with step 36, 0.001525 with step 37 (same top
+token 97.90%, 98.34%, 98.14%).
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

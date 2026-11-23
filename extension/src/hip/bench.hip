@@ -217,6 +217,102 @@ __global__ void TinyBarrierKernel(float* x, int n, int barriers) {
     x[t] = sh[t];
 }
 
+// A norm of 2,304 values in several layouts. Strided: thread t takes values
+// t, t + T, ...; sums through shared memory.
+template <int T>
+__launch_bounds__(T) __global__ void NormStridedBench(float* x, float* y) {
+  __shared__ float sh[T];
+  const int t = threadIdx.x;
+  float mine = 0.0f;
+  for (int i = t; i < 2304; i += T)
+    mine += x[i] * x[i];
+  sh[t] = mine;
+  __syncthreads();
+  for (int step = T / 2; step > 0; step >>= 1) {
+    if (t < step)
+      sh[t] += sh[t + step];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sh[0] / 2304 + 1e-6f);
+  for (int i = t; i < 2304; i += T)
+    y[i] = x[i] * inv;
+}
+// Contiguous: thread t owns 2304 / T values in a row, kept in registers; lanes
+// add by exchange, waves through one shared word each.
+template <int T>
+__launch_bounds__(T) __global__ void NormLaneBench(float* x, float* y) {
+  constexpr int kMine = 2304 / T;
+  __shared__ float sh[32];
+  const int t = threadIdx.x;
+  float v[kMine];
+  __builtin_memcpy(v, x + t * kMine, sizeof v);
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kMine; ++i)
+    sum += v[i] * v[i];
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    sum += __shfl_xor(sum, offset, 32);
+  if (T > 32) {
+    if ((t & 31) == 0)
+      sh[t >> 5] = sum;
+    __syncthreads();
+    sum = 0.0f;
+#pragma unroll
+    for (int w = 0; w < T / 32; ++w)
+      sum += sh[w];
+  }
+  const float inv = 1.0f / sqrtf(sum / 2304 + 1e-6f);
+#pragma unroll
+  for (int i = 0; i < kMine; ++i)
+    v[i] *= inv;
+  __builtin_memcpy(y + t * kMine, v, sizeof v);
+}
+// 128 rows of 2,304 F32 weights times one vector. Strided: a block of 64 per
+// row. Lane: a wave per row, 72 values per lane.
+__launch_bounds__(64) __global__ void DotStridedBench(float* w, float* x,
+                                                      float* y) {
+  __shared__ float sh[64];
+  const int t = threadIdx.x;
+  const float* row = w + blockIdx.x * 2304;
+  float acc = 0.0f;
+  for (int i = t; i < 2304; i += 64)
+    acc += row[i] * x[i];
+  sh[t] = acc;
+  __syncthreads();
+  for (int step = 32; step > 0; step >>= 1) {
+    if (t < step)
+      sh[t] += sh[t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    y[blockIdx.x] = sh[0];
+}
+template <int Waves>
+__launch_bounds__(Waves * 32) __global__ void DotLaneBench(float* w, float* x,
+                                                           float* y) {
+  const int lane = threadIdx.x & 31;
+  const int r = blockIdx.x * Waves + (threadIdx.x >> 5);
+  const float* row = w + r * 2304 + lane * 72;
+  const float* in = x + lane * 72;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int c = 0; c < 18; ++c) {
+    float a[4], b[4];
+    __builtin_memcpy(a, row + c * 4, 16);
+    __builtin_memcpy(b, in + c * 4, 16);
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      acc[e] += a[e] * b[e];
+  }
+  float sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    sum += __shfl_xor(sum, offset, 32);
+  if (lane == 0)
+    y[r] = sum;
+}
+
 int RunLaunchBench() {
   try {
     hipStream_t stream;
@@ -265,6 +361,31 @@ int RunLaunchBench() {
            Check(hipMemcpyAsync(host, x, 64, hipMemcpyDeviceToHost, stream));
          },
          true);
+    float* y = x + 4096;
+    time("norm of 2,304: 1,024 threads, strided", n,
+         [&] { NormStridedBench<1024><<<1, 1024, 0, stream>>>(x, y); }, false);
+    time("norm of 2,304: 256 threads, strided", n,
+         [&] { NormStridedBench<256><<<1, 256, 0, stream>>>(x, y); }, false);
+    time("norm of 2,304: 256 threads, 9 each in a row", n,
+         [&] { NormLaneBench<256><<<1, 256, 0, stream>>>(x, y); }, false);
+    time("norm of 2,304: 128 threads, 18 each", n,
+         [&] { NormLaneBench<128><<<1, 128, 0, stream>>>(x, y); }, false);
+    time("norm of 2,304: 64 threads, 36 each", n,
+         [&] { NormLaneBench<64><<<1, 64, 0, stream>>>(x, y); }, false);
+    time("norm of 2,304: 32 threads, 72 each", n,
+         [&] { NormLaneBench<32><<<1, 32, 0, stream>>>(x, y); }, false);
+    float* w = nullptr;
+    Check(hipMalloc(&w, 128 * 2304 * 4));
+    Check(hipMemset(w, 0, 128 * 2304 * 4));
+    time("128 dots of 2,304: a block of 64 per row", n,
+         [&] { DotStridedBench<<<128, 64, 0, stream>>>(w, x, y); }, false);
+    time("128 dots of 2,304: a wave per row, 1 per block", n,
+         [&] { DotLaneBench<1><<<128, 32, 0, stream>>>(w, x, y); }, false);
+    time("128 dots of 2,304: a wave per row, 4 per block", n,
+         [&] { DotLaneBench<4><<<32, 128, 0, stream>>>(w, x, y); }, false);
+    time("128 dots of 2,304: a wave per row, 8 per block", n,
+         [&] { DotLaneBench<8><<<16, 256, 0, stream>>>(w, x, y); }, false);
+    Check(hipFree(w));
     Check(hipFree(x));
     Check(hipStreamDestroy(stream));
   } catch (const std::exception& e) {

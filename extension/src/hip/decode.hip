@@ -399,6 +399,150 @@ __global__ void CtrlApplyKernel(CtrlArgs a) {
   cur[i] = x - tanhf(forget) * x + tanhf(gain) * msg;
 }
 
+// ---- one-row kernels of the small steps -------------------------------------
+// A thread owns values next to each other and reads them 16 bytes at a time;
+// the sums of a wave's lanes are added by exchange. INKLING2_SMALL_LANE (bits:
+// 1 router, 2 controller down, 4 controller apply, 8 norms; default all)
+// picks them.
+int SmallLane() {
+  static const int bits = [] {
+    const char* e = std::getenv("INKLING2_SMALL_LANE");
+    return e ? std::atoi(e) : 15;
+  }();
+  return bits;
+}
+
+__device__ inline float WaveSum(float v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    v += __shfl_xor(v, offset, 32);
+  return v;
+}
+
+// A wave per (controller, rank); a lane owns 72 columns.
+__launch_bounds__(256) __global__ void CtrlDownLaneKernel(CtrlArgs a) {
+  constexpr int kMine = kE / 32;
+  const int lane = threadIdx.x & 31;
+  const int idx = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const int d = idx % kRank, c = idx / kRank;
+  const std::size_t at = static_cast<std::size_t>(d) * kE + lane * kMine;
+  const float* cur = a.cur + c * kE + lane * kMine;
+  const float* msg = a.msg + c * kE + lane * kMine;
+  const std::uint16_t* wc = a.down_cur_h[c] + at;
+  const std::uint16_t* wm = a.down_msg_h[c] + at;
+  const std::uint16_t* lc = a.down_cur_l[c] ? a.down_cur_l[c] + at : nullptr;
+  const std::uint16_t* lm = a.down_msg_l[c] ? a.down_msg_l[c] + at : nullptr;
+  float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+#pragma unroll
+  for (int ch = 0; ch < kMine / 8; ++ch) {
+    _Float16 hc[8], hm[8];
+    float x[8], y[8];
+    __builtin_memcpy(hc, wc + ch * 8, 16);
+    __builtin_memcpy(hm, wm + ch * 8, 16);
+    __builtin_memcpy(x, cur + ch * 8, 32);
+    __builtin_memcpy(y, msg + ch * 8, 32);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      v0 += x[e] * x[e];
+      v1 += y[e] * y[e];
+      v2 += static_cast<float>(hc[e]) * x[e];
+      v3 += static_cast<float>(hm[e]) * y[e];
+    }
+    if (lc) {
+      __builtin_memcpy(hc, lc + ch * 8, 16);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        v2 += static_cast<float>(hc[e]) * x[e];
+    }
+    if (lm) {
+      __builtin_memcpy(hm, lm + ch * 8, 16);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        v3 += static_cast<float>(hm[e]) * y[e];
+    }
+  }
+  v0 = WaveSum(v0);
+  v1 = WaveSum(v1);
+  v2 = WaveSum(v2);
+  v3 = WaveSum(v3);
+  if (lane == 0) {
+    const float inv_cur = 1.0f / sqrtf(v0 / kE + 1e-6f);
+    const float inv_msg = 1.0f / sqrtf(v1 / kE + 1e-6f);
+    a.low[c * kRank + d] = v2 * inv_cur + v3 * inv_msg;
+  }
+}
+
+// A thread per value, its rank-64 gain and forget rows in FP16; a block of
+// 256 values lies inside one controller (kE = 9 * 256).
+__launch_bounds__(256) __global__ void CtrlApplyLaneKernel(CtrlArgs a) {
+  __shared__ float low[kRank];
+  const int t = threadIdx.x;
+  const int c = blockIdx.x / (kE / 256);
+  const int i = (blockIdx.x % (kE / 256)) * 256 + t;
+  if (t < kRank)
+    low[t] = a.low[c * kRank + t];
+  __syncthreads();
+  const std::size_t at = static_cast<std::size_t>(i) * kRank;
+  const std::uint16_t* wg = a.gain_h[c] + at;
+  const std::uint16_t* wf = a.forget_h[c] + at;
+  const std::uint16_t* lg = a.gain_l[c] ? a.gain_l[c] + at : nullptr;
+  const std::uint16_t* lf = a.forget_l[c] ? a.forget_l[c] + at : nullptr;
+  float gain = 0.0f, forget = 0.0f;
+#pragma unroll
+  for (int ch = 0; ch < kRank / 8; ++ch) {
+    _Float16 hg[8], hf[8];
+    __builtin_memcpy(hg, wg + ch * 8, 16);
+    __builtin_memcpy(hf, wf + ch * 8, 16);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      gain += static_cast<float>(hg[e]) * low[ch * 8 + e];
+      forget += static_cast<float>(hf[e]) * low[ch * 8 + e];
+    }
+    if (lg) {
+      __builtin_memcpy(hg, lg + ch * 8, 16);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        gain += static_cast<float>(hg[e]) * low[ch * 8 + e];
+    }
+    if (lf) {
+      __builtin_memcpy(hf, lf + ch * 8, 16);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        forget += static_cast<float>(hf[e]) * low[ch * 8 + e];
+    }
+  }
+  float* cur = a.cur + c * kE;
+  const float msg = a.msg[c * kE + i];
+  const float x = cur[i];
+  cur[i] = x - tanhf(forget) * x + tanhf(gain) * msg;
+}
+
+// A block per vector, 9 values per thread.
+__launch_bounds__(256) __global__ void NormLaneKernel(NormArgs a) {
+  constexpr int kMine = kE / 256;
+  __shared__ float sh[8];
+  const int t = threadIdx.x;
+  const int j = blockIdx.x;
+  float* x = a.x + j * kE + t * kMine;
+  float v[kMine], g[kMine];
+  __builtin_memcpy(v, x, sizeof v);
+  __builtin_memcpy(g, a.w[j] + t * kMine, sizeof g);
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kMine; ++i)
+    sum += v[i] * v[i];
+  sum = WaveSum(sum);
+  if ((t & 31) == 0)
+    sh[t >> 5] = sum;
+  __syncthreads();
+  sum = ((sh[0] + sh[1]) + (sh[2] + sh[3])) + ((sh[4] + sh[5]) + (sh[6] + sh[7]));
+  const float inv = 1.0f / sqrtf(sum / kE + a.eps);
+#pragma unroll
+  for (int i = 0; i < kMine; ++i)
+    v[i] = v[i] * inv * g[i];
+  __builtin_memcpy(x, v, sizeof v);
+}
+
 // One block per (row, vector).
 constexpr int kNormThreads = 256;
 __launch_bounds__(kNormThreads) __global__ void NormKernel(NormArgs a) {
@@ -1966,6 +2110,29 @@ __launch_bounds__(kRouterThreads) __global__ void RouterLogitsKernel(
     a.logits[b * kNX + expert] = sh[0];
 }
 
+// One row: a wave per expert, 72 columns per lane.
+__launch_bounds__(256) __global__ void RouterLogitsLaneKernel(RouterArgs a) {
+  constexpr int kMine = kE / 32;
+  const int lane = threadIdx.x & 31;
+  const int expert = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const float* row =
+      a.gate_inp + static_cast<std::size_t>(expert) * kE + lane * kMine;
+  const float* x = a.x + lane * kMine;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int c = 0; c < kMine / 4; ++c) {
+    float w[4], v[4];
+    __builtin_memcpy(w, row + c * 4, 16);
+    __builtin_memcpy(v, x + c * 4, 16);
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      acc[e] += w[e] * v[e];
+  }
+  const float sum = WaveSum((acc[0] + acc[1]) + (acc[2] + acc[3]));
+  if (lane == 0)
+    a.logits[expert] = sum;
+}
+
 // Top-8 of the 128 experts by sigmoid(logit) + bias, with the router weights.
 // One block per row.
 __launch_bounds__(kNX) __global__ void RouterSelectKernel(RouterArgs a) {
@@ -3244,16 +3411,28 @@ void GlueA(const GlueAArgs& args, hipStream_t stream) {
 }
 
 void CtrlDown(const CtrlArgs& args, hipStream_t stream) {
+  if (args.batch == 1 && (SmallLane() & 2) && args.down_cur_h[0]) {
+    CtrlDownLaneKernel<<<args.count * kRank / 8, 256, 0, stream>>>(args);
+    return;
+  }
   CtrlDownKernel<<<args.batch * args.count * kRank, kCtrlThreads, 0, stream>>>(
       args);
 }
 
 void CtrlApply(const CtrlArgs& args, hipStream_t stream) {
+  if (args.batch == 1 && !args.yg && (SmallLane() & 4) && args.gain_h[0]) {
+    CtrlApplyLaneKernel<<<args.count * (kE / 256), 256, 0, stream>>>(args);
+    return;
+  }
   CtrlApplyKernel<<<Blocks(std::size_t(args.batch) * args.count * kE, 256), 256,
                     0, stream>>>(args);
 }
 
 void Norm(const NormArgs& args, hipStream_t stream) {
+  if (args.batch == 1 && (SmallLane() & 8)) {
+    NormLaneKernel<<<args.count, 256, 0, stream>>>(args);
+    return;
+  }
   NormKernel<<<args.batch * args.count, kNormThreads, 0, stream>>>(args);
 }
 
@@ -3420,7 +3599,9 @@ void CtrlCombine(const CtrlArgs& args, hipStream_t stream) {
 }
 
 void Router(const RouterArgs& args, hipStream_t stream) {
-  if (!args.logits_ready)
+  if (!args.logits_ready && args.batch == 1 && (SmallLane() & 1))
+    RouterLogitsLaneKernel<<<kNX / 8, 256, 0, stream>>>(args);
+  else if (!args.logits_ready)
     RouterLogitsKernel<<<args.batch * kNX, kRouterThreads, 0, stream>>>(args);
   RouterSelectKernel<<<args.batch, kNX, 0, stream>>>(args);
 }

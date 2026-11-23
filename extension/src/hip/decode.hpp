@@ -130,6 +130,16 @@ struct CtrlArgs {
   // values per (row, controller), laid out like cur with stride 3 * kE.
   const float* yg;
   const float* yf;
+  // The same weights in FP16 (and what FP16 leaves over, or null), for the
+  // one-row kernels: down[:, :kE], down[:, kE:], gain, forget.
+  const std::uint16_t* down_cur_h[3];
+  const std::uint16_t* down_cur_l[3];
+  const std::uint16_t* down_msg_h[3];
+  const std::uint16_t* down_msg_l[3];
+  const std::uint16_t* gain_h[3];
+  const std::uint16_t* gain_l[3];
+  const std::uint16_t* forget_h[3];
+  const std::uint16_t* forget_l[3];
 };
 /// low = yc / rms(cur) + ym / rms(msg): CtrlDown with the two products done
 /// elsewhere (by Gemm).
