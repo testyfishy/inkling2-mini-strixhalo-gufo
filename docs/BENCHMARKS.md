@@ -972,6 +972,86 @@ quality side: perplexity 5.9089 against llama.cpp's 5.9063, KLD 0.0035).
 | Prompt, 512 tokens (this extension as measured at step 16, not since) | 553 | 520 |
 | Generation, short context | 24.9 tokens/s plain; 32 on code with the drafter | 19.5 |
 
+## Speculative sampling, and what other implementations do, 2026-11-23
+
+Step 35. Three other implementations of this model were read for ideas:
+[ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark) (MLX, MIT), Strata
+(github.com/Niko1221/Strata, three separate code paths) and oMLX (github.com/jundot/omlx).
+What they report is second-hand here, on other hardware or other weights unless said.
+
+**Checked against this engine's drafter.** mlx-dspark's description of the drafter matches
+what DSPARK.md specifies (a mixing row and norm per consumer, separate context projections,
+the head's feature of the newest context row, the soft cap after the head's correction).
+
+**Tried from them, on this machine** (through the server, drafter on):
+
+| Setting | Code after 40K tokens of source, greedy / sampled | Short code, greedy / sampled |
+|---|---:|---:|
+| As it was: middle layer sees 8,192 positions, up to 7 drafts by the gate | 35.1 / 31.5 | 32.2 / 27.5 |
+| Middle layer 4,096 positions (mlx-dspark's default) | 34.7 / 30.4 | 32.1 / 27.4 |
+| Middle layer 2,048 | 36.8 / 27.2 | 32.2 / 27.5 |
+| At most 3 drafts (their fixed cap) | 30.0 / 23.0 | 29.3 / 26.2 |
+| At most 5 | 33.0 / 24.4 | 31.7 / 29.6 |
+
+Nothing there beats the settings in use; a fixed short cap is clearly worse here, where the
+gate already stops at the first unsure draft.
+
+**Adopted: speculative sampling.** A sampled request kept a draft only if the model happened
+to draw the drafter's most likely token. All three projects instead draw the draft from the
+drafter's own distribution q and keep it with probability min(1, p / q) under the model's p,
+drawing from the normalized max(0, p - q) on the first refusal; the tokens are distributed
+exactly as without drafts. GUFO's sampler has the pieces (`Distribution`, `Uniform`,
+`SampleResidual`). Here the drafter draws on the device (Gumbel noise per shortlist entry,
+seeded from the request's random stream), the gate looks only at the distribution's largest
+chance, and the whole q of a position is fetched only when a draft is refused.
+`INKLING2_DRAFT_SPEC=0` gives the old test.
+
+Default sampling (temperature 1.0), three seeds each, mean (and the three):
+
+| Request | Plain | Drafts kept on an exact match | Speculative sampling |
+|---|---:|---:|---:|
+| A Python module with tests | 23.4 | 28.4 (30.0, 25.7, 29.6) | 29.3 (28.7, 32.6, 26.5) |
+| Code after 39,963 tokens of source | 21.1 | 27.1 (30.3, 25.5, 25.5) | 27.4 (26.1, 23.4, 32.6) |
+| TCP against UDP | 23.5 | 23.0 | 24.0 |
+| How tides work | 23.4 | 22.9 | 22.9 |
+
+A gain of 1% to 4%, inside the spread between seeds. A single seed had shown 27.4 against
+32.7, which is why three were run. The gate is the reason it is small: a draft is only
+offered when the drafter's best chance is at least one half, and such a token is usually the
+one the model draws as well. A seeded request still gives the same text from an empty
+session, a RAM checkpoint, a disk checkpoint and a new server.
+
+**Can the CPU carry part of the load?** Measured: 16 CPU threads reading memory alone move
+102 GB/s. While the GPU generates (24.7 tokens/s alone, about 138 GB/s of weights), the same
+threads still move 64 GB/s and generation drops to 23.8 tokens/s (4 threads: 28 GB/s and
+24.5). During prompt steps the CPU reads at its full 102 GB/s and prompt speed does not
+move (1,153 and 1,156 tokens/s at 12,000 tokens of depth). So generation is not using all
+the memory traffic this machine can carry: about 200 GB/s flows with both at work. Nothing
+is built on this yet. The work of a token is sequential, so the CPU could only take a share
+of each product while the GPU takes the rest, which costs a hand-over per product.
+
+**Where this engine stands against a port for the same GPU.** A HIP port of Strata's
+`strata-ink2` path (official checkpoint, FP16 cache; pull request 6561 there) reports, on a
+Radeon 8060S: 32.2 tokens/s plain generation and 37.4 with the drafter on one sample, and
+about 604 tokens/s for a 10,500-token prompt. Prompt length and sampling for the generation
+figures are not given. Plain generation here is 24.9: if their figure holds, single-token
+steps here leave about a quarter on the table, and the measured profile says where: about 8
+of 40 ms per token in some 700 small kernels, and projections that run above what reading
+their weights costs (12.0 and 5.3 ms against 10.0 and 3.6). Strata's own card gives 1,466
+tokens/s for prompts on a Strix Halo with a pack it calls identical to the original
+(context and version not stated) against 1,280 here.
+
+**Ideas kept for later, by expected effect here:**
+
+1. Fewer and fused small kernels per token (both MLX projects and Strata's CUDA path found
+   their decode bound by launches, not arithmetic; here it is a fifth of a token's time).
+2. An exact screened argmax for the output matrix on greedy steps (Strata: an 8-bit copy with
+   error bounds, then exact scores for the survivors), instead of reading 0.9 GB per token.
+3. A drafted tree instead of a chain for greedy requests (Strata; mlx-dspark measures about
+   +5% tokens per round on other heads).
+4. The next draft started before the host has read the last step's result (oMLX).
+5. A share of each product on the CPU, per the measurement above.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

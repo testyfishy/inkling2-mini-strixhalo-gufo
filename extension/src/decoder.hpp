@@ -89,17 +89,32 @@ public:
 
   struct DraftToken {
     std::uint32_t token;
-    float confidence;  // the drafter's probability of this token
+    float confidence;   // the drafter's largest probability at this position
+    float probability;  // its probability of this token
   };
   [[nodiscard]] bool has_drafter() const;
   /// Proposes the tokens that follow `anchor`, the token about to be placed
   /// at the session's position: up to `max_tokens` (at most 7), ending before
   /// the first one whose confidence is below `min_confidence`. Empty when the
   /// engine has no drafter or the session nothing to draft from.
+  ///
+  /// With `temperature` 0 each token is the drafter's most likely one. With a
+  /// positive temperature each is drawn from the drafter's distribution at
+  /// that temperature (the noise comes from `seed`), which is what
+  /// speculative sampling needs: a draft x drawn from q is kept with
+  /// probability min(1, p(x) / q(x)) under the model's p, and otherwise a
+  /// token is drawn from the normalized max(0, p - q). `DraftDistribution`
+  /// gives q for one position of the last draft.
   [[nodiscard]] std::vector<DraftToken> Draft(std::uint32_t session,
                                               std::uint32_t anchor,
                                               int max_tokens,
-                                              float min_confidence);
+                                              float min_confidence,
+                                              float temperature = 0.0f,
+                                              std::uint32_t seed = 0);
+  /// The distribution the last draft's token `index` (0-based) was drawn
+  /// from: the tokens with a non-zero chance and their chances.
+  void DraftDistribution(std::size_t index, std::vector<std::uint32_t>* tokens,
+                         std::vector<float>* probabilities);
 
   /// Empties a session's shortlist, and puts tokens on it in order. What a
   /// draft proposes depends on the list, so a caller that wants a request to

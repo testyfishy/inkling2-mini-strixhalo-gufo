@@ -313,10 +313,33 @@ __launch_bounds__(kDraftRank) __global__ void DraftGateKernel(DraftSlotArgs a) {
   a.state[t] = cand + g * (a.state[t] - cand);
 }
 
-// A thread per vocabulary entry: logit = base + m . latent + m_bias.
+__device__ inline float Cap(float x, float cap) {
+  return cap > 0.0f ? cap * tanhf(x / cap) : x;
+}
+
+// Standard Gumbel noise for (seed, slot, entry).
+__device__ inline float Gumbel(std::uint32_t seed, int slot, int entry) {
+  std::uint32_t h = static_cast<std::uint32_t>(entry) * 0x9E3779B1u ^ seed ^
+                    (static_cast<std::uint32_t>(slot) * 0x85EBCA77u);
+  h ^= h >> 16;
+  h *= 0x7FEB352Du;
+  h ^= h >> 15;
+  h *= 0x846CA68Bu;
+  h ^= h >> 16;
+  const float u = (static_cast<float>(h >> 8) + 0.5f) * (1.0f / 16777216.0f);
+  return -__logf(-__logf(u));
+}
+
+// An entry without a token (an empty shortlist slot) has a logit this low.
+constexpr float kNoEntry = -1.0e37f;
+
+// A thread per vocabulary entry: logit = base + m . latent + m_bias. Per
+// block: the best entry by logit, or by capped logit / temperature + noise
+// when a token is drawn, and the largest logit.
 __launch_bounds__(kThreads) __global__ void DraftLogitsKernel(DraftSlotArgs a) {
   __shared__ float lat[kDraftRank];
   __shared__ float sh[kThreads];
+  __shared__ float top[kThreads];
   __shared__ int arg[kThreads];
   if (!*a.alive)
     return;
@@ -324,7 +347,7 @@ __launch_bounds__(kThreads) __global__ void DraftLogitsKernel(DraftSlotArgs a) {
   lat[t] = a.latent[t];
   __syncthreads();
   const int v = blockIdx.x * kThreads + t;
-  float logit = -3.0e38f;
+  float logit = -3.0e38f, key = -3.0e38f;
   if (v < a.vocab) {
     // Column c of m is contiguous over the vocabulary, so a wave reads
     // neighbouring values at every step.
@@ -335,61 +358,75 @@ __launch_bounds__(kThreads) __global__ void DraftLogitsKernel(DraftSlotArgs a) {
       acc += Half(column[static_cast<std::size_t>(c) * a.vocab_stride]) * lat[c];
     logit = acc;
     a.logits[v] = acc;
+    if (acc > kNoEntry)
+      key = a.temperature > 0.0f
+                ? Cap(acc, a.softcap) / a.temperature + Gumbel(a.seed, a.slot, v)
+                : acc;
   }
-  sh[t] = logit;
+  sh[t] = key;
+  top[t] = logit;
   arg[t] = v;
   __syncthreads();
   for (int step = kThreads / 2; step > 0; step >>= 1) {
-    if (t < step && sh[t + step] > sh[t]) {
-      sh[t] = sh[t + step];
-      arg[t] = arg[t + step];
+    if (t < step) {
+      if (sh[t + step] > sh[t]) {
+        sh[t] = sh[t + step];
+        arg[t] = arg[t + step];
+      }
+      top[t] = fmaxf(top[t], top[t + step]);
     }
     __syncthreads();
   }
   if (t == 0) {
     a.block_max[blockIdx.x] = sh[0];
     a.block_arg[blockIdx.x] = arg[0];
+    a.block_top[blockIdx.x] = top[0];
   }
 }
 
-// One block: the best of the block maxima is the slot's token.
+// One block: the best of the block bests is the slot's token.
 constexpr int kPickThreads = 1024;
 __launch_bounds__(kPickThreads) __global__ void DraftPickKernel(
     DraftSlotArgs a, int blocks) {
   __shared__ float sh[kPickThreads];
+  __shared__ float top[kPickThreads];
   __shared__ int arg[kPickThreads];
   if (!*a.alive)
     return;
   const int t = threadIdx.x;
-  float best = -3.0e38f;
+  float best = -3.0e38f, most = -3.0e38f;
   int at = 0;
-  for (int i = t; i < blocks; i += kPickThreads)
+  for (int i = t; i < blocks; i += kPickThreads) {
     if (a.block_max[i] > best) {
       best = a.block_max[i];
       at = a.block_arg[i];
     }
+    most = fmaxf(most, a.block_top[i]);
+  }
   sh[t] = best;
+  top[t] = most;
   arg[t] = at;
   __syncthreads();
   for (int step = kPickThreads / 2; step > 0; step >>= 1) {
-    if (t < step && sh[t + step] > sh[t]) {
-      sh[t] = sh[t + step];
-      arg[t] = arg[t + step];
+    if (t < step) {
+      if (sh[t + step] > sh[t]) {
+        sh[t] = sh[t + step];
+        arg[t] = arg[t + step];
+      }
+      top[t] = fmaxf(top[t], top[t + step]);
     }
     __syncthreads();
   }
   if (t == 0) {
     a.tokens[a.slot] =
         a.ids ? a.ids[arg[0]] : static_cast<std::uint32_t>(arg[0]);
-    *a.top = sh[0];
+    *a.top = top[0];
+    *a.picked = a.logits[arg[0]];
   }
 }
 
-__device__ inline float Cap(float x, float cap) {
-  return cap > 0.0f ? cap * tanhf(x / cap) : x;
-}
-
-// Per 256 vocabulary entries: the sum of exp(capped logit - capped top).
+// Per 256 vocabulary entries: the sum of exp((capped logit - capped top) /
+// temperature), the temperature being 1 when no token is drawn.
 __launch_bounds__(kThreads) __global__ void DraftConfPartKernel(
     DraftSlotArgs a) {
   __shared__ float sh[kThreads];
@@ -398,13 +435,18 @@ __launch_bounds__(kThreads) __global__ void DraftConfPartKernel(
   const int t = threadIdx.x;
   const int v = blockIdx.x * kThreads + t;
   const float top = Cap(*a.top, a.softcap);
-  sh[t] = v < a.vocab ? __expf(Cap(a.logits[v], a.softcap) - top) : 0.0f;
+  const float inverse = a.temperature > 0.0f ? 1.0f / a.temperature : 1.0f;
+  float e = 0.0f;
+  if (v < a.vocab && a.logits[v] > kNoEntry)
+    e = __expf((Cap(a.logits[v], a.softcap) - top) * inverse);
+  sh[t] = e;
   Sum(sh, kThreads);
   if (t == 0)
     a.block_sum[blockIdx.x] = sh[0];
 }
 
-// One block: the token's probability; a low one ends the draft.
+// One block: the largest probability, and the token's; a low largest one
+// ends the draft.
 __launch_bounds__(kPickThreads) __global__ void DraftConfKernel(DraftSlotArgs a,
                                                                int blocks) {
   __shared__ float sh[kPickThreads];
@@ -418,7 +460,11 @@ __launch_bounds__(kPickThreads) __global__ void DraftConfKernel(DraftSlotArgs a,
   Sum(sh, kPickThreads);
   if (t == 0) {
     const float confidence = 1.0f / sh[0];
+    const float inverse = a.temperature > 0.0f ? 1.0f / a.temperature : 1.0f;
     a.confidence[a.slot] = confidence;
+    a.probability[a.slot] =
+        __expf((Cap(*a.picked, a.softcap) - Cap(*a.top, a.softcap)) * inverse) *
+        confidence;
     if (confidence < a.min_confidence)
       *a.alive = 0;
   }

@@ -122,7 +122,8 @@ void DraftSilu(float* gate, const float* up, hipStream_t stream);
 /// One slot of the recurrent head, slot = 1 .. 7. Reads the previous token
 /// from tokens[slot - 1]; writes tokens[slot] and confidence[slot], and
 /// clears *alive when the confidence is below min_confidence, which turns
-/// the later slots into no-ops.
+/// the later slots into no-ops. `logits` keeps the slot's logits (before the
+/// soft cap), for whoever needs the whole distribution afterwards.
 struct DraftSlotArgs {
   int slot;
   const float* joint;       // kDraftJoint rows of kDraftJointIn, F32
@@ -152,6 +153,15 @@ struct DraftSlotArgs {
   // When set, entry v of the head's matrices is token ids[v] (a shortlist of
   // the vocabulary); otherwise entry v is token v.
   const std::uint32_t* ids;
+  // temperature > 0: the slot's token is drawn from softmax(capped logits /
+  // temperature) over the entries (Gumbel noise from `seed`, the slot and
+  // the entry) instead of being the most likely one, and probability[slot]
+  // is the chance it had. confidence[slot] is the largest chance either way.
+  float temperature;
+  std::uint32_t seed;
+  float* probability;
+  float* block_top;  // one per 256 entries: the largest logit
+  float* picked;     // 1: the logit of the slot's token
 };
 void DraftSlot(const DraftSlotArgs& args, hipStream_t stream);
 

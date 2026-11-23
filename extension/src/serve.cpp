@@ -1260,6 +1260,8 @@ public:
         {max_tokens - 1, std::size_t{max_context_} - position - 1,
          std::size_t{max_batch_} - 1});
     std::vector<std::uint32_t> drafts;
+    // For drafts drawn from the drafter's distribution: the chance each had.
+    std::vector<float> chances;
     Lookup::Match match{};
     bool copied = false;
     if (lookup_step) {
@@ -1281,21 +1283,36 @@ public:
       // keep it. A row costs about a quarter of a plain step, the first one
       // more, so a draft is tried while the chance that it and all before it
       // are kept is worth that.
+      // INKLING2_DRAFT_SPEC=0: sampled requests take the drafter's most
+      // likely tokens and keep one only if the model draws the same.
+      const bool draw = sampled && spec_sampling_;
       const float first_min = draft_first_ > 0 ? draft_first_
-                              : sampled        ? 0.6F
-                                               : 0.5F;
+                              : sampled && !draw ? 0.6F
+                                                 : 0.5F;
       const float chain_min = draft_chain_ > 0 ? draft_chain_
-                              : sampled        ? 0.5F
-                                               : 0.45F;
+                              : sampled && !draw ? 0.5F
+                                                 : 0.45F;
+      // A sampled request draws its drafts from the drafter's distribution
+      // at the request's temperature (speculative sampling, see Verify); the
+      // noise comes from the request's own random stream, so a seed repeats.
+      // The gate looks at the distribution's largest chance, never at the
+      // token drawn, which keeps the result exact.
+      const float temperature = draw ? config.temperature : 0.0F;
+      const std::uint32_t seed =
+          draw ? static_cast<std::uint32_t>(sampler.Uniform() * 4294967295.0)
+               : 0U;
       const auto tokens = engine_->Draft(
-          s.session(), anchor, static_cast<int>(std::min<std::size_t>(room, 7)),
-          std::min(first_min, chain_min));
+          s.session(), anchor,
+          static_cast<int>(std::min<std::size_t>(room, draft_max_)),
+          std::min(first_min, chain_min), temperature, seed);
       float chain = 1.0F;
       for (const GpuEngine::DraftToken& token : tokens) {
         chain *= token.confidence;
         if (chain < (drafts.empty() ? first_min : chain_min))
           break;
         drafts.push_back(token.token);
+        if (draw)
+          chances.push_back(token.probability);
       }
     }
     step.selections.push_back(std::move(first));
@@ -1318,7 +1335,9 @@ public:
                          position + static_cast<std::uint32_t>(rows.size()));
     s.slot().has_logits = false;
     engine_->Step(rows, GpuEngine::Head::kAll, true);
-    const std::size_t kept = Verify(s, sampler, anchor, drafts, 0, &step);
+    const std::size_t kept =
+        Verify(s, sampler, anchor, drafts, 0, &step,
+               chances.empty() ? nullptr : &chances);
     if (draft_trace_) {
       std::fprintf(stderr, "inkling2 trace: at %u anchor %u %s", position, anchor,
                    copied ? "copied" : "drafted");
@@ -1488,13 +1507,20 @@ public:
 
 private:
   // After a tentative step: `anchor` is kept, then each draft for as long as
-  // it is the token the sampler draws from the model's distribution at its
-  // position. The session's rows start at logits row `first_row` of the
-  // step. Returns the drafts kept.
+  // it passes. Without `chances` a draft passes when it is the token the
+  // sampler draws from the model's distribution at its position. With
+  // `chances` (the drafts were drawn from the drafter's distribution q, and
+  // these are q of each) it is speculative sampling: a draft x passes with
+  // probability min(1, p(x) / q(x)) under the model's distribution p after
+  // the request's filters, and on the first that does not, the token is
+  // drawn from the normalized max(0, p - q). Either way the tokens are
+  // distributed exactly as without drafts. The session's rows start at
+  // logits row `first_row` of the step. Returns the drafts kept.
   std::size_t Verify(State& s, sampling::SamplerState& sampler,
                      std::uint32_t anchor,
                      const std::vector<std::uint32_t>& drafts,
-                     std::size_t first_row, ext::TextDecodeStep* step) const {
+                     std::size_t first_row, ext::TextDecodeStep* step,
+                     const std::vector<float>* chances = nullptr) const {
     if (s.tokens.size() == engine_->position(s.session()))
       s.tokens.push_back(anchor);
     const bool tracked =
@@ -1504,12 +1530,27 @@ private:
     for (; kept < drafts.size(); ++kept) {
       std::vector<float> logits = engine_->capped_logits(first_row + kept);
       Mask(s, logits.data());
-      const std::uint32_t token =
-          sampler.Sample(std::span<const float>(logits.data(), tokenizer_.size()));
-      if (token != drafts[kept]) {
-        // The token drawn stands; the next step starts from it.
-        sampler.DeferSample(token);
-        break;
+      const std::span<const float> row(logits.data(), tokenizer_.size());
+      std::uint32_t token;
+      if (chances) {
+        const double p = sampler.Distribution(row).probability(drafts[kept]);
+        const double q = (*chances)[kept];
+        if (sampler.Uniform() * q < p) {
+          token = drafts[kept];
+        } else {
+          std::vector<std::uint32_t> ids;
+          std::vector<float> probabilities;
+          engine_->DraftDistribution(kept, &ids, &probabilities);
+          sampler.DeferSample(sampler.SampleResidual(row, ids, probabilities));
+          break;
+        }
+      } else {
+        token = sampler.Sample(row);
+        if (token != drafts[kept]) {
+          // The token drawn stands; the next step starts from it.
+          sampler.DeferSample(token);
+          break;
+        }
       }
       if (s.stop_at_eos() && token == tokenizer_.eos()) {
         step->stop = true;
@@ -1764,7 +1805,11 @@ private:
   float draft_first_{EnvInt("INKLING2_DRAFT_FIRST", 0) / 100.0F};
   float draft_chain_{EnvInt("INKLING2_DRAFT_CHAIN", 0) / 100.0F};
   bool draft_log_{EnvInt("INKLING2_SERVE_DRAFT_LOG", 0) != 0};
+  // Most drafts a step asks the drafter for (INKLING2_DRAFT_MAX, 1 to 7).
+  std::size_t draft_max_{
+      static_cast<std::size_t>(std::clamp(EnvInt("INKLING2_DRAFT_MAX", 7), 1, 7))};
   bool draft_trace_{EnvInt("INKLING2_SERVE_DRAFT_TRACE", 0) != 0};
+  bool spec_sampling_{EnvInt("INKLING2_DRAFT_SPEC", 1) != 0};
   // Most sessions decoded in one step (INKLING2_SERVE_BATCH_WIDTH; 1 = each
   // session on its own).
   std::size_t batch_width_{std::min<std::size_t>(

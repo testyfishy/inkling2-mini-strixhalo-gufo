@@ -242,9 +242,12 @@ draft in fifteen is kept, and drafting seven tokens every step would halve the s
 The drafter's probability of a token predicts whether the model keeps it (request B, greedy,
 first draft: 1 of 12 kept below 0.3, 18 of 21 kept above 0.9). So:
 
-- **Gate.** A first draft is tried when its probability is at least 0.5 (0.6 when sampling);
-  each further one while the product of the probabilities so far is at least 0.45 (0.5). The
-  head stops at the first slot below the gate.
+- **Gate.** A first draft is tried when the drafter's largest probability at that position is
+  at least 0.5; each further one while the product so far is at least 0.45. The head stops at
+  the first slot below the gate.
+- **Sampled requests** draw each draft from the drafter's distribution at the request's
+  temperature and are verified by speculative sampling (BENCHMARKS.md, step 35), which keeps
+  the output distributed exactly as without drafts.
 - **Controller.** Every drafted step is charged what it costs in plain steps (the drafter's
   pass 0.20, the first extra row 0.42, each further row 0.25 at short context; less at depth,
   where a plain step is longer) and compared with the tokens it produced. While drafting

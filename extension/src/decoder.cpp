@@ -209,6 +209,12 @@ struct GpuEngine::Impl {
         *scratch;
     std::int32_t *block_arg, *alive;
     std::uint32_t* tokens;
+    // Per slot: its logits, kept for DraftDistribution; and the scalars of
+    // drawing a token.
+    float *slot_logits, *probability, *block_top, *picked;
+    std::size_t slot_stride{0};
+    std::uint32_t last_session{0};
+    float last_temperature{0};
     // FP16 copies of the inputs of a block's products.
     std::uint16_t *a_h, *o_h, *gate_h, *h_h;
     // Entries of a session's shortlist of the vocabulary (0: none), the
@@ -946,6 +952,11 @@ struct GpuEngine::Impl {
     d.block_max = Floats(vocab_blocks);
     d.block_sum = Floats(vocab_blocks);
     d.block_arg = static_cast<std::int32_t*>(Alloc(vocab_blocks * 4));
+    d.block_top = Floats(vocab_blocks);
+    d.picked = Floats(1);
+    d.probability = Floats(R, true);
+    d.slot_stride = c.n_vocab_padded;
+    d.slot_logits = Floats((R - 1) * d.slot_stride);
     d.top = Floats(1);
     d.confidence = Floats(R, true);
     d.tokens = static_cast<std::uint32_t*>(Alloc(R * 4, true));
@@ -1204,7 +1215,8 @@ struct GpuEngine::Impl {
   }
 
   std::vector<DraftToken> DraftTokens(std::uint32_t index, std::uint32_t anchor,
-                                      int max_tokens, float min_confidence) {
+                                      int max_tokens, float min_confidence,
+                                      float temperature, std::uint32_t seed) {
     Session& session = sessions.at(index);
     if (!draft || !session.draft_ready || session.pos == 0 ||
         session.pending_first >= 0 || max_tokens < 1 || anchor >= c.n_vocab)
@@ -1318,6 +1330,13 @@ struct GpuEngine::Impl {
     slot.tokens = d.tokens;
     slot.confidence = d.confidence;
     slot.alive = d.alive;
+    slot.temperature = temperature;
+    slot.seed = seed;
+    slot.probability = d.probability;
+    slot.block_top = d.block_top;
+    slot.picked = d.picked;
+    d.last_session = index;
+    d.last_temperature = temperature;
     slot.softcap = c.logit_softcap;
     slot.min_confidence = min_confidence;
     slot.vocab = static_cast<int>(c.n_vocab);
@@ -1330,10 +1349,14 @@ struct GpuEngine::Impl {
     }
     for (int i = 1; i <= max_tokens; ++i) {
       slot.slot = i;
+      slot.logits = d.slot_logits + std::size_t(i - 1) * d.slot_stride;
       gpu::DraftSlot(slot, stream);
     }
     std::uint32_t tokens[gpu::kDraftBlock];
-    float confidence[gpu::kDraftBlock];
+    float confidence[gpu::kDraftBlock], probability[gpu::kDraftBlock];
+    Check(hipMemcpyAsync(probability, d.probability, sizeof probability,
+                         hipMemcpyDeviceToHost, stream),
+          "copy drafts");
     Check(hipMemcpyAsync(tokens, d.tokens, sizeof tokens, hipMemcpyDeviceToHost,
                          stream),
           "copy drafts");
@@ -1354,7 +1377,7 @@ struct GpuEngine::Impl {
     for (int i = 1; i <= max_tokens; ++i) {
       if (!(confidence[i] >= min_confidence))
         break;
-      out.push_back({tokens[i], confidence[i]});
+      out.push_back({tokens[i], confidence[i], probability[i]});
     }
     return out;
   }
@@ -2596,6 +2619,47 @@ void GpuEngine::Scrub(std::uint32_t session) {
   }
 }
 
+void GpuEngine::DraftDistribution(std::size_t index,
+                                  std::vector<std::uint32_t>* tokens,
+                                  std::vector<float>* probabilities) {
+  Impl& impl = *impl_;
+  if (!impl.draft || index + 1 >= gpu::kDraftBlock)
+    throw std::runtime_error("inkling2 gpu: no such draft position");
+  Impl::Draft& d = *impl.draft;
+  const Impl::Session& session = impl.sessions.at(d.last_session);
+  const std::size_t entries = d.slots > 0 ? std::size_t(session.list.used)
+                                          : std::size_t(impl.c.n_vocab);
+  std::vector<float> raw(entries);
+  Check(hipStreamSynchronize(impl.stream), "synchronize");
+  Check(hipMemcpy(raw.data(), d.slot_logits + index * d.slot_stride,
+                  entries * 4, hipMemcpyDeviceToHost),
+        "copy draft logits");
+  const float cap = impl.c.logit_softcap;
+  const float inverse = d.last_temperature > 0 ? 1.0f / d.last_temperature : 1.0f;
+  tokens->clear();
+  probabilities->clear();
+  float top = -3.0e38f;
+  for (float& x : raw) {
+    if (x > -1.0e37f) {
+      if (cap != 0.0f)
+        x = cap * std::tanh(x / cap);
+      top = std::max(top, x);
+    }
+  }
+  double sum = 0;
+  for (std::size_t v = 0; v < entries; ++v) {
+    if (raw[v] <= -1.0e37f)
+      continue;
+    const float e = std::exp((raw[v] - top) * inverse);
+    tokens->push_back(d.slots > 0 ? session.list.token_of[v]
+                                  : static_cast<std::uint32_t>(v));
+    probabilities->push_back(e);
+    sum += e;
+  }
+  for (float& e : *probabilities)
+    e = static_cast<float>(e / sum);
+}
+
 void GpuEngine::ResetDraftList(std::uint32_t session) {
   impl_->ResetList(impl_->sessions.at(session));
 }
@@ -2622,8 +2686,11 @@ bool GpuEngine::has_drafter() const {
 std::vector<GpuEngine::DraftToken> GpuEngine::Draft(std::uint32_t session,
                                                     std::uint32_t anchor,
                                                     int max_tokens,
-                                                    float min_confidence) {
-  return impl_->DraftTokens(session, anchor, max_tokens, min_confidence);
+                                                    float min_confidence,
+                                                    float temperature,
+                                                    std::uint32_t seed) {
+  return impl_->DraftTokens(session, anchor, max_tokens, min_confidence,
+                            temperature, seed);
 }
 
 void* GpuEngine::History(std::uint32_t session) const {
