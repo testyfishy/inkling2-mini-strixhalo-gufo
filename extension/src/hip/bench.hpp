@@ -6,5 +6,8 @@ namespace inkling2::gpu {
 /// matrix instruction reaches on this GPU under several conditions. Returns
 /// the process exit code.
 int RunWmmaBench();
+/// INKLING2_LAUNCH_BENCH: what launching a small kernel, and waiting for one,
+/// costs on this machine.
+int RunLaunchBench();
 
 }  // namespace inkling2::gpu

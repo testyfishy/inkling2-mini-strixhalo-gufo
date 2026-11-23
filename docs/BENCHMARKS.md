@@ -1052,6 +1052,37 @@ tokens/s for prompts on a Strix Halo with a pack it calls identical to the origi
 4. The next draft started before the host has read the last step's result (oMLX).
 5. A share of each product on the CPU, per the measurement above.
 
+## Single-token steps, kernel by kernel, 2026-11-22
+
+Step 36 onwards: the gaps of a one-token step are taken largest first, one at a time.
+
+**What a launch costs.** Measured with `INKLING2_LAUNCH_BENCH=1`: a kernel of one block takes
+2.0 us from launch to launch (1.0 us to queue it), eleven barriers inside it add 0.6 us,
+launch and wait 8 us, and 14 us with 64 bytes copied back. The roughly 700 launches of a
+token therefore cost about 1.5 ms, not the 8 ms the section above supposed: the time is
+inside the kernels.
+
+**Step 36: single-row projections.** The kernel for one batch row gave each weight row a
+block of 128 threads, each thread reading one 16-bit weight per load, and added the 128
+partial sums through shared memory. The new one (`GemvLaneKernel`) gives each weight row one
+wave: every lane owns a contiguous 1/32 of the columns, keeps its part of the input in
+registers, reads its weights 16 bytes per load and the lanes' sums are added by exchange,
+with no shared memory and no barrier. Same weights, same 32-bit sums in another order.
+
+| One-token step, 200 tokens after a 256-token prompt | Before | After |
+|---|---:|---:|
+| Plain generation | 24.8 tokens/s | 29.8 |
+| Input projections (profiled) | 12.0 ms | 8.7 |
+| Output projection | 5.3 ms | 3.6 |
+| Output head | 5.1 ms | 3.9 |
+| KLD from llama.cpp, one row per step, 255 positions | 0.00131 | 0.00136 |
+
+Tried on the way: several weight rows per wave (4: 27.6 tokens/s, 2: 28.6, 8: 26.7) and
+blocks of 1 to 16 waves (no difference). A launch bound of 1,024 threads instead of 256
+cost 2.5 tokens/s by itself (the compiler then has fewer registers per thread).
+`INKLING2_WMMA_DIRECT=4` gives the kernel of before. The input projections now read their
+1.9 GB at about 220 GB/s, more than the 190 GB/s taken as the limit until now.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

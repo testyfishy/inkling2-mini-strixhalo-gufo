@@ -715,6 +715,59 @@ __global__ void TransposeKernel(TransposeArgs a) {
 
 // The single-row case: one block of `Threads` threads per output row, no
 // per-row bookkeeping.
+// One batch row, a wave per weight row: lane l owns columns l * cols / 32
+// onwards, reads its part of the weight row 16 bytes at a time and keeps its
+// part of the input in registers for the rows the wave works through; the
+// lanes' sums are added by exchange, with no shared memory and no barrier.
+// A load instruction of a wave moves 512 bytes here against 64 in
+// GemvKernel, which is what a product bound by reading its weights needs.
+// Every job has Chunks * 256 columns.
+template <int Chunks>
+__launch_bounds__(256) __global__ void GemvLaneKernel(GemmArgs a,
+                                                      int total_rows,
+                                                      int kRowsPerWave,
+                                                      int waves) {
+  constexpr int kMine = Chunks * 8;  // columns per lane
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  const int first = (blockIdx.x * waves + wave) * kRowsPerWave;
+  float x[kMine];
+  int have = -1;
+  for (int i = 0; i < kRowsPerWave; ++i) {
+    int r = first + i;
+    if (r >= total_rows)
+      break;
+    int j = 0;
+    while (r >= a.jobs[j].rows) {
+      r -= a.jobs[j].rows;
+      ++j;
+    }
+    if (j != have) {
+      const float* from = a.jobs[j].x + lane * kMine;
+#pragma unroll
+      for (int c = 0; c < kMine; ++c)
+        x[c] = from[c];
+      have = j;
+    }
+    const std::uint16_t* w =
+        a.jobs[j].w + static_cast<std::size_t>(r) * (kMine * 32) + lane * kMine;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int c = 0; c < Chunks; ++c) {
+      std::uint16_t v[8];
+      __builtin_memcpy(v, w + c * 8, 16);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        acc[e & 3] += Bf16(v[e]) * x[c * 8 + e];
+    }
+    float sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0)
+      a.jobs[j].y[r] = sum;
+  }
+}
+
 template<int Threads>
 __launch_bounds__(Threads) __global__ void GemvKernel(GemmArgs a) {
   __shared__ float shared[Threads];
@@ -3261,6 +3314,35 @@ void Gemm(const GemmArgs& args, hipStream_t stream) {
     else
       WmmaGemmBlockKernel<4, false><<<grid, 256, 0, stream>>>(args);
     return;
+  }
+  if (args.batch == 1 && args.variant == 0 && !(g_direct & 4)) {
+    // Bit 4 of INKLING2_WMMA_DIRECT keeps the kernel of before.
+    bool same = true;
+    for (int j = 0; j < args.count; ++j)
+      same = same && args.jobs[j].cols == args.jobs[0].cols &&
+             !args.jobs[j].xt;
+    const int cols = args.jobs[0].cols;
+    if (same && (cols == 2304 || cols == 3072)) {
+      static const int per_a = [] {
+        const char* e = std::getenv("INKLING2_GEMV_ROWS");
+        return e ? std::atoi(e) : 1;
+      }();
+      static const int per_b = [] {
+        const char* e = std::getenv("INKLING2_GEMV_ROWS_B");
+        return e ? std::atoi(e) : 1;
+      }();
+      const int per = cols == 2304 ? per_a : per_b;
+      static const int waves = [] {
+        const char* e = std::getenv("INKLING2_GEMV_WAVES");
+        return e ? std::atoi(e) : 8;
+      }();
+      const int grid = (rows + per * waves - 1) / (per * waves);
+      if (cols == 2304)
+        GemvLaneKernel<9><<<grid, waves * 32, 0, stream>>>(args, rows, per, waves);
+      else
+        GemvLaneKernel<12><<<grid, waves * 32, 0, stream>>>(args, rows, per, waves);
+      return;
+    }
   }
   if (args.batch == 1 && args.variant == 0) {
     if (args.single_threads == 64)

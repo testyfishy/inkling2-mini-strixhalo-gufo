@@ -197,6 +197,83 @@ void RunBlocked(const std::uint32_t* src, float* out, hipStream_t stream) {
 
 }  // namespace
 
+// What a launch costs: a kernel that does next to nothing, in a chain.
+__global__ void TinyKernel(float* x, int n) {
+  const int t = threadIdx.x;
+  if (t < n)
+    x[blockIdx.x * 1024 + t] += 1.0f;
+}
+__global__ void TinyBarrierKernel(float* x, int n, int barriers) {
+  __shared__ float sh[1024];
+  const int t = threadIdx.x;
+  sh[t] = x[t % n];
+  for (int i = 0; i < barriers; ++i) {
+    __syncthreads();
+    if (t < 512)
+      sh[t] += sh[t + 512] * 0.0f;
+  }
+  __syncthreads();
+  if (t < n)
+    x[t] = sh[t];
+}
+
+int RunLaunchBench() {
+  try {
+    hipStream_t stream;
+    Check(hipStreamCreate(&stream));
+    float* x = nullptr;
+    Check(hipMalloc(&x, 64 * 1024 * 4));
+    Check(hipMemset(x, 0, 64 * 1024 * 4));
+    const auto time = [&](const char* what, int count, auto&& launch,
+                          bool sync_each) {
+      for (int i = 0; i < 200; ++i)
+        launch();
+      Check(hipStreamSynchronize(stream));
+      const auto start = std::chrono::steady_clock::now();
+      for (int i = 0; i < count; ++i) {
+        launch();
+        if (sync_each)
+          Check(hipStreamSynchronize(stream));
+      }
+      const double queued = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+      Check(hipStreamSynchronize(stream));
+      const double seconds = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+      std::printf("launch bench: %-46s %7.2f us each (%.2f us to queue)%c", what,
+                  1e6 * seconds / count, 1e6 * queued / count, 10);
+    };
+    const int n = 20000;
+    time("1 block of 64 threads", n,
+         [&] { TinyKernel<<<1, 64, 0, stream>>>(x, 64); }, false);
+    time("1 block of 1,024 threads", n,
+         [&] { TinyKernel<<<1, 1024, 0, stream>>>(x, 1024); }, false);
+    time("9 blocks of 256 threads", n,
+         [&] { TinyKernel<<<9, 256, 0, stream>>>(x, 256); }, false);
+    time("1 block of 1,024 threads, 11 barriers", n,
+         [&] { TinyBarrierKernel<<<1, 1024, 0, stream>>>(x, 1024, 11); }, false);
+    time("1 block of 1,024 threads, 44 barriers", n,
+         [&] { TinyBarrierKernel<<<1, 1024, 0, stream>>>(x, 1024, 44); }, false);
+    time("1 block of 1,024 threads, wait after each", 5000,
+         [&] { TinyKernel<<<1, 1024, 0, stream>>>(x, 1024); }, true);
+    float host[16];
+    time("the same, and 64 bytes copied back", 5000,
+         [&] {
+           TinyKernel<<<1, 1024, 0, stream>>>(x, 1024);
+           Check(hipMemcpyAsync(host, x, 64, hipMemcpyDeviceToHost, stream));
+         },
+         true);
+    Check(hipFree(x));
+    Check(hipStreamDestroy(stream));
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s%c", e.what(), 10);
+    return 1;
+  }
+  return 0;
+}
+
 int RunWmmaBench() {
   try {
     hipStream_t stream{};
