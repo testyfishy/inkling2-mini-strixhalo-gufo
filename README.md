@@ -8,8 +8,9 @@ precision.
 **Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
 extension: about 1,270 tokens/s on a 4K-token prompt, 990 on average over a 100K-token prompt (101 s),
 313 over a 1,040,000-token prompt (55 minutes), 24 tokens/s plain generation, and with the
-model's drafter 31 to 36 on code (25 after 120K tokens of source, where plain is 17), KLD 0.0015
-against llama.cpp on the same file.
+model's drafter 32 to 35 on code (25 after 120K tokens of source, where plain is 17). Against
+llama.cpp on the same file: KLD 0.0015 at 4K tokens and 0.0035 at 32K (perplexity within 0.1%),
+and a 32K-token prompt in 28 s where llama.cpp takes 182 s.
 See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Goal

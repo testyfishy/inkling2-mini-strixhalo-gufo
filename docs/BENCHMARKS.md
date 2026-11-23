@@ -956,6 +956,17 @@ the drafter):
 Prompt speed through the server on those requests: 1,147 tokens/s for the 39,963-token
 prompt and 988 for the 100,024-token one (step 25: 804 and 555).
 
+## Against llama.cpp at 32,768 tokens, 2026-11-22
+
+The same file, the same machine, one 32,768-token chunk of wikitext (QUALITY.md has the
+quality side: perplexity 5.9089 against llama.cpp's 5.9063, KLD 0.0035).
+
+| | This extension | llama.cpp (HIP) |
+|---|---:|---:|
+| A 32,768-token prompt | 27.9 s (1,175 tokens/s) | 181.5 s (180 tokens/s) |
+| Prompt, 512 / 4,096 tokens (llama-bench, synthetic) | 553 / 1,267 tokens/s | 520 / 346 |
+| Generation, short context | 24.9 tokens/s plain; 32 on code with the drafter | 19.5 |
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

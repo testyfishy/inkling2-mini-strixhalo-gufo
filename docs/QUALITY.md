@@ -126,8 +126,34 @@ long-context kernel:
 | Mean KLD from llama.cpp | 0.0017 | |
 | Same top token | 97.56% to 98.05% across two runs | |
 
-Agreement is as close as at 512 tokens. Nothing beyond 4,096 tokens has been checked against a
-reference.
+Agreement is as close as at 512 tokens.
+
+### 32,768 tokens, 2026-11-22
+
+One chunk of 32,768 tokens of the same text, 16,383 scored positions (16,384 to 32,766),
+against llama.cpp's logits for the same chunk (`llama-perplexity -c 32768
+--kl-divergence-base`, a 6.6 GB file). Two runs of this engine at step 34, which take
+different attention kernels: 256 rows per step (the one-pass kernel) and 8 rows per step (the
+one-pass kernel in parts on full-attention layers, the batched kernel on sliding-window
+layers).
+
+| Measure | 256 rows per step | 8 rows per step | llama.cpp |
+|---|---:|---:|---:|
+| Perplexity | 5.9089 | 5.9125 | 5.9063 |
+| Mean KLD from llama.cpp | 0.003457 | 0.003486 | |
+| Median / 99% / largest KLD | 0.00157 / 0.0292 / 0.33 | 0.00156 / 0.0291 / 0.47 | |
+| Same top token | 97.34% | 97.42% | |
+
+Perplexity is within 0.1% of llama.cpp's. The divergence is about 2.3 times what it is at
+4,096 tokens (0.0015), throughout its distribution, and the same for both kernel paths, so it
+is not one kernel's doing. Both engines keep keys and values in 16 bits and sum attention
+over eight times as many positions here; how much of the growth is this engine's rounding and
+how much llama.cpp's cannot be told from this comparison, which has no exact reference.
+
+llama.cpp took 181.5 s for this prompt (180 tokens/s); this engine takes 27.9 s (1,175
+tokens/s on average from an empty context).
+
+Nothing beyond 32,768 tokens has been checked against a reference.
 
 ## What the remaining difference is, and is not, known to be
 
