@@ -1104,6 +1104,74 @@ KLD from llama.cpp at one row per step, 2,047 scored positions of a 4,096-token 
 0.001703 with the kernels of step 35, 0.001539 with step 36, 0.001525 with step 37 (same top
 token 97.90%, 98.34%, 98.14%).
 
+**Step 38: steps of 2 to 4 rows, and the drafter's gate.** With a plain token at 32 ms
+instead of 40, a drafted row has to be cheaper and surer than before to pay. Through the
+server on the build of step 37, drafter on: code 32.7 tokens/s against 30.9 plain, prose 27.8
+against 30.8.
+
+*Steps of a few rows.* The kernels of steps 36 and 37 now also take steps of 2 to 4 rows
+(`INKLING2_GEMV_MAX_BATCH`, `INKLING2_SMALL_MAX_BATCH`): a wave keeps its part of a weight row
+in registers and takes the batch rows one after another, so the weights are still read once.
+The loop controllers of such steps use the exact one-row kernels (FP16 weight parts, 32-bit
+inputs) instead of the matrix instruction, and the expert kernel that groups rows by expert
+starts at 5 rows instead of 4.
+
+| Rows per step (384-token prompt, no output head) | Before | After |
+|---|---:|---:|
+| 1 | 27.9 ms | 27.9 ms |
+| 2 | 48.2 ms | 42.4 ms |
+| 3 | 57.1 ms | 52.4 ms |
+| 4 | 70.4 ms | 64.6 ms |
+| 8 (unchanged path) | 90.2 ms | 90.2 ms |
+
+A second row costs 14.5 ms and each further one 10 to 12: every row reads its own 8 experts
+per layer (11 ms of memory traffic), which no kernel can share between rows that chose
+different experts. KLD from llama.cpp, 2,047 positions: 0.00170, 0.00166 and 0.00168 at 2, 3
+and 4 rows per step (0.00153 at 1, 0.00147 at 256).
+
+*The gate.* A draft was tried when the drafter gave it a chance of 0.5 (0.45 for the chain
+of it and those before). Requests through the server, drafter on, tokens/s:
+
+| First / chain | Code, greedy | Code, sampled | Prose | Answer | Code after 40K tokens |
+|---|---:|---:|---:|---:|---:|
+| 0.50 / 0.45 (before) | 32.2 | 31.3 | 29.2 | 29.5 | 35.7 |
+| 0.60 / 0.50 | 34.6 | 30.1 | 28.8 | 28.9 | 40.1 |
+| 0.70 / 0.60 | 34.1 | 34.0 | 29.8 | 29.4 | 40.0 |
+| 0.70 / 0.70 | 34.9 | 34.7 | 30.3 | 30.6 | 36.6 |
+| 0.80 / 0.70 | 36.5 | 35.1 | 30.0 | 30.8 | 36.6 |
+| 0.80 / 0.55 | 33.6 | 31.7 | 29.7 | 30.2 | 39.1 |
+| 0.50 / 0.45, at most 4 drafts | 32.0 | 28.5 | 29.3 | 28.8 | 33.8 |
+| 0.50 / 0.45, at most 3 drafts | 32.9 | 30.5 | 29.8 | 29.3 | 33.5 |
+
+(Each setting gives a different text, so single cells move by a token per second or so.)
+Short contexts want a strict gate, deep ones a looser one, as the cost of a row against a
+plain step says they should. The gate is now 0.75 / 0.65, less 0.15 at 100,000 tokens of
+context (linear in between), and the controller's cost model uses the step times above.
+
+| Request, drafter on (step 38) | Tokens/s | Plain |
+|---|---:|---:|
+| Code, greedy | 37.6 | 30.9 |
+| Code, sampled | 34.2 | 28.7 |
+| Prose, greedy / sampled | 30.3 / 27.2 | 30.8 / |
+| Technical answer, greedy / sampled | 30.2 / 30.1 | 31.0 / |
+| Code after 39,963 tokens of source, greedy / sampled | 40.2 / 26.1 | 26.6 / |
+
+A request still gives the same text from an empty session, a RAM checkpoint, a disk
+checkpoint and a new server (the test of step 34, repeated).
+
+*A fault found on the way.* The drafter's shortlist of output rows is kept in FP16 only; a
+draft pass of one token read it with the BF16 kernel (wrong chances for that pass, never a
+wrong token: the model verifies every draft), and the new few-row kernel did the same for
+passes of up to four. Such a product now always takes the matrix-instruction kernel.
+
+*Tried without gain.* The same layout for the experts of a one-token step (a wave per hidden
+unit or per group of 2 to 16, 36 bytes of weights in three loads): identical output, 31.1 and
+31.3 tokens/s against 31.05; those kernels already run at what reading their weights costs.
+Sums over a glue block by exchange (two barriers instead of eleven): 31.05 against 31.01.
+
+*Seen, not changed.* A sampled token costs about 2.3 ms more than a greedy one (28.7 against
+30.9 tokens/s): GUFO's sampler works through all 200,000 logits on the host.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

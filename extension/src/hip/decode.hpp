@@ -197,6 +197,9 @@ struct GemmArgs {
   // Kernel choice, for experiments: 0 picks by batch; 1, 2, 4 force the
   // staged kernel 32, 64 or 128 batch rows wide; 8 forces the direct kernel.
   int wmma_tiles;
+  // The weights at `w` are not BF16 rows (a list of FP16 rows for the
+  // matrix-instruction kernel only): the kernels that read `w` must not run.
+  bool half_only;
 };
 /// Every job's y[b] = W x[b] for every row, in one launch.
 void Gemm(const GemmArgs& args, hipStream_t stream);

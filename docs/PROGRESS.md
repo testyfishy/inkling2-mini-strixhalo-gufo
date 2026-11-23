@@ -49,6 +49,7 @@ a short repeating test pattern; from step 9 they are real text (wikitext-2 chunk
 | 35 | `5a8f9ec` | Speculative sampling for sampled requests with the drafter (drafts drawn from the drafter's distribution, kept with probability min(1, p/q)); other implementations read for ideas; CPU headroom measured | at temperature 1.0, three seeds: code 28.4 -> 29.3, code after 40K tokens 27.1 -> 27.4, technical answer 23.0 -> 24.0, prose 22.9 (plain 23.4) | unchanged | | seeded requests repeat exactly from cold, RAM, disk and a new server |
 | 36 | (this commit) | Single-row projections: a wave per weight row, 16-byte loads, no shared memory; launch cost measured (2 us) | plain 24.8 -> 29.8 | unchanged | | KLD at one row per step 0.00136 (0.00131 before) |
 | 37 | (this commit) | One-token step: router products, loop controllers (FP16 weights, same values) and norms read 16 bytes per load and sum by exchange | plain 29.7 -> 31.0 | unchanged | | KLD at one row per step, 2,047 positions: 0.00153 (0.00170 at step 35) |
+| 38 | (this commit) | Steps of 2 to 4 rows on the kernels of steps 36 and 37; drafter gate 0.75 / 0.65 (looser deep in a context) and its cost model on the new step times; drafter shortlist never read as BF16 | plain 31.0 (server 30.9); with the drafter: code 37.6 greedy / 34.2 sampled, code after 40K tokens 40.2, prose 30.3 | unchanged | | KLD at 2 to 4 rows per step 0.0017; repeatability test passes |
 
 Notes on reading this table:
 

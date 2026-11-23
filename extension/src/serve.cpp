@@ -813,17 +813,18 @@ struct DraftControl {
   // What a step that asked the drafter and verified `drafts` of its
   // proposals costs, in plain steps, at `position` tokens of context. Short
   // context, through the server (a verified row also costs the host a
-  // sample): the drafter's pass 0.20, the first extra row 0.42, each further
-  // row 0.25. At 100,000 tokens a plain step is half again as long and the
-  // same work is 0.13, 0.32 and 0.16 of it.
+  // sample): the drafter's pass 0.22, the first extra row 0.45, each further
+  // row 0.31 (a plain step is 32 ms since step 38, a step of 2, 3, 4 rows 46,
+  // 56, 68 ms). At 100,000 tokens a plain step is longer by attention alone
+  // and the same work is 0.13, 0.30 and 0.18 of it.
   [[nodiscard]] static double Cost(std::size_t drafts, std::size_t position) {
     const double depth =
         std::min(1.0, static_cast<double>(position) / 100000.0);
-    const double pass = 0.20 - 0.07 * depth;
+    const double pass = 0.22 - 0.09 * depth;
     if (drafts == 0)
       return 1.0 + pass;
-    return 1.0 + pass + (0.42 - 0.10 * depth) +
-           (0.25 - 0.09 * depth) * static_cast<double>(drafts - 1);
+    return 1.0 + pass + (0.45 - 0.15 * depth) +
+           (0.31 - 0.13 * depth) * static_cast<double>(drafts - 1);
   }
   void Drafted(std::size_t tokens, std::size_t drafts, std::size_t position) {
     ++calls;
@@ -1280,18 +1281,22 @@ public:
     const bool proposed = drafts.empty() && model_step;
     if (proposed) {
       // The drafter's probability of a token says how likely the model is to
-      // keep it. A row costs about a quarter of a plain step, the first one
-      // more, so a draft is tried while the chance that it and all before it
-      // are kept is worth that.
+      // keep it. A row costs about a third of a plain step, the first one
+      // nearly half (less deep in a context, where a plain step is longer),
+      // so a draft is tried while the chance that it and all before it are
+      // kept is well above that. Measured, step 38: 0.75 and 0.65 at short
+      // context, 0.15 less at 100,000 tokens.
+      const float deep =
+          0.15F * std::min(1.0F, static_cast<float>(s.tokens.size()) / 100000.0F);
       // INKLING2_DRAFT_SPEC=0: sampled requests take the drafter's most
       // likely tokens and keep one only if the model draws the same.
       const bool draw = sampled && spec_sampling_;
       const float first_min = draft_first_ > 0 ? draft_first_
-                              : sampled && !draw ? 0.6F
-                                                 : 0.5F;
+                              : sampled && !draw ? 0.8F
+                                                 : 0.75F - deep;
       const float chain_min = draft_chain_ > 0 ? draft_chain_
-                              : sampled && !draw ? 0.5F
-                                                 : 0.45F;
+                              : sampled && !draw ? 0.7F
+                                                 : 0.65F - deep;
       // A sampled request draws its drafts from the drafter's distribution
       // at the request's temperature (speculative sampling, see Verify); the
       // noise comes from the request's own random stream, so a seed repeats.

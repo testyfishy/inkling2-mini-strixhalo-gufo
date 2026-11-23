@@ -287,7 +287,7 @@ struct GpuEngine::Impl {
       *expert_items_full{};
   std::uint32_t *xq{}, *aq{};
   float *xs{}, *as{};
-  int major_min_batch{4};
+  int major_min_batch{5};
   bool transpose{true};
   // Steps of at least this many rows run the projections through the FP16
   // matrix-instruction kernel (0 = never). INKLING2_WMMA_MIN_BATCH.
@@ -370,7 +370,7 @@ struct GpuEngine::Impl {
   // Steps of at least this many rows compute the router and the loop
   // controllers' projections with SplitGemm (0 = never).
   // INKLING2_SPLIT_GEMM_MIN_BATCH.
-  int split_min_batch{EnvOr("INKLING2_SPLIT_GEMM_MIN_BATCH", 2)};
+  int split_min_batch{EnvOr("INKLING2_SPLIT_GEMM_MIN_BATCH", 5)};
   std::size_t split_count{0}, split_with_lo{0};
   // The loop controllers' products take their inputs as one FP16 value each,
   // like every other projection; INKLING2_CTRL_LOW_INPUTS=1 adds the part
@@ -490,7 +490,8 @@ struct GpuEngine::Impl {
   // is large enough and every weight has an FP16 copy: converts the inputs
   // (`cols` values per row at x) into `xh` and fills in the jobs.
   bool Wmma(gpu::GemmArgs& g, const float* x, int cols, std::uint16_t* xh) {
-    if (wmma_min_batch <= 0 || g.batch < wmma_min_batch)
+    // (A product whose weights exist in FP16 only has no other kernel.)
+    if (wmma_min_batch <= 0 || (g.batch < wmma_min_batch && !g.half_only))
       return false;
     for (int j = 0; j < g.count; ++j)
       if (half_of.find(g.jobs[j].w) == half_of.end())
@@ -1305,6 +1306,7 @@ struct GpuEngine::Impl {
       head.jobs[0] = {session.list.output, d.h + kE, kE,     d.base,
                       d.slots,             d.slots,  kE};
     head.count = 1;
+    head.half_only = d.slots > 0;
     head.batch = max_tokens;
     head.single_threads = head_threads;
     DraftWmma(head, d.h + kE, kE, d.h_h, true);

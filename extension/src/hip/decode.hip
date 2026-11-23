@@ -411,6 +411,14 @@ int SmallLane() {
   }();
   return bits;
 }
+// Steps of up to this many rows take them (INKLING2_SMALL_MAX_BATCH).
+int SmallMaxBatch() {
+  static const int rows = [] {
+    const char* e = std::getenv("INKLING2_SMALL_MAX_BATCH");
+    return e ? std::atoi(e) : 4;
+  }();
+  return rows;
+}
 
 __device__ inline float WaveSum(float v) {
 #pragma unroll
@@ -424,10 +432,11 @@ __launch_bounds__(256) __global__ void CtrlDownLaneKernel(CtrlArgs a) {
   constexpr int kMine = kE / 32;
   const int lane = threadIdx.x & 31;
   const int idx = blockIdx.x * 8 + (threadIdx.x >> 5);
-  const int d = idx % kRank, c = idx / kRank;
+  const int d = idx % kRank, c = (idx / kRank) % a.count;
+  const std::size_t b = idx / (kRank * a.count);
   const std::size_t at = static_cast<std::size_t>(d) * kE + lane * kMine;
-  const float* cur = a.cur + c * kE + lane * kMine;
-  const float* msg = a.msg + c * kE + lane * kMine;
+  const float* cur = a.cur + b * a.cur_stride + c * kE + lane * kMine;
+  const float* msg = a.msg + b * a.msg_stride + c * kE + lane * kMine;
   const std::uint16_t* wc = a.down_cur_h[c] + at;
   const std::uint16_t* wm = a.down_msg_h[c] + at;
   const std::uint16_t* lc = a.down_cur_l[c] ? a.down_cur_l[c] + at : nullptr;
@@ -468,7 +477,7 @@ __launch_bounds__(256) __global__ void CtrlDownLaneKernel(CtrlArgs a) {
   if (lane == 0) {
     const float inv_cur = 1.0f / sqrtf(v0 / kE + 1e-6f);
     const float inv_msg = 1.0f / sqrtf(v1 / kE + 1e-6f);
-    a.low[c * kRank + d] = v2 * inv_cur + v3 * inv_msg;
+    a.low[(b * 3 + c) * kRank + d] = v2 * inv_cur + v3 * inv_msg;
   }
 }
 
@@ -477,10 +486,11 @@ __launch_bounds__(256) __global__ void CtrlDownLaneKernel(CtrlArgs a) {
 __launch_bounds__(256) __global__ void CtrlApplyLaneKernel(CtrlArgs a) {
   __shared__ float low[kRank];
   const int t = threadIdx.x;
-  const int c = blockIdx.x / (kE / 256);
+  const int c = (blockIdx.x / (kE / 256)) % a.count;
+  const std::size_t b = blockIdx.x / (kE / 256 * a.count);
   const int i = (blockIdx.x % (kE / 256)) * 256 + t;
   if (t < kRank)
-    low[t] = a.low[c * kRank + t];
+    low[t] = a.low[(b * 3 + c) * kRank + t];
   __syncthreads();
   const std::size_t at = static_cast<std::size_t>(i) * kRank;
   const std::uint16_t* wg = a.gain_h[c] + at;
@@ -511,8 +521,8 @@ __launch_bounds__(256) __global__ void CtrlApplyLaneKernel(CtrlArgs a) {
         forget += static_cast<float>(hf[e]) * low[ch * 8 + e];
     }
   }
-  float* cur = a.cur + c * kE;
-  const float msg = a.msg[c * kE + i];
+  float* cur = a.cur + b * a.cur_stride + c * kE;
+  const float msg = a.msg[b * a.msg_stride + c * kE + i];
   const float x = cur[i];
   cur[i] = x - tanhf(forget) * x + tanhf(gain) * msg;
 }
@@ -522,8 +532,9 @@ __launch_bounds__(256) __global__ void NormLaneKernel(NormArgs a) {
   constexpr int kMine = kE / 256;
   __shared__ float sh[8];
   const int t = threadIdx.x;
-  const int j = blockIdx.x;
-  float* x = a.x + j * kE + t * kMine;
+  const int j = blockIdx.x % a.count;
+  const std::size_t b = blockIdx.x / a.count;
+  float* x = a.x + b * a.stride + j * kE + t * kMine;
   float v[kMine], g[kMine];
   __builtin_memcpy(v, x, sizeof v);
   __builtin_memcpy(g, a.w[j] + t * kMine, sizeof g);
@@ -909,6 +920,53 @@ __launch_bounds__(256) __global__ void GemvLaneKernel(GemmArgs a,
       sum += __shfl_xor(sum, offset, 32);
     if (lane == 0)
       a.jobs[j].y[r] = sum;
+  }
+}
+
+// A few batch rows: a wave per weight row keeps its 1/32 of the row in
+// registers, converted once, and takes the batch rows one after another. The
+// weights are read once, as for one row; the inputs come from the cache.
+template <int Chunks>
+__launch_bounds__(256) __global__ void GemvLaneBatchKernel(GemmArgs a,
+                                                           int total_rows) {
+  constexpr int kMine = Chunks * 8;
+  const int lane = threadIdx.x & 31;
+  int r = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (r >= total_rows)
+    return;
+  int j = 0;
+  while (r >= a.jobs[j].rows) {
+    r -= a.jobs[j].rows;
+    ++j;
+  }
+  const std::uint16_t* w =
+      a.jobs[j].w + static_cast<std::size_t>(r) * (kMine * 32) + lane * kMine;
+  float wf[kMine];
+#pragma unroll
+  for (int c = 0; c < Chunks; ++c) {
+    std::uint16_t v[8];
+    __builtin_memcpy(v, w + c * 8, 16);
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      wf[c * 8 + e] = Bf16(v[e]);
+  }
+  const float* x0 = a.jobs[j].x + lane * kMine;
+  float* y = a.jobs[j].y + r;
+  const int x_stride = a.jobs[j].x_stride, y_stride = a.jobs[j].y_stride;
+  for (int b = 0; b < a.batch; ++b) {
+    const float* x = x0 + static_cast<std::size_t>(b) * x_stride;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int c = 0; c < Chunks; ++c) {
+      float v[8];
+      __builtin_memcpy(v, x + c * 8, 32);
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        acc[e & 3] += wf[c * 8 + e] * v[e];
+    }
+    const float sum = WaveSum((acc[0] + acc[1]) + (acc[2] + acc[3]));
+    if (lane == 0)
+      y[static_cast<std::size_t>(b) * y_stride] = sum;
   }
 }
 
@@ -2114,10 +2172,11 @@ __launch_bounds__(kRouterThreads) __global__ void RouterLogitsKernel(
 __launch_bounds__(256) __global__ void RouterLogitsLaneKernel(RouterArgs a) {
   constexpr int kMine = kE / 32;
   const int lane = threadIdx.x & 31;
-  const int expert = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const int expert = (blockIdx.x % (kNX / 8)) * 8 + (threadIdx.x >> 5);
+  const std::size_t b = blockIdx.x / (kNX / 8);
   const float* row =
       a.gate_inp + static_cast<std::size_t>(expert) * kE + lane * kMine;
-  const float* x = a.x + lane * kMine;
+  const float* x = a.x + b * kE + lane * kMine;
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
   for (int c = 0; c < kMine / 4; ++c) {
@@ -2130,7 +2189,7 @@ __launch_bounds__(256) __global__ void RouterLogitsLaneKernel(RouterArgs a) {
   }
   const float sum = WaveSum((acc[0] + acc[1]) + (acc[2] + acc[3]));
   if (lane == 0)
-    a.logits[expert] = sum;
+    a.logits[b * kNX + expert] = sum;
 }
 
 // Top-8 of the 128 experts by sigmoid(logit) + bias, with the router weights.
@@ -3411,8 +3470,10 @@ void GlueA(const GlueAArgs& args, hipStream_t stream) {
 }
 
 void CtrlDown(const CtrlArgs& args, hipStream_t stream) {
-  if (args.batch == 1 && (SmallLane() & 2) && args.down_cur_h[0]) {
-    CtrlDownLaneKernel<<<args.count * kRank / 8, 256, 0, stream>>>(args);
+  if (args.batch <= SmallMaxBatch() && (SmallLane() & 2) &&
+      args.down_cur_h[0]) {
+    CtrlDownLaneKernel<<<args.batch * args.count * kRank / 8, 256, 0,
+                         stream>>>(args);
     return;
   }
   CtrlDownKernel<<<args.batch * args.count * kRank, kCtrlThreads, 0, stream>>>(
@@ -3420,8 +3481,10 @@ void CtrlDown(const CtrlArgs& args, hipStream_t stream) {
 }
 
 void CtrlApply(const CtrlArgs& args, hipStream_t stream) {
-  if (args.batch == 1 && !args.yg && (SmallLane() & 4) && args.gain_h[0]) {
-    CtrlApplyLaneKernel<<<args.count * (kE / 256), 256, 0, stream>>>(args);
+  if (args.batch <= SmallMaxBatch() && !args.yg && (SmallLane() & 4) &&
+      args.gain_h[0]) {
+    CtrlApplyLaneKernel<<<args.batch * args.count * (kE / 256), 256, 0,
+                          stream>>>(args);
     return;
   }
   CtrlApplyKernel<<<Blocks(std::size_t(args.batch) * args.count * kE, 256), 256,
@@ -3429,8 +3492,8 @@ void CtrlApply(const CtrlArgs& args, hipStream_t stream) {
 }
 
 void Norm(const NormArgs& args, hipStream_t stream) {
-  if (args.batch == 1 && (SmallLane() & 8)) {
-    NormLaneKernel<<<args.count, 256, 0, stream>>>(args);
+  if (args.batch <= SmallMaxBatch() && (SmallLane() & 8)) {
+    NormLaneKernel<<<args.batch * args.count, 256, 0, stream>>>(args);
     return;
   }
   NormKernel<<<args.batch * args.count, kNormThreads, 0, stream>>>(args);
@@ -3445,6 +3508,26 @@ void Gemm(const GemmArgs& args, hipStream_t stream) {
   int rows = 0;
   for (int j = 0; j < args.count; ++j)
     rows += args.jobs[j].rows;
+  static const int few_max = [] {
+    const char* e = std::getenv("INKLING2_GEMV_MAX_BATCH");
+    return e ? std::atoi(e) : 4;
+  }();
+  if (args.batch > 1 && args.batch <= few_max && args.variant == 0 &&
+      !args.half_only) {
+    bool same = true;
+    for (int j = 0; j < args.count; ++j)
+      same = same && args.jobs[j].cols == args.jobs[0].cols &&
+             args.jobs[j].x && !args.jobs[j].add && !args.jobs[j].swap;
+    const int cols = args.jobs[0].cols;
+    if (same && (cols == 2304 || cols == 3072)) {
+      const int grid = (rows + 7) / 8;
+      if (cols == 2304)
+        GemvLaneBatchKernel<9><<<grid, 256, 0, stream>>>(args, rows);
+      else
+        GemvLaneBatchKernel<12><<<grid, 256, 0, stream>>>(args, rows);
+      return;
+    }
+  }
   if (args.wmma) {
     // Up to 16 rows: one tile of batch rows per wave, straight from global
     // memory (the weights are the traffic). Above: blocks staged in shared
@@ -3494,7 +3577,8 @@ void Gemm(const GemmArgs& args, hipStream_t stream) {
       WmmaGemmBlockKernel<4, false><<<grid, 256, 0, stream>>>(args);
     return;
   }
-  if (args.batch == 1 && args.variant == 0 && !(g_direct & 4)) {
+  if (args.batch == 1 && args.variant == 0 && !(g_direct & 4) &&
+      !args.half_only) {
     // Bit 4 of INKLING2_WMMA_DIRECT keeps the kernel of before.
     bool same = true;
     for (int j = 0; j < args.count; ++j)
@@ -3599,8 +3683,8 @@ void CtrlCombine(const CtrlArgs& args, hipStream_t stream) {
 }
 
 void Router(const RouterArgs& args, hipStream_t stream) {
-  if (!args.logits_ready && args.batch == 1 && (SmallLane() & 1))
-    RouterLogitsLaneKernel<<<kNX / 8, 256, 0, stream>>>(args);
+  if (!args.logits_ready && args.batch <= SmallMaxBatch() && (SmallLane() & 1))
+    RouterLogitsLaneKernel<<<args.batch * (kNX / 8), 256, 0, stream>>>(args);
   else if (!args.logits_ready)
     RouterLogitsKernel<<<args.batch * kNX, kRouterThreads, 0, stream>>>(args);
   RouterSelectKernel<<<args.batch, kNX, 0, stream>>>(args);
