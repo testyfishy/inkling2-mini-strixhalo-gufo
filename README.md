@@ -1,20 +1,65 @@
 # Inkling 2 Mini on Strix Halo with GUFO
 
-Work in progress: a [GUFO](https://github.com/gufo-org/gufo) extension (`gufo-extension`) that runs
+A [GUFO](https://github.com/gufo-org/gufo) extension (`gufo-extension`) that runs
 Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on AMD
 Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`, 128 GB unified memory) at native weight
 precision.
 
-**Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
-extension: about 1,270 tokens/s on a 4K-token prompt, 990 on average over a 100K-token prompt (101 s),
-313 over a 1,040,000-token prompt (55 minutes), 31 tokens/s plain generation (greedy or
-sampled), and with the model's drafter about 35 on code (26 after 120K tokens of source, where
-plain is 19; prose is about 4% slower with it). Against
-llama.cpp on the same file: KLD 0.0015 at 4K tokens and 0.0035 at 32K (perplexity within 0.1%),
-and a 32K-token prompt in 28 s where llama.cpp takes 182 s.
+**Status: it runs and serves; work paused at step 39 (2026-11-23).** `gufo serve llm` answers on
+GUFO's OpenAI-style API with this extension, with the weights exactly as released.
 Start with [docs/STATE.md](docs/STATE.md): what the project is held to, where it stands, what has
 been tried and what is open. Then [docs/SERVING.md](docs/SERVING.md) and
 [docs/PROGRESS.md](docs/PROGRESS.md).
+
+## Summary
+
+Same machine, same file (NVFP4 experts + BF16, 21.3 GiB), one session, tokens per second unless
+a time is given.
+
+**Against llama.cpp (HIP backend)**
+
+| | llama.cpp | This extension | |
+|---|---:|---:|---:|
+| Prompt, 4,096 tokens | 346 | 1,267 | 3.7x |
+| Prompt, 32,768 tokens | 181.5 s | 27.9 s | 6.5x |
+| Prompt, 100,000 tokens | not run | 100.8 s | |
+| Generation | 19.5 | 31.0 | 1.6x |
+| Generation of code, with the model's drafter | not measured | about 35 | |
+| Output agreement with llama.cpp | | KLD 0.0015 at 4K tokens, 0.0035 at 32K; perplexity within 0.1% | |
+
+For scale, llama.cpp with the smaller UD-Q4_K_XL quantization generates at 24.3: the released
+weights run faster here than a 4-bit requantization does there.
+
+**Before and after, inside this project**
+
+| Stage | Step | Generation | Prompt, short / 4K / 100K deep |
+|---|---:|---:|---:|
+| llama.cpp baseline | 0 | 19.5 | 520 / 346 / |
+| CPU reference, correct against llama.cpp | 1 | 2.2 | |
+| Whole decode step on the GPU | 4 | 20.9 | |
+| Batched engine, first prompt steps | 5 | 19.4 | 44 |
+| Expert-major kernels, 8-bit expert products | 10 | 18.5 | 130 |
+| Single-row kernels, attention for long contexts | 13 | 25.0 | 145 / 115 / 27 |
+| FP16 matrix-instruction kernels, batched attention | 18 | 24.7 | 573 / 523 / 273 |
+| Prompt steps of up to 4,096 rows | 20 | 24.7 | / 1,082 / 368 |
+| One-pass attention, expert tiles listed ahead | 33 | 24.9 | / 1,267 / 815 |
+| One-token and few-row kernels rebuilt, tokens drawn with the device's help | 39 | 31.0 | / 1,267 / 815 |
+
+| With the model's drafter, through the server | Step 30 | Step 39 | Plain at step 39 |
+|---|---:|---:|---:|
+| Code, greedy | 31.4 | 35.4 | 31.0 |
+| Code, sampled (three seeds) | about 28 | 34.9 | 30.7 |
+| Code after 120K tokens of source, greedy | 25.3 | 26.1 | 19.1 |
+| Prose | about plain | 29.4 to 29.7 | 30.7 to 31.0 |
+
+Also built on the way: the tokenizer and chat template, tool calls and reasoning, a continuation
+cache with RAM and disk checkpoints (a repeated 100K request restores in 43 ms), drafts copied
+from the context (86 to 93 tokens/s on text the model copies), several sessions decoded in one
+step (four requests: about 50 tokens/s in all), and requests that repeat exactly.
+
+What is left is in [docs/STATE.md](docs/STATE.md), section 6. With these weights one token reads
+5.6 GB, which this machine's memory delivers in about 25 ms: a ceiling near 39 tokens/s for plain
+generation, against 31.0 now.
 
 ## Goal
 
