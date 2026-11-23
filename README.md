@@ -12,7 +12,9 @@ sampled), and with the model's drafter about 35 on code (26 after 120K tokens of
 plain is 19; prose is about 4% slower with it). Against
 llama.cpp on the same file: KLD 0.0015 at 4K tokens and 0.0035 at 32K (perplexity within 0.1%),
 and a 32K-token prompt in 28 s where llama.cpp takes 182 s.
-See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).
+Start with [docs/STATE.md](docs/STATE.md): what the project is held to, where it stands, what has
+been tried and what is open. Then [docs/SERVING.md](docs/SERVING.md) and
+[docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Goal
 
