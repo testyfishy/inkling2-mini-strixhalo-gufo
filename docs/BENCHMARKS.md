@@ -821,6 +821,10 @@ after about 340), drafter loaded:
 | Four in one step | 61.2 s | 39.8 | 11.6 each |
 | Two requests, two sessions, in one step | 42.4 s | 33.0 | 16.7 each |
 
+On the build of step 34 (which zeroes the positions after each step's rows and draws every
+session's token from capped logits made on the device) the same four requests: 89.8 s one at
+a time (27.4 tokens/s in all), 65.5 s in one step (37.2 in all, 10.8 each).
+
 ## Prompt steps: what the experts and the loop controllers cost, 2026-11-22
 
 Step 33. A 2,048-row step at short context, by kernel group, before and after (ms):
@@ -964,7 +968,8 @@ quality side: perplexity 5.9089 against llama.cpp's 5.9063, KLD 0.0035).
 | | This extension | llama.cpp (HIP) |
 |---|---:|---:|
 | A 32,768-token prompt | 27.9 s (1,175 tokens/s) | 181.5 s (180 tokens/s) |
-| Prompt, 512 / 4,096 tokens (llama-bench, synthetic) | 553 / 1,267 tokens/s | 520 / 346 |
+| Prompt, 4,096 tokens (llama.cpp: llama-bench, synthetic text) | 1,267 tokens/s | 346 |
+| Prompt, 512 tokens (this extension as measured at step 16, not since) | 553 | 520 |
 | Generation, short context | 24.9 tokens/s plain; 32 on code with the drafter | 19.5 |
 
 ## Not measured yet

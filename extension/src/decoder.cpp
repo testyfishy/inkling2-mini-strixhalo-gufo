@@ -2358,7 +2358,9 @@ struct GpuEngine::Impl {
     Check(hipMemcpyAsync(staging, host_staging.data(), host_staging.size(),
                          hipMemcpyHostToDevice, stream),
           "copy step inputs");
-    if (rows.size() > static_cast<std::size_t>(n_runs)) {
+    // Every step of several rows: also one row from each of several sessions
+    // goes through the kernels that read in tiles.
+    if (rows.size() > 1) {
       gpu::ClearAheadArgs ahead{};
       ahead.rows = row_states;
       ahead.ends = reinterpret_cast<const std::int32_t*>(

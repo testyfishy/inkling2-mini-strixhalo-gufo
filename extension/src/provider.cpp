@@ -1373,6 +1373,23 @@ int RunQuality(const gufo::core::GgufReader& reader, const char* path) {
     const double seconds = std::chrono::duration<double>(
                                std::chrono::steady_clock::now() - start)
                                .count();
+    // By position: the scored positions of a chunk in eight equal parts.
+    if (!klds.empty() && chunks > 0) {
+      const std::size_t per_chunk =
+          klds.size() / static_cast<std::size_t>(chunks);
+      std::printf("  mean KLD by eighth of the scored positions:");
+      for (std::size_t part = 0; part < 8; ++part) {
+        double sum = 0;
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < klds.size(); ++i)
+          if ((i % per_chunk) * 8 / per_chunk == part) {
+            sum += klds[i];
+            ++n;
+          }
+        std::printf(" %.5f", n ? sum / n : 0.0);
+      }
+      std::printf("%c", 10);
+    }
     std::sort(klds.begin(), klds.end());
     std::printf("\nquality over %zu positions (%d chunks of %d tokens, second "
                 "half scored):\n",

@@ -146,9 +146,17 @@ layers).
 
 Perplexity is within 0.1% of llama.cpp's. The divergence is about 2.3 times what it is at
 4,096 tokens (0.0015), throughout its distribution, and the same for both kernel paths, so it
-is not one kernel's doing. Both engines keep keys and values in 16 bits and sum attention
-over eight times as many positions here; how much of the growth is this engine's rounding and
-how much llama.cpp's cannot be told from this comparison, which has no exact reference.
+is not one kernel's doing. By position it is level: the mean over each eighth of the scored
+positions, from 16,384 to 32,766, is 0.0041, 0.0034, 0.0035, 0.0032, 0.0030, 0.0032, 0.0036,
+0.0037 (at 4,096 tokens the eighths run from 0.0012 to 0.0018). So it does not grow with
+depth inside this range; it is a step somewhere between 4,096 and 16,384 tokens.
+
+What is new in that range: from position 8,192 the model scales its queries on
+full-attention layers by 1 + 0.1 ln(position / 8,192), which this run is the first to
+exercise against a reference. An error in that factor would grow with the logarithm of the
+position, which the eighths do not show; larger queries do make scores more sensitive to the
+16-bit keys both engines keep. Which engine the step belongs to, or whether to both, this
+comparison cannot say: it has no exact reference. Open.
 
 llama.cpp took 181.5 s for this prompt (180 tokens/s); this engine takes 27.9 s (1,175
 tokens/s on average from an empty context).

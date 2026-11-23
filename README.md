@@ -114,8 +114,8 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       generation ([docs/SERVING.md](docs/SERVING.md))
 - [ ] M7: a standard benchmark panel comparing this model at released precision with a larger
       4-bit model on the same machine: prepared, not run ([docs/EVALS.md](docs/EVALS.md))
-- [x] M5c: sessions that generate at the same time share a step (four requests at once: 39.8
-      tokens/s in all against 27.6)
+- [x] M5c: sessions that generate at the same time share a step (four requests at once: 37.2
+      tokens/s in all against 27.4)
 - [ ] M5b: what serving still lacks: smaller checkpoints,
       `tool_choice: required` in the model's own framing, the disk cache and GUFO's
       conformance suites
