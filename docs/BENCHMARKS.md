@@ -762,6 +762,65 @@ through the server with thinking on: code 24.0 to 31.4 tokens/s greedy and 22.3 
 the default temperature, technical answers about a tenth faster, prose and generation after
 long prompts unchanged, prompt speed unchanged.
 
+## Steps of a few rows over a long context, 2026-11-22
+
+Step 31. A step that verifies drafts has 2 to 17 rows. Its full-attention visits used the
+per-row kernel for 2 or 3 rows (the whole cache read once per row) and the batched kernel
+from 4 rows (built for 32 rows per block). At 100,000 tokens that made a 2-row step cost 97
+ms against 63 for one row, and a 4-row step 143.
+
+Such steps now use the one-pass kernel of step 29 with the context cut into parts: one block
+per (key head, part), up to 32 parts, each leaving its maximum, sum and weighted values per
+row and head for the combine kernel. The cache is read once for all rows, by as many blocks
+as there are parts.
+
+One step, ms, context faked to the stated depth:
+
+| Rows | Short | 32,000 before | after | 100,000 before | after |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 40 | 47 | 47 | 63 | 63 |
+| 2 | 56 | 68 | 65 | 97 | 80 |
+| 4 | 81 | 100 | 95 | 143 | 108 |
+| 8 | 104 | 115 | 117 | 157 | 129 |
+
+Short contexts and prompt steps of 16 or 32 rows are unchanged (a 4,096-token prompt at 32
+rows per step: 208.9 tokens/s, before 208.0). Quality with every step going through it
+(4,096-token context, 8 rows per step): KLD 0.001588, perplexity 7.4742 against llama.cpp's
+7.4828, same top token 97.66%; the kernels it replaces give 0.001594 on the same run.
+
+Tried first and dropped: the same arithmetic with each wave reading its 16 keys and its 16
+value dimensions straight from the cache, no shared memory. It was slower than what it
+replaced (119, 152 and 177 ms for 2, 4 and 8 rows at 100,000): sixteen separate streams per
+wave do not read as fast as staged, contiguous loads. A single row is not faster through the
+new kernel either, so plain generation at depth is where it was: 42 ms plus 0.22 ms per 1,000
+tokens of context, which is reading the cache.
+
+What it buys is drafting at depth. Through the server, drafter on, thinking on, 500 tokens
+asked for after a prompt of C++ source (`decode_tps`, without and with the drafter):
+
+| Context | Greedy | Default sampling |
+|---|---:|---:|
+| 39,963 tokens of source | 22.4 -> 36.4 | 18.6 -> 29.7 |
+| 119,922 tokens of source | 16.8 -> 25.3 | 14.0 -> 19.1 |
+| 100,024 tokens of prose, a summary asked | 15.5 -> 16.2 | |
+
+## Sessions decoded together through the server, 2026-11-22
+
+Step 32. The server now gives the engine one row per session that is generating, in one
+step (GUFO's batched plans, up to 8 sessions; `INKLING2_SERVE_BATCH_WIDTH=1` turns it off).
+Drafts copied from the context ride along per session. The model's drafter is left to
+single sessions: beside other sessions a row costs a session little, and the drafter's pass
+would cost each of them about as much.
+
+Four requests sent at once to a server with 4 sessions (three of 700 tokens, one that ends
+after about 340), drafter loaded:
+
+| | Wall time | Tokens/s in all | Per request while all run |
+|---|---:|---:|---:|
+| One session at a time (each with the drafter) | 88.4 s | 27.6 | 24.6 to 32.5 when it has the GPU |
+| Four in one step | 61.2 s | 39.8 | 11.6 each |
+| Two requests, two sessions, in one step | 42.4 s | 33.0 | 16.7 each |
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

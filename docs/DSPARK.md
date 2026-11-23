@@ -267,9 +267,11 @@ Through the server, with gate and controller, thinking on, 700 tokens per reques
 | Three-paragraph summary of a 33,854-token text | 20.3 -> 20.1 | 19.2 -> 18.4 |
 | The same of a 100,024-token text | 15.5 -> 15.6 | 14.9 -> 14.7 |
 
-So: a third to a half faster on code, about a tenth on technical answers, nothing on prose,
-and nothing at depth yet, where a verification step of a few rows reads the whole cache once
-per row. Prompt speed through the server is unchanged (1,094 and 1,087 tokens/s on the
+So: a third to a half faster on code, about a tenth on technical answers, nothing on prose.
+The two rows at depth are prose and were measured before step 31, which made verification
+steps at depth cheaper; with it, code after 40,000 tokens of source goes from 22.4 to 36.4
+tokens/s and after 120,000 from 16.8 to 25.3 (BENCHMARKS.md, "Steps of a few rows over a
+long context"). Prompt speed through the server is unchanged (1,094 and 1,087 tokens/s on the
 33,854-token prompt).
 
 The drafter's state (rings and head feature, 32 MB) is one more private part of a cache

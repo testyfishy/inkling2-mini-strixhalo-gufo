@@ -7,9 +7,9 @@ precision.
 
 **Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
 extension: about 1,190 tokens/s on a 4K-token prompt, 940 on average over a 100K-token prompt (106 s),
-313 over a 1,040,000-token prompt (55 minutes), 24 tokens/s generation
-(86 to 93 greedy and 76 sampled, one seed, where the output repeats its context), KLD 0.0015 against
-llama.cpp on the same file.
+313 over a 1,040,000-token prompt (55 minutes), 24 tokens/s plain generation, and with the
+model's drafter 31 to 36 on code (25 after 120K tokens of source, where plain is 17), KLD 0.0015
+against llama.cpp on the same file.
 See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Goal
@@ -113,11 +113,13 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       generation ([docs/SERVING.md](docs/SERVING.md))
 - [ ] M7: a standard benchmark panel comparing this model at released precision with a larger
       4-bit model on the same machine: prepared, not run ([docs/EVALS.md](docs/EVALS.md))
-- [ ] M5b: what serving still lacks: batched decode across sessions, smaller checkpoints,
+- [x] M5c: sessions that generate at the same time share a step (four requests at once: 39.8
+      tokens/s in all against 27.6)
+- [ ] M5b: what serving still lacks: smaller checkpoints,
       `tool_choice: required` in the model's own framing, the disk cache and GUFO's
       conformance suites
 - [ ] M6: kernel work on the hot path, each change checked against M3's logit comparison
-- [ ] Later: vision (mmproj), DSpark speculative decoding, tool calls, multi-session serving
+- [ ] Later: vision (mmproj)
 
 ## Repository layout
 
