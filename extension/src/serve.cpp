@@ -932,6 +932,9 @@ public:
                 .final_token_advance_required = true,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = lookup_ || drafter_ != nullptr,
+                .batched_multi_token_decode = batch_width_ > 1,
+                .batched_multi_token_decode_max_width =
+                    batch_width_ > 1 ? batch_width_ : 0,
                 .prefix_reuse = true,
             },
         .sampling_defaults =
@@ -959,7 +962,14 @@ public:
 
   [[nodiscard]] std::vector<ext::TextExecutionPlan> SupportedPlans()
       const override {
-    return {{.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    // Sessions that generate at the same time share a step of the engine,
+    // one row each (plus any drafts): the weights are read once for all.
+    std::vector<ext::TextExecutionPlan> plans{
+        {.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= batch_width_; ++width)
+      plans.push_back(
+          {.kind = ext::TextExecutionPlanKind::kBatched, .physical_width = width});
+    return plans;
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
@@ -1296,43 +1306,10 @@ public:
                          position + static_cast<std::uint32_t>(rows.size()));
     s.slot().has_logits = false;
     engine_->Step(rows, GpuEngine::Head::kAll, true);
-    s.tokens.push_back(anchor);
-    (void)Piece(anchor, &s.output);
-    std::size_t kept = 0;
-    for (; kept < drafts.size(); ++kept) {
-      std::vector<float> logits = engine_->capped_logits(kept);
-      Mask(s, logits.data());
-      const std::uint32_t token =
-          sampler.Sample(std::span<const float>(logits.data(), tokenizer_.size()));
-      if (token != rows[kept + 1].token) {
-        // The token drawn stands; the next step starts from it.
-        sampler.DeferSample(token);
-        break;
-      }
-      if (s.stop_at_eos() && token == tokenizer_.eos()) {
-        step.stop = true;
-        break;
-      }
-      step.selections.push_back(
-          {.stop = false, .token = token, .piece = Piece(token, &s.output)});
-      s.tokens.push_back(token);
-    }
-    engine_->Accept(s.session(), static_cast<std::uint32_t>(1 + kept));
-    {
-      const std::vector<float> logits = engine_->capped_logits(kept);
-      std::copy(logits.begin(), logits.begin() + tokenizer_.size(),
-                s.slot().logits.begin());
-      Mask(s, s.slot().logits.data());
-      s.slot().has_logits = true;
-    }
+    const std::size_t kept = Verify(s, sampler, anchor, drafts, 0, &step);
     step.draft_rounds = 1;
     if (copied) {
-      s.lookup.Observe(match.start, drafts.size(), kept);
-      s.draft_budget = kept == drafts.size()
-                           ? std::min(s.draft_budget * 2, kMostDrafts)
-                           : kFirstDrafts;
-      step.lookup_tokens = drafts.size();
-      step.lookup_accepted_tokens = kept;
+      Copied(s, match, drafts.size(), kept, &step);
     } else {
       Drafted(s, 1 + kept, drafts.size(), elapsed_ms());
       step.draft_tokens = drafts.size();
@@ -1341,12 +1318,205 @@ public:
     return step;
   }
 
+  // Several sessions in one step of the engine: each session's next token,
+  // and after it any drafts copied from its context. The model's drafter is
+  // left to single sessions: beside other sessions a row costs a session
+  // little, and the drafter's pass would cost each of them as much as that.
+  [[nodiscard]] std::vector<ext::TextDecodeStep> DecodeBatch(
+      std::span<const ext::TextRunnerDecode> decodes) const override {
+    if (decodes.size() < 2 || decodes.size() > batch_width_)
+      return ext::TextModelRunner::DecodeBatch(decodes);
+    struct Item {
+      State* s{};
+      sampling::SamplerState* sampler{};
+      std::uint32_t anchor{0};
+      std::size_t first_row{0};
+      std::vector<std::uint32_t> drafts;
+      Lookup::Match match{};
+      bool active{false};
+    };
+    const ext::TextExecutionPlan plan{
+        .kind = ext::TextExecutionPlanKind::kBatched,
+        .physical_width = decodes.size()};
+    std::vector<ext::TextDecodeStep> steps(decodes.size());
+    std::vector<Item> items(decodes.size());
+    std::vector<GpuEngine::Row> rows;
+    const std::size_t most_drafts =
+        std::min<std::size_t>(kMostDrafts, max_batch_ / decodes.size() - 1);
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      ext::TextDecodeStep& step = steps[i];
+      step.execution_plan = plan;
+      Item& item = items[i];
+      try {
+        State& s = Require(decodes[i].state.get());
+        sampling::SamplerState& sampler = decodes[i].sampler.get();
+        item.s = &s;
+        item.sampler = &sampler;
+        if (decodes[i].max_tokens == 0)
+          continue;
+        auto first = SelectNext(s, sampler);
+        if (first.stop) {
+          step.stop = true;
+          step.terminal_logprobs = std::move(first.logprobs);
+          continue;
+        }
+        item.anchor = first.token;
+        if (item.anchor >= tokenizer_.size())
+          throw std::invalid_argument("inkling2: token outside the vocabulary");
+        const auto& config = sampler.config();
+        const std::uint32_t position = engine_->position(s.session());
+        if (lookup_ && decodes[i].max_tokens >= 2 && !config.logprobs &&
+            !config.constraint && !config.reasoning_budget &&
+            !config.penalties_enabled() && !sampler.ForcedToken() &&
+            s.tokens.size() == position && position + 2 <= max_context_) {
+          const bool sampled = config.uses_random_sampling();
+          s.lookup.Extend(s.tokens, sampled);
+          if (s.lookup.Step(position)) {
+            const std::uint32_t tail[1] = {item.anchor};
+            item.match = s.lookup.Find(
+                s.tokens, tail,
+                sampled ? std::min(2 * lookup_min_, Lookup::kMaxMatch)
+                        : lookup_min_);
+            if (item.match.length != 0 &&
+                item.match.start < s.lookup.IndexedTokens()) {
+              const std::size_t count = std::min<std::size_t>(
+                  {s.draft_budget, most_drafts, decodes[i].max_tokens - 1,
+                   std::size_t{max_context_} - position - 1,
+                   s.lookup.IndexedTokens() - item.match.start});
+              item.drafts.assign(s.tokens.begin() + item.match.start,
+                                 s.tokens.begin() + item.match.start + count);
+            }
+          }
+        }
+        s.slot().BeforeWrite(
+            position,
+            position + 1 + static_cast<std::uint32_t>(item.drafts.size()));
+        s.slot().has_logits = false;
+        item.first_row = rows.size();
+        rows.push_back({s.session(), item.anchor});
+        for (const std::uint32_t draft : item.drafts)
+          rows.push_back({s.session(), draft});
+        step.selections.push_back(std::move(first));
+        item.active = true;
+      } catch (...) {
+        step = {};
+        step.execution_plan = plan;
+        step.failure = std::current_exception();
+      }
+    }
+    if (rows.empty())
+      return steps;
+    engine_->Step(rows, GpuEngine::Head::kAll, true);
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      Item& item = items[i];
+      if (!item.active)
+        continue;
+      try {
+        const std::size_t kept = Verify(*item.s, *item.sampler, item.anchor,
+                                        item.drafts, item.first_row, &steps[i]);
+        if (!item.drafts.empty()) {
+          steps[i].draft_rounds = 1;
+          Copied(*item.s, item.match, item.drafts.size(), kept, &steps[i]);
+        }
+      } catch (...) {
+        steps[i] = {};
+        steps[i].execution_plan = plan;
+        steps[i].failure = std::current_exception();
+      }
+    }
+    return steps;
+  }
+
+  // One row per session in one step, for hosts that select the tokens
+  // themselves.
+  void AdvanceBatch(
+      std::span<const ext::TextRunnerAdvance> advances) const override {
+    if (advances.size() < 2 || advances.size() > batch_width_) {
+      ext::TextModelRunner::AdvanceBatch(advances);
+      return;
+    }
+    std::vector<GpuEngine::Row> rows;
+    std::vector<State*> states;
+    std::vector<std::uint32_t> positions;
+    for (const ext::TextRunnerAdvance& advance : advances) {
+      State& s = Require(advance.state.get());
+      const std::uint32_t position = engine_->position(s.session());
+      if (position >= max_context_)
+        throw std::runtime_error("inkling2: the context is full");
+      if (advance.token >= tokenizer_.size())
+        throw std::invalid_argument("inkling2: token outside the vocabulary");
+      s.slot().BeforeWrite(position, position + 1);
+      s.slot().has_logits = false;
+      rows.push_back({s.session(), advance.token});
+      states.push_back(&s);
+      positions.push_back(position);
+    }
+    engine_->Step(rows, GpuEngine::Head::kLast);
+    for (std::size_t i = 0; i < states.size(); ++i) {
+      State& s = *states[i];
+      KeepLogits(&s, i);
+      if (s.tokens.size() == positions[i])
+        s.tokens.push_back(rows[i].token);
+      (void)Piece(rows[i].token, &s.output);
+    }
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const ext::TextRunnerState& state) const override {
     return engine_->position(Require(state).session());
   }
 
 private:
+  // After a tentative step: `anchor` is kept, then each draft for as long as
+  // it is the token the sampler draws from the model's distribution at its
+  // position. The session's rows start at logits row `first_row` of the
+  // step. Returns the drafts kept.
+  std::size_t Verify(State& s, sampling::SamplerState& sampler,
+                     std::uint32_t anchor,
+                     const std::vector<std::uint32_t>& drafts,
+                     std::size_t first_row, ext::TextDecodeStep* step) const {
+    if (s.tokens.size() == engine_->position(s.session()))
+      s.tokens.push_back(anchor);
+    const bool tracked =
+        s.tokens.size() == std::size_t{engine_->position(s.session())} + 1;
+    (void)Piece(anchor, &s.output);
+    std::size_t kept = 0;
+    for (; kept < drafts.size(); ++kept) {
+      std::vector<float> logits = engine_->capped_logits(first_row + kept);
+      Mask(s, logits.data());
+      const std::uint32_t token =
+          sampler.Sample(std::span<const float>(logits.data(), tokenizer_.size()));
+      if (token != drafts[kept]) {
+        // The token drawn stands; the next step starts from it.
+        sampler.DeferSample(token);
+        break;
+      }
+      if (s.stop_at_eos() && token == tokenizer_.eos()) {
+        step->stop = true;
+        break;
+      }
+      step->selections.push_back(
+          {.stop = false, .token = token, .piece = Piece(token, &s.output)});
+      if (tracked)
+        s.tokens.push_back(token);
+    }
+    engine_->Accept(s.session(), static_cast<std::uint32_t>(1 + kept));
+    const std::vector<float> logits = engine_->capped_logits(first_row + kept);
+    std::copy(logits.begin(), logits.begin() + tokenizer_.size(),
+              s.slot().logits.begin());
+    Mask(s, s.slot().logits.data());
+    s.slot().has_logits = true;
+    return kept;
+  }
+  // Bookkeeping after a step whose drafts were copied from the context.
+  void Copied(State& s, const Lookup::Match& match, std::size_t drafts,
+              std::size_t kept, ext::TextDecodeStep* step) const {
+    s.lookup.Observe(match.start, drafts, kept);
+    s.draft_budget = kept == drafts ? std::min(s.draft_budget * 2, kMostDrafts)
+                                    : kFirstDrafts;
+    step->lookup_tokens = drafts;
+    step->lookup_accepted_tokens = kept;
+  }
   void Drafted(State& s, std::size_t tokens, std::size_t drafts,
                double ms) const {
     DraftControl& c = s.control;
@@ -1359,8 +1529,8 @@ private:
                    c.steps, c.calls, c.empty, c.kept, c.drafted, c.pauses,
                    c.plain_ms, c.gain, 10);
   }
-  void KeepLogits(State* s) const {
-    const std::vector<float> capped = engine_->capped_logits(0);
+  void KeepLogits(State* s, std::size_t run = 0) const {
+    const std::vector<float> capped = engine_->capped_logits(run);
     std::copy(capped.begin(), capped.begin() + tokenizer_.size(),
               s->slot().logits.begin());
     Mask(*s, s->slot().logits.data());
@@ -1575,6 +1745,11 @@ private:
   float draft_first_{EnvInt("INKLING2_DRAFT_FIRST", 0) / 100.0F};
   float draft_chain_{EnvInt("INKLING2_DRAFT_CHAIN", 0) / 100.0F};
   bool draft_log_{EnvInt("INKLING2_SERVE_DRAFT_LOG", 0) != 0};
+  // Most sessions decoded in one step (INKLING2_SERVE_BATCH_WIDTH; 1 = each
+  // session on its own).
+  std::size_t batch_width_{std::min<std::size_t>(
+      sessions_, static_cast<std::size_t>(std::clamp(
+                     EnvInt("INKLING2_SERVE_BATCH_WIDTH", 8), 1, 16)))};
   Tokenizer tokenizer_;
   std::uint32_t max_context_;
   std::size_t sessions_;
