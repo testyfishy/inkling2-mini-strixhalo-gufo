@@ -6,6 +6,7 @@
 #include "decode.hpp"
 
 #include <cstddef>
+#include <vector>
 
 namespace inkling2::gpu {
 namespace {
@@ -2658,9 +2659,10 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
   const int lane = tid & 31, wave = tid >> 5;
   const int sl = lane & 15, hi = lane >> 4;
   const int wr = wave >> 1, wt = wave & 1;
-  const int e = blockIdx.x / kPerExpert, rb = blockIdx.x % kPerExpert;
+  const int item = blockIdx.x / kPerExpert, rb = blockIdx.x % kPerExpert;
+  const int e = a.items[2 * item];
   const int n = a.group_count[e];
-  const int t_block = blockIdx.y * BN;
+  const int t_block = a.items[2 * item + 1];
   if (t_block >= n)
     return;
   const std::int32_t* list =
@@ -2787,13 +2789,18 @@ __launch_bounds__(256) __global__ void ExpertWmmaKernel(BatchExpertArgs a) {
 
 template <int WTS>
 void LaunchExpertWmma(const BatchExpertArgs& args, hipStream_t stream) {
-  const dim3 grid(kNX * 18, (args.batch + 32 * WTS - 1) / (32 * WTS));
+  const dim3 grid(args.item_count * 18, 1);
   if (args.nvfp4) {
-    if (g_direct & 2)
+    // Timing switches 4 and 8: without the up or the down kernel.
+    if (args.timing & 4)
+      ;
+    else if (g_direct & 2)
       ExpertWmmaKernel<true, true, WTS, true><<<grid, 256, 0, stream>>>(args);
     else
       ExpertWmmaKernel<true, true, WTS, false><<<grid, 256, 0, stream>>>(args);
-    if (g_direct & 2)
+    if (args.timing & 8)
+      ;
+    else if (g_direct & 2)
       ExpertWmmaKernel<false, true, WTS, true><<<grid, 256, 0, stream>>>(args);
     else
       ExpertWmmaKernel<false, true, WTS, false><<<grid, 256, 0, stream>>>(args);
@@ -3279,8 +3286,9 @@ void Router(const RouterArgs& args, hipStream_t stream) {
   RouterSelectKernel<<<args.batch, kNX, 0, stream>>>(args);
 }
 
-void BatchExperts(const BatchExpertArgs& args, hipStream_t stream) {
-  if (args.variant == 5) {
+void BatchExperts(const BatchExpertArgs& in, hipStream_t stream) {
+  if (in.variant == 5) {
+    BatchExpertArgs args = in;
     ExpertGroupKernel<<<1, kNX, 0, stream>>>(args);
     ToHalfArgs h{args.x, kE, args.xh, kE, args.batch};
     ToHalfKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0, stream>>>(h);
@@ -3291,16 +3299,62 @@ void BatchExperts(const BatchExpertArgs& args, hipStream_t stream) {
                      : args.batch <= 384 ? 1
                      : args.batch <= 768 ? 2
                                          : 4;
-    if (wide == 1)
+    // Rows spread unevenly over the experts (a tenth of the experts get none
+    // in a typical step, a few get most rows). In large steps the tiles with
+    // pairs are therefore listed on the host: one round trip per layer
+    // visit, against nine in ten blocks of a full grid finding nothing to
+    // do. Small steps keep the full grid, listed once.
+    {
+      static thread_local std::vector<std::int32_t> items;
+      items.clear();
+      const int tile = 32 * (wide == 1 ? 1 : wide == 2 ? 2 : 4);
+      if (args.batch >= 256) {
+        std::int32_t counts[kNX];
+        (void)hipStreamSynchronize(stream);
+        (void)hipMemcpy(counts, args.group_count, sizeof counts,
+                        hipMemcpyDeviceToHost);
+        for (int e = 0; e < kNX; ++e)
+          for (int t = 0; t < counts[e]; t += tile) {
+            items.push_back(e);
+            items.push_back(t);
+          }
+        args.item_count = static_cast<int>(items.size() / 2);
+        if (args.item_count > 0)
+          (void)hipMemcpy(args.items, items.data(), items.size() * 4,
+                          hipMemcpyHostToDevice);
+      } else {
+        // The full list only changes with the number of tiles; kernels of
+        // the step before may still be reading it otherwise.
+        static thread_local int listed = 0;
+        const int tiles = (args.batch + tile - 1) / tile;
+        if (listed != tiles * 1024 + tile) {
+          for (int e = 0; e < kNX; ++e)
+            for (int t = 0; t < tiles; ++t) {
+              items.push_back(e);
+              items.push_back(t * tile);
+            }
+          (void)hipStreamSynchronize(stream);
+          (void)hipMemcpy(args.items_full, items.data(), items.size() * 4,
+                          hipMemcpyHostToDevice);
+          listed = tiles * 1024 + tile;
+        }
+        args.items = args.items_full;
+        args.item_count = kNX * tiles;
+      }
+    }
+    if (args.item_count == 0) {
+    } else if (wide == 1)
       LaunchExpertWmma<1>(args, stream);
     else if (wide == 2)
       LaunchExpertWmma<2>(args, stream);
     else
       LaunchExpertWmma<4>(args, stream);
-    ExpertSumKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0,
-                      stream>>>(args);
+    if (!(args.timing & 16))  // timing: without the sum
+      ExpertSumKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0,
+                        stream>>>(args);
     return;
   }
+  const BatchExpertArgs& args = in;
   if (args.variant == 4 && args.nvfp4) {
     QuantizeArgs qx{args.x, kE, args.batch, kE, args.xq, args.xs};
     QuantizeKernel<<<Blocks(std::size_t(args.batch) * kE / 16, 256), 256, 0,

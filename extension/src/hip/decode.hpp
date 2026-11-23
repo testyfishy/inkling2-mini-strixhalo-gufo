@@ -391,6 +391,14 @@ struct BatchExpertArgs {
   // Variant 5 scratch: FP16 copies of x (kE per row) and act (kFF per pair).
   std::uint16_t* xh;
   std::uint16_t* acth;
+  // Variant 5: the tiles that have pairs, as (expert, first pair of the
+  // expert's list) for each; room for kNX + max_batch * kTopK / 32 tiles.
+  // The launcher fills it from the group counts, so that no block is
+  // launched for a tile without pairs. `item_count` is set by the launcher.
+  std::int32_t* items;
+  int item_count;
+  // The same for every tile of a step of fewer than 256 rows: kNX * 8 tiles.
+  std::int32_t* items_full;
 };
 void BatchExperts(const BatchExpertArgs& args, hipStream_t stream);
 

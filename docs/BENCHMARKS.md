@@ -821,6 +821,74 @@ after about 340), drafter loaded:
 | Four in one step | 61.2 s | 39.8 | 11.6 each |
 | Two requests, two sessions, in one step | 42.4 s | 33.0 | 16.7 each |
 
+## Prompt steps: what the experts and the loop controllers cost, 2026-11-22
+
+Step 33. A 2,048-row step at short context, by kernel group, before and after (ms):
+
+| Group | Before | After |
+|---|---:|---:|
+| NVFP4 experts | 728 | 705 |
+| Input projections | 236 | 235 |
+| Attention | 124 | 123 |
+| Glue A (mixing earlier blocks, messages) | 111 | 111 |
+| BF16 experts | 83 | 70 |
+| Output projection | 82 | 82 |
+| Loop controllers (FP16 copies, down, norms, gain and forget, apply) | 33 + 41 + 20 + 60 + 46 | 27 + 20 + 19 + 17 + 47 |
+| Glue B, C, D, norms, router | 44 + 42 + 12 + 29 + 19 | unchanged |
+| Whole step | 1,710 | 1,600 |
+
+Two changes:
+
+- **Only the expert tiles that have rows are launched.** Measured on a real prompt
+  (`INKLING2_EXPERT_STATS=1`): rows spread very unevenly over the 128 experts. Per layer visit
+  9.4% of the experts get no row, 31% get more than 128 pairs (one tile), 14.8% more than
+  256, 4.4% more than 512, and some get every row. The kernels launched a full grid of
+  36,864 blocks of which nine in ten found nothing to do; the tiles with pairs are now
+  listed on the host (one round trip per layer visit, for steps of 256 rows or more).
+- **The loop controllers take their inputs as one FP16 value**, like every other
+  projection. They had carried a second FP16 part for what rounding lost, which doubled their
+  products. The router, which picks the experts, keeps both parts.
+  (`INKLING2_CTRL_LOW_INPUTS=1` restores the old arithmetic.)
+
+Prompt speed at depth, same text and method as before (2,048 rows per step):
+
+| Depth | Step 29 | Step 33 | One token | A step with 8 drafts |
+|---:|---:|---:|---:|---:|
+| 4,096 | 1,189 t/s | 1,267 | 43.3 ms | 118 ms (was 120) |
+| 16,384 | 1,121 | 1,189 | 44.6 | 124 (131) |
+| 32,768 | 1,024 | 1,079 | 48.3 | 128 (138) |
+| 65,536 | 891 | 928 | 55.8 | 137 (162) |
+| 100,000 | 787 | 815 | 63.4 | 138 (174) |
+| 131,072 | 708 | 728 | 70.2 | 147 (177) |
+| 196,608 | 584 | 597 | 84.6 | 159 (215) |
+
+A 100,000-token prompt takes 100.8 s (was 106.3), 196,608 tokens 241.9 s (was 251.1). With
+4,096 rows per step a 4,096-token prompt runs at 1,385 tokens/s against 1,280; the server
+keeps 2,048, because a session's sliding-window rings, and with them every cache checkpoint,
+grow with the step size.
+
+Quality, against llama.cpp on the same file: 4,096-token context at 256 rows per step, KLD
+0.001469 (was 0.001490), perplexity 7.4823 against 7.4828, same top token 97.70%; 512-token
+contexts at 64 rows per step, 8 chunks, KLD 0.002102 (was 0.002112); 4,096 tokens at 8 rows
+per step 0.001647 (was 0.001588). All inside the band every change of kernel has moved
+within.
+
+Tried on these kernels and not kept, each measured on the same 2,048-row step:
+
+| Tried | Result |
+|---|---|
+| Expert tiles of 256 pairs instead of 128 (fewer passes over an expert's weights: 1.14 per expert instead of 1.59) | 864 ms against 728: the larger shared-memory footprint costs more than the passes saved |
+| Expert tiles of 64 and 32 pairs | 822 and 1,192 ms |
+| Adding each expert's output straight into the row's sum with atomic adds, instead of eight contributions and a sum kernel | 733 ms against 726, and the result then depends on the order the blocks run in |
+| The grouped-GEMM staging of headbouyJB/inkling2-gufo (`k_gemm4`: every thread owns half a weight row, two buffers, one barrier per 64 columns, a byte-permute table for the 4-bit codes) written for this engine's experts | 721 ms against 703 for the kernel here |
+| The one-pass attention kernel with 128 rows per block instead of 64 (the cache read once for twice the rows) | 790 against 787 tokens/s at 100,000: at depth the kernel is bound by its products, not by reading the cache |
+| Sums across a glue block by exchange between lanes and two barriers, instead of a tree of eleven | slower: generation 22.9 against 24.8 tokens/s |
+
+So the expert, projection and attention kernels are where designs of this kind end on this
+GPU: about 8e12 multiply-adds per second in the experts and projections and 10e12 in
+attention, against 27e12 with every operand in registers. Each product here needs an operand
+from shared memory, and that read costs about as much as the product.
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

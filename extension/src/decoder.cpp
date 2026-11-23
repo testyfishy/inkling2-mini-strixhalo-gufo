@@ -241,7 +241,8 @@ struct GpuEngine::Impl {
       *v_taps{}, *attn{}, *proj{}, *xn{}, *sel_up{}, *sel_coef{}, *act{},
       *moe{}, *scratch{}, *final_x{}, *logits{}, *low{}, *router_logits{},
       *xt_in{}, *xt_attn{}, *contrib{};
-  std::int32_t *group_list{}, *group_count{};
+  std::int32_t *group_list{}, *group_count{}, *expert_items{},
+      *expert_items_full{};
   std::uint32_t *xq{}, *aq{};
   float *xs{}, *as{};
   int major_min_batch{4};
@@ -289,6 +290,10 @@ struct GpuEngine::Impl {
   bool attn_stats_now{false};
   int attn_skip{EnvOr("INKLING2_ATTN_SKIP", 0)};
   int expert_skip{EnvOr("INKLING2_EXPERT_SKIP", 0)};
+  bool expert_stats{EnvOr("INKLING2_EXPERT_STATS", 0) != 0};
+  std::size_t stat_experts{0}, stat_empty{0}, stat_pairs{0}, stat_tiles128{0},
+      stat_tiles256{0}, stat_over128{0}, stat_over256{0}, stat_over512{0},
+      stat_max{0};
   // Bit 16: the one-pass kernel (AttentionFlashKernel), whose blocks take
   // groups of up to 64 rows; the older batched kernels take 32.
   int attn_fast{EnvOr("INKLING2_ATTN_FAST", 63)};
@@ -325,6 +330,10 @@ struct GpuEngine::Impl {
   // INKLING2_SPLIT_GEMM_MIN_BATCH.
   int split_min_batch{EnvOr("INKLING2_SPLIT_GEMM_MIN_BATCH", 2)};
   std::size_t split_count{0}, split_with_lo{0};
+  // The loop controllers' products take their inputs as one FP16 value each,
+  // like every other projection; INKLING2_CTRL_LOW_INPUTS=1 adds the part
+  // that rounding lost, as the router always does (it picks the experts).
+  bool ctrl_low{EnvOr("INKLING2_CTRL_LOW_INPUTS", 0) != 0};
   std::uint16_t *sh_in{}, *sl_in{}, *sh_m{}, *sl_m{}, *sl_x{};
   float *low_c{}, *low_m{}, *ctrl_g{}, *ctrl_f{};
   std::uint16_t *low_h{}, *low_l{};
@@ -497,8 +506,10 @@ struct GpuEngine::Impl {
   // y = W x for every job, with the matrix-instruction kernel and F32-like
   // accuracy: W = hi + lo and x = xh + xl in FP16, and the three products
   // that matter (hi xh, hi xl, lo xh) are summed in FP32.
-  void SplitGemm(const SplitJob* jobs, int n) {
+  void SplitGemm(const SplitJob* jobs, int n, bool low_inputs = true) {
     for (int pass = 0; pass < 3; ++pass) {
+      if (pass == 1 && !low_inputs)
+        continue;
       gpu::GemmArgs g{};
       for (int j = 0; j < n; ++j) {
         const std::uint16_t* w = pass == 2 ? jobs[j].w.lo : jobs[j].w.hi;
@@ -743,6 +754,10 @@ struct GpuEngine::Impl {
     }
     group_list = static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * B * 4));
     group_count = static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * 4));
+    expert_items = static_cast<std::int32_t*>(
+        Alloc((std::size_t(kNX) + B * kTopK / 32 + 16) * 2 * 4));
+    expert_items_full =
+        static_cast<std::int32_t*>(Alloc(std::size_t(kNX) * 8 * 2 * 4));
     if (const char* v = std::getenv("INKLING2_MAJOR_MIN_BATCH"))
       major_min_batch = std::atoi(v);
     low = Floats(B * 3 * kRank);
@@ -1324,6 +1339,19 @@ struct GpuEngine::Impl {
   ~Impl() {
     if (stream)
       (void)hipStreamSynchronize(stream);
+    if (stat_experts > 0)
+      std::fprintf(stderr,
+                   "inkling2 gpu: experts over %zu (visit, expert): %.1f%% "
+                   "unused, %.1f pairs on average, most %zu; more than 128 "
+                   "pairs %.1f%%, more than 256 %.1f%%, more than 512 %.1f%%; "
+                   "tiles of 128 per expert %.2f, of 256 %.2f%c",
+                   stat_experts, 100.0 * stat_empty / stat_experts,
+                   double(stat_pairs) / stat_experts, stat_max,
+                   100.0 * stat_over128 / stat_experts,
+                   100.0 * stat_over256 / stat_experts,
+                   100.0 * stat_over512 / stat_experts,
+                   double(stat_tiles128) / stat_experts,
+                   double(stat_tiles256) / stat_experts, 10);
     if (ab_visits > 0)
       std::fprintf(stderr,
                    "inkling2 gpu: attention A/B over %zu visits: max |old - "
@@ -1543,8 +1571,8 @@ struct GpuEngine::Impl {
       ctrl.count = 3;
       ctrl.batch = batch;
       if (split) {
-        ToHalf2(in, 3 * kE, 3 * kE, sh_in, sl_in);
-        ToHalf2(msgs, 4 * kE, 4 * kE, sh_m, sl_m);
+        ToHalf2(in, 3 * kE, 3 * kE, sh_in, ctrl_low ? sl_in : nullptr);
+        ToHalf2(msgs, 4 * kE, 4 * kE, sh_m, ctrl_low ? sl_m : nullptr);
         Mark(14);
         SplitJob jobs[6];
         for (int j = 0; j < 3; ++j) {
@@ -1553,13 +1581,13 @@ struct GpuEngine::Impl {
           jobs[2 * j + 1] = {l.down_msg[j], sh_m + j * kE, sl_m + j * kE, 4 * kE,
                              low_m + j * kRank, 3 * kRank, kRank, kE};
         }
-        SplitGemm(jobs, 6);
+        SplitGemm(jobs, 6, ctrl_low);
         Mark(15);
         ctrl.yc = low_c;
         ctrl.ym = low_m;
         gpu::CtrlCombine(ctrl, stream);
         Mark(16);
-        ToHalf2(low, 3 * kRank, 3 * kRank, low_h, low_l);
+        ToHalf2(low, 3 * kRank, 3 * kRank, low_h, ctrl_low ? low_l : nullptr);
         for (int j = 0; j < 3; ++j) {
           jobs[2 * j] = {l.gain_split[j], low_h + j * kRank, low_l + j * kRank,
                          3 * kRank, ctrl_g + j * kE, 3 * kE, kE, kRank};
@@ -1567,7 +1595,7 @@ struct GpuEngine::Impl {
                              low_l + j * kRank, 3 * kRank, ctrl_f + j * kE,
                              3 * kE, kE, kRank};
         }
-        SplitGemm(jobs, 6);
+        SplitGemm(jobs, 6, ctrl_low);
         Mark(17);
         ctrl.yg = ctrl_g;
         ctrl.yf = ctrl_f;
@@ -1819,25 +1847,25 @@ struct GpuEngine::Impl {
       ctrl.batch = batch;
       if (split) {
         // msgs has not changed since its FP16 parts were made above.
-        ToHalf2(xn, kE, kE, xh_x, sl_x);
+        ToHalf2(xn, kE, kE, xh_x, ctrl_low ? sl_x : nullptr);
         Mark(14);
         SplitJob jobs[2] = {
             {l.down_cur[3], xh_x, sl_x, kE, low_c, 3 * kRank, kRank, kE},
             {l.down_msg[3], sh_m + 3 * kE, sl_m + 3 * kE, 4 * kE, low_m,
              3 * kRank, kRank, kE}};
-        SplitGemm(jobs, 2);
+        SplitGemm(jobs, 2, ctrl_low);
         Mark(15);
         ctrl.yc = low_c;
         ctrl.ym = low_m;
         gpu::CtrlCombine(ctrl, stream);
         Mark(16);
         // (ToHalf packs its output: kRank values per row here.)
-        ToHalf2(low, 3 * kRank, kRank, low_h, low_l);
+        ToHalf2(low, 3 * kRank, kRank, low_h, ctrl_low ? low_l : nullptr);
         jobs[0] = {l.gain_split[3], low_h, low_l, kRank, ctrl_g, 3 * kE, kE,
                    kRank};
         jobs[1] = {l.forget_split[3], low_h, low_l, kRank, ctrl_f, 3 * kE, kE,
                    kRank};
-        SplitGemm(jobs, 2);
+        SplitGemm(jobs, 2, ctrl_low);
         Mark(17);
         ctrl.yg = ctrl_g;
         ctrl.yf = ctrl_f;
@@ -1907,6 +1935,8 @@ struct GpuEngine::Impl {
     e.as = as;
     e.group_list = group_list;
     e.group_count = group_count;
+    e.items = expert_items;
+    e.items_full = expert_items_full;
     e.contrib = contrib;
     e.xh = xh_x;
     e.wmma_tiles = expert_tiles;
@@ -1914,6 +1944,24 @@ struct GpuEngine::Impl {
     e.acth = acth;
     e.max_batch = static_cast<int>(opt.max_batch);
     gpu::BatchExperts(e, stream);
+    if (expert_stats && batch >= 256 && e.variant == 5) {
+      // INKLING2_EXPERT_STATS: how the step's rows spread over the experts.
+      Check(hipStreamSynchronize(stream), "synchronize");
+      std::int32_t counts[kNX];
+      Check(hipMemcpy(counts, group_count, sizeof counts, hipMemcpyDeviceToHost),
+            "copy expert counts");
+      for (const std::int32_t n : counts) {
+        ++stat_experts;
+        stat_empty += n == 0;
+        stat_pairs += n;
+        stat_tiles128 += (n + 127) / 128;
+        stat_tiles256 += (n + 255) / 256;
+        stat_over128 += n > 128;
+        stat_over256 += n > 256;
+        stat_over512 += n > 512;
+        stat_max = std::max<std::size_t>(stat_max, n);
+      }
+    }
     Mark(l.nvfp4 ? 6 : 7);
 
     gpu::GlueDArgs d{};
