@@ -536,8 +536,9 @@ One token reads these weights once (profile of a single-row step, 40.5 ms):
 
 So plain generation with the weights as they are in the file cannot exceed about 34 tokens/s
 on this machine if memory delivers 190 GB/s (what the single-row kernels here reach), or about
-41 at the 228 GB/s that Loom's report gives for this machine; it is at 24.7. The 8 ms of small kernels is mostly launch latency (726
-launches per token); fusing them is worth perhaps 10%.
+41 at the 228 GB/s that Loom's report gives for this machine; it is at 24.7. (This section
+took the 8 ms of small kernels for launch latency. Measured at step 36, a launch costs 2 us:
+the time was inside the kernels, and steps 36 and 37 took most of it out.)
 
 Steps that verify drafts, at short context: 2 rows take about 60 ms, 4 rows about 80, 8 rows
 about 113, because every extra row reads its own 2.1 GB of experts. A drafter that gets 60%
@@ -1037,14 +1038,16 @@ about 604 tokens/s for a 10,500-token prompt. Prompt length and sampling for the
 figures are not given. Plain generation here is 24.9: if their figure holds, single-token
 steps here leave about a quarter on the table, and the measured profile says where: about 8
 of 40 ms per token in some 700 small kernels, and projections that run above what reading
-their weights costs (12.0 and 5.3 ms against 10.0 and 3.6). Strata's own card gives 1,466
+their weights costs (12.0 and 5.3 ms against 10.0 and 3.6). (Steps 36 to 39 below: plain
+generation is 31.0 since.) Strata's own card gives 1,466
 tokens/s for prompts on a Strix Halo with a pack it calls identical to the original
 (context and version not stated) against 1,280 here.
 
 **Ideas kept for later, by expected effect here:**
 
 1. Fewer and fused small kernels per token (both MLX projects and Strata's CUDA path found
-   their decode bound by launches, not arithmetic; here it is a fifth of a token's time).
+   their decode bound by launches, not arithmetic; here launches turned out to cost 1.5 ms a
+   token and the kernels themselves the rest: steps 36 and 37).
 2. An exact screened argmax for the output matrix on greedy steps (Strata: an 8-bit copy with
    error bounds, then exact scores for the survivors), instead of reading 0.9 GB per token.
 3. A drafted tree instead of a chain for greedy requests (Strata; mlx-dspark measures about
@@ -1171,6 +1174,70 @@ Sums over a glue block by exchange (two barriers instead of eleven): 31.05 again
 
 *Seen, not changed.* A sampled token costs about 2.3 ms more than a greedy one (28.7 against
 30.9 tokens/s): GUFO's sampler works through all 200,000 logits on the host.
+
+**Step 39: drawing a token with the device's help.** GUFO's sampler works through all
+200,000 logits on the host for each token it draws, about 2.3 ms. For a request that sets a
+temperature and nothing else (no top-k, top-p, min-p, penalties, grammar, reasoning budget or
+logprobs), the device now adds up exp((logit - largest) / temperature) per block of 1,024
+tokens in FP64 while the logits are still there, and reports each row's largest logit. The
+host draws one uniform number from the request's random stream, finds the block and works
+through that block alone. With drafts, the chance of a drafted token comes from the same
+sums, and a greedy request takes the device's largest logit; a row is copied to the host only
+when GUFO's sampler has to see all of it (any other setting, or a refused draft).
+`INKLING2_FAST_DRAW=0` gives the path of before.
+
+Checked on 1,300 rows of two sampled requests (`INKLING2_FAST_DRAW_CHECK=1`): every token's
+chance against GUFO's distribution of the same row differs by at most 2.3e-12, every block's
+sum by 1e-14 of the total, and the largest token is the same on every row. The requests of
+the three-seed test gave the same number of tokens either way.
+
+Default sampling (temperature 1.0), three seeds each, mean, through the server:
+
+| Request | Plain, host sampler | Plain | With the drafter |
+|---|---:|---:|---:|
+| A Python module with tests | 28.5 | 30.7 | 34.9 (33.3, 37.0, 34.5) |
+| Code after 39,963 tokens of source | 23.6 | 24.9 | 29.7 (34.6, 26.8, 27.6) |
+| TCP against UDP | 28.7 | 30.9 | 29.5 |
+| How tides work | 28.5 | 30.7 | 29.4 |
+
+A sampled token now costs what a greedy one does. Greedy, same build: code 35.4 with the
+drafter (31.0 plain), prose 29.7 (31.0), and after 119,922 tokens of source 26.1 against 19.1
+(24.9 against 17 before step 36).
+
+*The drafter on prose.* It still costs about 4% there, on every gate tried (old 0.50 / 0.45:
+26.8 against 28.5 plain on the host sampler; 0.75 / 0.65: 27.2; 0.85 / 0.75: 27.5). Measured
+parts: feeding the drafter costs each step 1.3% whether it drafts or not (30.2 against 30.6
+tokens/s with `INKLING2_DRAFT_NEVER=1`); the rest is passes that end without a draft, about
+130 per 700 tokens at 6.5 ms. The controller now also charges a refused draft of a sampled
+request (a tenth of a step: GUFO's sampler then sees the whole row) and pauses below a gain
+of 0.03 instead of 0. Pauses of up to 128 steps instead of 32 brought prose to 29.8 and took
+code from 34.9 to 33.4; they were not kept. The three-seed test also showed that the gate of
+step 38 does not help sampled code (32.5 against 32.6 with the old gate, before this step's
+sampler); its gain is on greedy requests.
+
+*The drafter's own pass.* 6.5 ms: three layers 5.0, shortlist product 1.0, slots 0.5. The
+layers read about 500 MB of weights, 2.5 ms at what the projections reach. The few-row kernel
+of step 38 on its products gave 5.2 ms (no gain). Open.
+
+*Four requests at once* (no drafter): each decodes at 11.7 to 12.8 tokens/s while the four
+share steps, about 50 in all, against 31 one at a time.
+
+*BF16 experts of a one-token step.* The same layout as the projections: for the up
+projection slower (30.5 against 31.0 tokens/s), for the down projection slightly faster
+(31.2); the latter is in use (`INKLING2_EXPERT_BF16_LANE`). Why the experts read at about
+185 GB/s where the projections reach 220 is not explained.
+
+*Repeatability,* checked again on this build: a greedy request and two seeded sampled ones
+give the same text from an empty session, a RAM checkpoint, a disk checkpoint and a new
+server with the drafter, and twice without it.
+
+**Where one token's 32 ms go now** (profiled, each figure a little high from its waits):
+input projections 8.7, experts 11.3, output head 3.9, output projection 3.6, everything else
+about 6 (attention 1.3, three glue kernels 3.2, loop controllers 1.3, router 1.1, norms
+0.9). Not done: the exact screened largest-logit search for greedy steps (up to 3.9 ms; it
+would also have to return every token within 7 of the largest, which the drafter's shortlist
+takes each step), a drafted tree, drafting ahead of the host, and a share of each product on
+the CPU.
 
 ## Not measured yet
 

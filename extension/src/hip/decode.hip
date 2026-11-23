@@ -2339,6 +2339,78 @@ __launch_bounds__(64) __global__ void ExpertDownBf16Kernel(BatchExpertArgs a) {
     a.out[b * kE + i] = shared[0];
 }
 
+// The BF16 experts of a step of few rows, a wave per (row, expert, hidden
+// unit): a lane owns 72 columns of the gate row and of the up row, 16 bytes
+// per load, and its part of the input once for both.
+__launch_bounds__(256) __global__ void ExpertUpBf16LaneKernel(BatchExpertArgs a) {
+  constexpr int kMine = kE / 32;
+  const int lane = threadIdx.x & 31;
+  const int idx = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const int k = idx % kFF;
+  const int e = (idx / kFF) % kTopK;
+  const std::size_t b = idx / (kFF * kTopK);
+  const std::uint16_t* base =
+      reinterpret_cast<const std::uint16_t*>(a.gate_up) +
+      static_cast<std::size_t>(a.ids[b * kTopK + e]) * 2 * kFF * kE;
+  const std::uint16_t* gate_row =
+      base + static_cast<std::size_t>(k) * kE + lane * kMine;
+  const std::uint16_t* up_row =
+      base + static_cast<std::size_t>(kFF + k) * kE + lane * kMine;
+  const float* x = a.x + b * kE + lane * kMine;
+  float g[4] = {0.0f, 0.0f, 0.0f, 0.0f}, u[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int c = 0; c < kMine / 8; ++c) {
+    std::uint16_t wg[8], wu[8];
+    float v[8];
+    __builtin_memcpy(wg, gate_row + c * 8, 16);
+    __builtin_memcpy(wu, up_row + c * 8, 16);
+    __builtin_memcpy(v, x + c * 8, 32);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      g[i & 3] += Bf16(wg[i]) * v[i];
+      u[i & 3] += Bf16(wu[i]) * v[i];
+    }
+  }
+  const float gs = WaveSum((g[0] + g[1]) + (g[2] + g[3]));
+  const float us = WaveSum((u[0] + u[1]) + (u[2] + u[3]));
+  if (lane == 0) {
+    const float s = a.up_scale[b * kTopK + e];
+    a.act[(b * kTopK + e) * kFF + k] =
+        Situ(gs * s, us * s, a.situ_beta, a.situ_linear_beta);
+  }
+}
+
+// A wave per (row, output value): a lane owns 36 columns of each selected
+// expert's down row.
+__launch_bounds__(256) __global__ void ExpertDownBf16LaneKernel(
+    BatchExpertArgs a) {
+  constexpr int kMine = kFF / 32;  // 36
+  const int lane = threadIdx.x & 31;
+  const int idx = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const int i = idx % kE;
+  const std::size_t b = idx / kE;
+  const std::uint16_t* down = reinterpret_cast<const std::uint16_t*>(a.down);
+  float acc = 0.0f;
+  for (int e = 0; e < kTopK; ++e) {
+    const std::uint16_t* row =
+        down + (static_cast<std::size_t>(a.ids[b * kTopK + e]) * kE + i) * kFF +
+        lane * kMine;
+    const float* act = a.act + (b * kTopK + e) * kFF + lane * kMine;
+    std::uint16_t w[kMine];
+    float v[kMine];
+    __builtin_memcpy(w, row, sizeof w);
+    __builtin_memcpy(v, act, sizeof v);
+    float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int c = 0; c < kMine; ++c)
+      part[c & 3] += Bf16(w[c]) * v[c];
+    acc += a.coef[b * kTopK + e] * ((part[0] + part[1]) + (part[2] + part[3]));
+  }
+  acc = WaveSum(acc);
+  if (lane == 0)
+    a.out[b * kE + i] = acc;
+}
+
 // ---- expert-major variant --------------------------------------------------
 
 // One 64-value NVFP4 block as F32, each value already times its sub-block
@@ -3817,8 +3889,21 @@ void BatchExperts(const BatchExpertArgs& in, hipStream_t stream) {
     ExpertUpNvfp4Kernel<<<args.batch * kTopK * kFF, 64, 0, stream>>>(args);
     ExpertDownNvfp4Kernel<<<args.batch * kE, 32, 0, stream>>>(args);
   } else {
-    ExpertUpBf16Kernel<<<args.batch * kTopK * kFF, 64, 0, stream>>>(args);
-    ExpertDownBf16Kernel<<<args.batch * kE, 64, 0, stream>>>(args);
+    // INKLING2_EXPERT_BF16_LANE: bits 1 up, 2 down. Measured at one row:
+    // 31.0 tokens/s with neither, 30.5 with up, 31.2 with down.
+    static const int lane_bits = [] {
+      const char* e = std::getenv("INKLING2_EXPERT_BF16_LANE");
+      return e ? std::atoi(e) : 2;
+    }();
+    if (lane_bits & 1)
+      ExpertUpBf16LaneKernel<<<args.batch * kTopK * kFF / 8, 256, 0,
+                               stream>>>(args);
+    else
+      ExpertUpBf16Kernel<<<args.batch * kTopK * kFF, 64, 0, stream>>>(args);
+    if (lane_bits & 2)
+      ExpertDownBf16LaneKernel<<<args.batch * kE / 8, 256, 0, stream>>>(args);
+    else
+      ExpertDownBf16Kernel<<<args.batch * kE, 64, 0, stream>>>(args);
   }
 }
 
@@ -3834,6 +3919,99 @@ void Final(const FinalArgs& args, hipStream_t stream) {
 void Copy(const CopyArgs& args, hipStream_t stream) {
   CopyKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0, stream>>>(
       args);
+}
+
+// A block per (row, block of 1,024 tokens), four tokens next to each other
+// per thread. Ties go to the lower token.
+__launch_bounds__(256) __global__ void RowMaxKernel(RowStatsArgs a) {
+  __shared__ float smax[8];
+  __shared__ std::uint32_t sarg[8];
+  const int t = threadIdx.x;
+  const int blk = blockIdx.x % a.blocks, row = blockIdx.x / a.blocks;
+  const float* l =
+      a.logits + static_cast<std::size_t>(row) * a.stride + blk * kStatBlock;
+  const int masked = a.masked[row];
+  float best = -3.0e38f;
+  std::uint32_t arg = 0xFFFFFFFFu;
+  for (int j = 0; j < 4; ++j) {
+    const int token = blk * kStatBlock + t * 4 + j;
+    if (token < a.vocab && token != masked) {
+      const float v = l[t * 4 + j];
+      if (v > best) {
+        best = v;
+        arg = static_cast<std::uint32_t>(token);
+      }
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float ob = __shfl_xor(best, offset, 32);
+    const std::uint32_t oa =
+        static_cast<std::uint32_t>(__shfl_xor(static_cast<int>(arg), offset, 32));
+    if (ob > best || (ob == best && oa < arg)) {
+      best = ob;
+      arg = oa;
+    }
+  }
+  if ((t & 31) == 0) {
+    smax[t >> 5] = best;
+    sarg[t >> 5] = arg;
+  }
+  __syncthreads();
+  if (t == 0) {
+    for (int w = 1; w < 8; ++w)
+      if (smax[w] > best || (smax[w] == best && sarg[w] < arg)) {
+        best = smax[w];
+        arg = sarg[w];
+      }
+    a.block_max[row * a.blocks + blk] = best;
+    a.block_arg[row * a.blocks + blk] = arg;
+  }
+}
+
+__launch_bounds__(256) __global__ void RowSumKernel(RowStatsArgs a) {
+  __shared__ float gm[8];
+  __shared__ double sd[256];
+  const int t = threadIdx.x;
+  const int blk = blockIdx.x % a.blocks, row = blockIdx.x / a.blocks;
+  const double inv = a.inv_temp[row];
+  if (!(inv > 0.0))
+    return;
+  // The row's largest logit, from the blocks' (at most 256 of them).
+  float m = t < a.blocks ? a.block_max[row * a.blocks + t] : -3.0e38f;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    m = fmaxf(m, __shfl_xor(m, offset, 32));
+  if ((t & 31) == 0)
+    gm[t >> 5] = m;
+  __syncthreads();
+  float top = gm[0];
+  for (int w = 1; w < 8; ++w)
+    top = fmaxf(top, gm[w]);
+  const float* l =
+      a.logits + static_cast<std::size_t>(row) * a.stride + blk * kStatBlock;
+  const int masked = a.masked[row];
+  double sum = 0.0;
+  for (int j = 0; j < 4; ++j) {
+    const int token = blk * kStatBlock + t * 4 + j;
+    if (token < a.vocab && token != masked)
+      sum += exp((static_cast<double>(l[t * 4 + j]) - static_cast<double>(top)) *
+                 inv);
+  }
+  sd[t] = sum;
+  __syncthreads();
+  for (int step = 128; step > 0; step >>= 1) {
+    if (t < step)
+      sd[t] += sd[t + step];
+    __syncthreads();
+  }
+  if (t == 0)
+    a.block_sum[row * a.blocks + blk] = sd[0];
+}
+
+void RowStats(const RowStatsArgs& args, hipStream_t stream) {
+  RowMaxKernel<<<args.rows * args.blocks, 256, 0, stream>>>(args);
+  RowSumKernel<<<args.rows * args.blocks, 256, 0, stream>>>(args);
 }
 
 void SoftCap(float* x, std::size_t count, float cap, hipStream_t stream) {

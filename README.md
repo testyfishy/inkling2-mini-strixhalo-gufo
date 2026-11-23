@@ -7,8 +7,9 @@ precision.
 
 **Status: it runs and serves.** `gufo serve llm` answers on GUFO's OpenAI-style API with this
 extension: about 1,270 tokens/s on a 4K-token prompt, 990 on average over a 100K-token prompt (101 s),
-313 over a 1,040,000-token prompt (55 minutes), 31 tokens/s plain generation, and with the
-model's drafter 34 to 38 on code (40 after 40K tokens of source, where plain is 27). Against
+313 over a 1,040,000-token prompt (55 minutes), 31 tokens/s plain generation (greedy or
+sampled), and with the model's drafter about 35 on code (26 after 120K tokens of source, where
+plain is 19; prose is about 4% slower with it). Against
 llama.cpp on the same file: KLD 0.0015 at 4K tokens and 0.0035 at 32K (perplexity within 0.1%),
 and a 32K-token prompt in 28 s where llama.cpp takes 182 s.
 See [docs/SERVING.md](docs/SERVING.md) and [docs/PROGRESS.md](docs/PROGRESS.md).
@@ -114,8 +115,8 @@ These numbers are the floor the extension has to beat, not a prediction of GUFO 
       generation ([docs/SERVING.md](docs/SERVING.md))
 - [ ] M7: a standard benchmark panel comparing this model at released precision with a larger
       4-bit model on the same machine: prepared, not run ([docs/EVALS.md](docs/EVALS.md))
-- [x] M5c: sessions that generate at the same time share a step (four requests at once: 37.2
-      tokens/s in all against 27.4)
+- [x] M5c: sessions that generate at the same time share a step (four requests at once: about
+      50 tokens/s in all against 31)
 - [ ] M5b: what serving still lacks: smaller checkpoints,
       `tool_choice: required` in the model's own framing, the disk cache and GUFO's
       conformance suites

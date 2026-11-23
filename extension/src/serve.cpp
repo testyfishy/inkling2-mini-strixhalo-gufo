@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -360,6 +361,10 @@ public:
   // The soft-capped logits of the token after the last one processed.
   std::vector<float> logits;
   bool has_logits{false};
+  // What the device worked out for drawing from `logits`
+  // (GpuEngine::RowStats); not kept in checkpoints.
+  GpuEngine::RowStats draw;
+  std::vector<double> draw_sums;
 };
 
 Adapter::State& Adapter::As(cache::Slot& slot) const {
@@ -423,6 +428,7 @@ void Adapter::BeginRestore(cache::Slot& slot,
   state.coverage.assign(descriptors_.size(), {});
   state.meta.fill(std::byte{});
   state.has_logits = false;
+  state.draw = {};
   state.restoring = true;
 }
 
@@ -737,6 +743,7 @@ bool Adapter::Validate(cache::Slot& slot,
     return refuse();
   }
   state.has_logits = meta.has_logits != 0;
+  state.draw = {};
   state.restoring = false;
   state.coverage.clear();
   state.expected.clear();
@@ -753,6 +760,7 @@ bool Adapter::Invalidate(cache::Slot& slot) noexcept {
     state.failed = false;
     state.restoring = false;
     state.has_logits = false;
+    state.draw = {};
     state.expected.clear();
     state.coverage.clear();
     state.guard.AfterReset();
@@ -826,14 +834,20 @@ struct DraftControl {
     return 1.0 + pass + (0.45 - 0.15 * depth) +
            (0.31 - 0.13 * depth) * static_cast<double>(drafts - 1);
   }
-  void Drafted(std::size_t tokens, std::size_t drafts, std::size_t position) {
+  // `refused`: a sampled request turned a draft down, which costs the host
+  // one pass of GUFO's sampler over the whole row for the token drawn in its
+  // place (a tenth of a plain step). Having the drafter fed at all costs
+  // every step a little over 1%, drafting or not, so drafting has to gain
+  // more than nothing to go on.
+  void Drafted(std::size_t tokens, std::size_t drafts, std::size_t position,
+               bool refused = false) {
     ++calls;
     empty += drafts == 0 ? 1 : 0;
     drafted += drafts;
     kept += tokens - 1;
-    gain = 0.9 * gain +
-           0.1 * (static_cast<double>(tokens) - Cost(drafts, position));
-    if (gain < 0) {
+    gain = 0.9 * gain + 0.1 * (static_cast<double>(tokens) -
+                               Cost(drafts, position) - (refused ? 0.1 : 0.0));
+    if (gain < 0.03) {
       pause = next_pause;
       next_pause = std::min(2 * next_pause, 32);
       gain = 0.15;
@@ -1192,7 +1206,13 @@ public:
     if (!s.slot().has_logits)
       throw std::logic_error("inkling2: no logits at this position");
     const std::span<const float> logits(s.slot().logits);
-    const std::uint32_t token = sampler.Sample(logits);
+    SetDraw(s, sampler);
+    if (draw_check_ && CanFastDraw(s, sampler, s.slot().draw))
+      CheckDraw(sampler, s.slot().draw, logits);
+    const std::uint32_t token =
+        CanFastDraw(s, sampler, s.slot().draw)
+            ? FastDraw(sampler, s.slot().draw, logits.data())
+            : sampler.Sample(logits);
     const bool stop = s.stop_at_eos() && token == tokenizer_.eos();
     Framing output = s.output;
     return {.stop = stop,
@@ -1245,7 +1265,7 @@ public:
       s.lookup.Extend(s.tokens, sampled);
       lookup_step = s.lookup.Step(position);
     }
-    const bool model_step = drafter_ && s.control.Allows();
+    const bool model_step = drafter_ && !draft_never_ && s.control.Allows();
     if (!lookup_step && !model_step)
       return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
 
@@ -1355,7 +1375,8 @@ public:
     if (copied) {
       Copied(s, match, drafts.size(), kept, &step);
     } else {
-      Drafted(s, 1 + kept, drafts.size(), position);
+      Drafted(s, 1 + kept, drafts.size(), position,
+              sampled && kept < drafts.size());
       step.draft_tokens = drafts.size();
       step.draft_accepted_tokens = kept;
     }
@@ -1533,12 +1554,25 @@ private:
     (void)Piece(anchor, &s.output);
     std::size_t kept = 0;
     for (; kept < drafts.size(); ++kept) {
-      std::vector<float> logits = engine_->capped_logits(first_row + kept);
-      Mask(s, logits.data());
-      const std::span<const float> row(logits.data(), tokenizer_.size());
+      // The device has each row's largest logit and, for a request that
+      // only sets a temperature, the sums a draw needs: the row itself is
+      // copied only when GUFO's sampler has to see all of it.
+      const std::size_t r = first_row + kept;
+      const GpuEngine::RowStats stats = engine_->row_stats(r);
+      const bool fast = CanFastDraw(s, sampler, stats);
+      std::vector<float> logits;
+      const auto row = [&]() {
+        if (logits.empty()) {
+          logits = engine_->capped_logits(r);
+          Mask(s, logits.data());
+        }
+        return std::span<const float>(logits.data(), tokenizer_.size());
+      };
       std::uint32_t token;
       if (chances) {
-        const double p = sampler.Distribution(row).probability(drafts[kept]);
+        const double p =
+            fast ? Chance(stats, engine_->logits(r), drafts[kept])
+                 : sampler.Distribution(row()).probability(drafts[kept]);
         const double q = (*chances)[kept];
         if (sampler.Uniform() * q < p) {
           token = drafts[kept];
@@ -1546,11 +1580,17 @@ private:
           std::vector<std::uint32_t> ids;
           std::vector<float> probabilities;
           engine_->DraftDistribution(kept, &ids, &probabilities);
-          sampler.DeferSample(sampler.SampleResidual(row, ids, probabilities));
+          sampler.DeferSample(
+              sampler.SampleResidual(row(), ids, probabilities));
           break;
         }
       } else {
-        token = sampler.Sample(row);
+        if (fast)
+          token = FastDraw(sampler, stats, engine_->logits(r));
+        else if (CanTakeArgmax(s, sampler, stats))
+          token = stats.argmax;
+        else
+          token = sampler.Sample(row());
         if (token != drafts[kept]) {
           // The token drawn stands; the next step starts from it.
           sampler.DeferSample(token);
@@ -1572,6 +1612,7 @@ private:
               s.slot().logits.begin());
     Mask(s, s.slot().logits.data());
     s.slot().has_logits = true;
+    KeepDraw(&s, first_row + kept);
     return kept;
   }
   // Bookkeeping after a step whose drafts were copied from the context.
@@ -1584,9 +1625,9 @@ private:
     step->lookup_accepted_tokens = kept;
   }
   void Drafted(State& s, std::size_t tokens, std::size_t drafts,
-               std::size_t position) const {
+               std::size_t position, bool refused = false) const {
     DraftControl& c = s.control;
-    c.Drafted(tokens, drafts, position);
+    c.Drafted(tokens, drafts, position, refused);
     if (draft_log_ && c.calls % 64 == 0)
       std::fprintf(stderr,
                    "inkling2 draft: %zu steps, %zu draft calls (%zu without a "
@@ -1600,6 +1641,132 @@ private:
               s->slot().logits.begin());
     Mask(*s, s->slot().logits.data());
     s->slot().has_logits = true;
+    KeepDraw(s, run);
+  }
+
+  // ---- drawing with the device's row statistics ----------------------------
+  // GUFO's sampler works through all 200,000 logits on the host for every
+  // token it draws (about 2.3 ms). For a request that only sets a
+  // temperature the device adds up exp((logit - largest) / temperature) per
+  // block of 1,024 tokens in FP64 while the logits are still there; the host
+  // then draws one uniform number from the request's random stream, finds
+  // the block and works through that block alone. The token is distributed
+  // as the sampler's would be, and a seed repeats it. Everything else
+  // (top-k, top-p, min-p, penalties, grammars, a reasoning budget, logprobs,
+  // a deferred draw) goes to GUFO's sampler as before. INKLING2_FAST_DRAW=0
+  // turns this off.
+  [[nodiscard]] static bool OnlyTemperature(const sampling::SamplingConfig& c) {
+    return c.uses_random_sampling() && c.top_k <= 0 && c.top_p >= 1.0F &&
+           c.min_p <= 0.0F && !c.penalties_enabled() && !c.constraint &&
+           !c.reasoning_budget && !c.logprobs;
+  }
+  [[nodiscard]] std::int32_t MaskedToken(const State& s) const {
+    return s.no_thinking ? static_cast<std::int32_t>(ids_.content_thinking) : -1;
+  }
+  void SetDraw(const State& s, const sampling::SamplerState& sampler) const {
+    const auto& config = sampler.config();
+    engine_->SetDraw(s.session(),
+                     fast_draw_ && OnlyTemperature(config) ? config.temperature
+                                                           : 0.0F,
+                     MaskedToken(s));
+  }
+  void KeepDraw(State* s, std::size_t row) const {
+    Adapter::State& slot = s->slot();
+    slot.draw = engine_->row_stats(row);
+    slot.draw_sums.assign(slot.draw.sums.begin(), slot.draw.sums.end());
+    slot.draw.sums = slot.draw_sums;
+  }
+  [[nodiscard]] bool CanFastDraw(const State& s,
+                                 const sampling::SamplerState& sampler,
+                                 const GpuEngine::RowStats& stats) const {
+    const auto& config = sampler.config();
+    return fast_draw_ && stats.valid && !stats.sums.empty() &&
+           OnlyTemperature(config) && stats.temperature == config.temperature &&
+           stats.masked == MaskedToken(s) && stats.total > 0.0 &&
+           std::isfinite(stats.total) && !sampler.SaveDrawState().pending &&
+           !sampler.ForcedToken() && !sampler.NeedsConstraintMask() &&
+           engine_->vocab() == tokenizer_.size();
+  }
+  [[nodiscard]] bool CanTakeArgmax(const State& s,
+                                   const sampling::SamplerState& sampler,
+                                   const GpuEngine::RowStats& stats) const {
+    return fast_draw_ && stats.valid && stats.masked == MaskedToken(s) &&
+           sampler.config().can_use_unmodified_argmax() &&
+           !sampler.SaveDrawState().pending && !sampler.ForcedToken() &&
+           engine_->vocab() == tokenizer_.size() &&
+           sampler.CanSelectArgmax(stats.argmax);
+  }
+  [[nodiscard]] static double Weight(const GpuEngine::RowStats& stats,
+                                     float logit) {
+    return std::exp((static_cast<double>(logit) - static_cast<double>(stats.max)) *
+                    (1.0 / static_cast<double>(stats.temperature)));
+  }
+  // The chance of `token` in the row `logits` (as the engine left it).
+  [[nodiscard]] static double Chance(const GpuEngine::RowStats& stats,
+                                     const float* logits, std::uint32_t token) {
+    if (static_cast<std::int32_t>(token) == stats.masked)
+      return 0.0;
+    return Weight(stats, logits[token]) / stats.total;
+  }
+  // INKLING2_FAST_DRAW_CHECK=1: every chance against GUFO's distribution of
+  // the same row, and every block's sum against the host's.
+  void CheckDraw(const sampling::SamplerState& sampler,
+                 const GpuEngine::RowStats& stats,
+                 std::span<const float> logits) const {
+    static double worst = 0.0, worst_sum = 0.0;
+    static std::size_t checks = 0, top_differs = 0;
+    const sampling::SamplingDistribution exact = sampler.Distribution(logits);
+    for (const sampling::Probability& entry : exact.entries())
+      worst = std::max(worst, std::abs(entry.value -
+                                       Chance(stats, logits.data(), entry.token)));
+    top_differs += exact.best_token() == stats.argmax ? 0 : 1;
+    for (std::size_t block = 0; block < stats.sums.size(); ++block) {
+      double sum = 0.0;
+      const std::size_t first = block * GpuEngine::kStatBlock;
+      for (std::size_t token = first;
+           token < std::min(first + GpuEngine::kStatBlock, logits.size()); ++token)
+        if (static_cast<std::int32_t>(token) != stats.masked)
+          sum += Weight(stats, logits[token]);
+      worst_sum = std::max(worst_sum, std::abs(sum - stats.sums[block]) /
+                                          std::max(stats.total, 1e-300));
+    }
+    if (++checks % 100 == 0)
+      std::fprintf(stderr,
+                   "inkling2 draw check: %zu rows, largest difference of a "
+                   "chance %.3g, of a block sum %.3g of the total, largest "
+                   "token differs %zu times%c",
+                   checks, worst, worst_sum, top_differs, 10);
+  }
+  [[nodiscard]] std::uint32_t FastDraw(sampling::SamplerState& sampler,
+                                       const GpuEngine::RowStats& stats,
+                                       const float* logits) const {
+    const double target = sampler.Uniform() * stats.total;
+    double before = 0.0;
+    std::size_t block = 0;
+    for (; block + 1 < stats.sums.size(); ++block) {
+      if (target < before + stats.sums[block])
+        break;
+      before += stats.sums[block];
+    }
+    const std::size_t first = block * GpuEngine::kStatBlock;
+    const std::size_t end =
+        std::min<std::size_t>(first + GpuEngine::kStatBlock, tokenizer_.size());
+    double sum = before;
+    std::optional<std::uint32_t> last;
+    for (std::size_t token = first; token < end; ++token) {
+      if (static_cast<std::int32_t>(token) == stats.masked)
+        continue;
+      const double weight = Weight(stats, logits[token]);
+      if (weight > 0.0) {
+        sum += weight;
+        last = static_cast<std::uint32_t>(token);
+        if (target < sum)
+          return *last;
+      }
+    }
+    // The host's sum of a block can differ from the device's in the last
+    // place: the target then lies just past the block's last token.
+    return last ? *last : stats.argmax;
   }
 
   // The text the server sees for a token, and what the model is writing
@@ -1807,6 +1974,10 @@ private:
   // Overrides of the confidence a first draft needs and of the chance a
   // later one needs that it and all before it are kept (percent; 0 = the
   // defaults in DecodeStep).
+  bool fast_draw_{EnvInt("INKLING2_FAST_DRAW", 1) != 0};
+  // Measurement: the drafter is loaded and fed, and never asked.
+  bool draft_never_{EnvInt("INKLING2_DRAFT_NEVER", 0) != 0};
+  bool draw_check_{EnvInt("INKLING2_FAST_DRAW_CHECK", 0) != 0};
   float draft_first_{EnvInt("INKLING2_DRAFT_FIRST", 0) / 100.0F};
   float draft_chain_{EnvInt("INKLING2_DRAFT_CHAIN", 0) / 100.0F};
   bool draft_log_{EnvInt("INKLING2_SERVE_DRAFT_LOG", 0) != 0};

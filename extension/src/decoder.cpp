@@ -138,6 +138,9 @@ struct GpuEngine::Impl {
     float* hist{};
     // The run of the last tentative step: its first batch row and length.
     int pending_first{-1}, pending_count{0};
+    // See GpuEngine::SetDraw.
+    float draw_temp{0.0F};
+    std::int32_t draw_masked{-1};
     // With a drafter: per layer the key ring and the value ring, then the
     // head's feature of the last kept row (kE floats). One allocation.
     std::uint8_t* draft_state{};
@@ -404,6 +407,19 @@ struct GpuEngine::Impl {
   int n_blocks{0};
   std::size_t n_heads{0};
   std::vector<float> host_logits;
+  // Row statistics for drawing (gpu::RowStats), per head row.
+  int stat_blocks{0};
+  bool row_stats{EnvOr("INKLING2_ROW_STATS", 1) != 0};
+  double* dev_inv_temp{};
+  std::int32_t* dev_masked{};
+  float* dev_block_max{};
+  std::uint32_t* dev_block_arg{};
+  double* dev_block_sum{};
+  std::vector<double> host_inv_temp, host_block_sum;
+  std::vector<std::int32_t> host_masked;
+  std::vector<float> host_temp, host_block_max;
+  std::vector<std::uint32_t> host_block_arg;
+  bool stats_valid{false};
   std::size_t n_launches{0};
 
   static constexpr int kPhases = 18;
@@ -839,6 +855,24 @@ struct GpuEngine::Impl {
     final_x = Floats(heads_cap * kE);
     logits = Floats(heads_cap * c.n_vocab_padded);
     host_logits.resize(heads_cap * c.n_vocab_padded);
+    stat_blocks = static_cast<int>((c.n_vocab + gpu::kStatBlock - 1) /
+                                   gpu::kStatBlock);
+    if (stat_blocks > 256)
+      row_stats = false;
+    if (row_stats) {
+      const std::size_t n = heads_cap * stat_blocks;
+      dev_inv_temp = static_cast<double*>(Alloc(heads_cap * 8));
+      dev_masked = static_cast<std::int32_t*>(Alloc(heads_cap * 4));
+      dev_block_max = static_cast<float*>(Alloc(n * 4));
+      dev_block_arg = static_cast<std::uint32_t*>(Alloc(n * 4));
+      dev_block_sum = static_cast<double*>(Alloc(n * 8, true));
+      host_inv_temp.resize(heads_cap);
+      host_masked.resize(heads_cap);
+      host_temp.resize(heads_cap);
+      host_block_max.resize(n);
+      host_block_arg.resize(n);
+      host_block_sum.resize(n);
+    }
 
     off_tokens = sizeof(gpu::RowState) * c.visits() * B;
     off_heads = off_tokens + 4 * B;
@@ -2543,6 +2577,45 @@ struct GpuEngine::Impl {
                            n_heads * c.n_vocab_padded * 4,
                            hipMemcpyDeviceToHost, stream),
             "copy logits");
+      stats_valid = row_stats;
+      if (row_stats) {
+        for (std::size_t i = 0; i < n_heads; ++i) {
+          const Session& session = sessions[rows[heads[i]].session];
+          host_temp[i] = session.draw_temp;
+          host_inv_temp[i] = session.draw_temp > 0.0F
+                                 ? 1.0 / static_cast<double>(session.draw_temp)
+                                 : 0.0;
+          host_masked[i] = session.draw_masked;
+        }
+        Check(hipMemcpyAsync(dev_inv_temp, host_inv_temp.data(), n_heads * 8,
+                             hipMemcpyHostToDevice, stream),
+              "copy draw settings");
+        Check(hipMemcpyAsync(dev_masked, host_masked.data(), n_heads * 4,
+                             hipMemcpyHostToDevice, stream),
+              "copy draw settings");
+        gpu::RowStatsArgs st{};
+        st.logits = logits;
+        st.stride = static_cast<int>(c.n_vocab_padded);
+        st.vocab = static_cast<int>(c.n_vocab);
+        st.rows = static_cast<int>(n_heads);
+        st.blocks = stat_blocks;
+        st.inv_temp = dev_inv_temp;
+        st.masked = dev_masked;
+        st.block_max = dev_block_max;
+        st.block_arg = dev_block_arg;
+        st.block_sum = dev_block_sum;
+        gpu::RowStats(st, stream);
+        const std::size_t n = n_heads * stat_blocks;
+        Check(hipMemcpyAsync(host_block_max.data(), dev_block_max, n * 4,
+                             hipMemcpyDeviceToHost, stream),
+              "copy row statistics");
+        Check(hipMemcpyAsync(host_block_arg.data(), dev_block_arg, n * 4,
+                             hipMemcpyDeviceToHost, stream),
+              "copy row statistics");
+        Check(hipMemcpyAsync(host_block_sum.data(), dev_block_sum, n * 8,
+                             hipMemcpyDeviceToHost, stream),
+              "copy row statistics");
+      }
     }
     if (!tentative)
       for (std::size_t b = 0; b < rows.size(); ++b)
@@ -2779,6 +2852,40 @@ const float* GpuEngine::logits(std::size_t i) const {
   if (i >= impl_->n_heads)
     throw std::runtime_error("inkling2 gpu: no logits for that run");
   return impl_->host_logits.data() + i * impl_->c.n_vocab_padded;
+}
+
+void GpuEngine::SetDraw(std::uint32_t session, float temperature,
+                        std::int32_t masked) {
+  Impl::Session& s = impl_->sessions.at(session);
+  s.draw_temp = temperature;
+  s.draw_masked = masked;
+}
+
+static_assert(GpuEngine::kStatBlock == gpu::kStatBlock);
+
+GpuEngine::RowStats GpuEngine::row_stats(std::size_t i) const {
+  const Impl& m = *impl_;
+  RowStats out;
+  if (!m.stats_valid || i >= m.n_heads)
+    return out;
+  const std::size_t at = i * m.stat_blocks;
+  out.valid = true;
+  out.temperature = m.host_temp[i];
+  out.masked = m.host_masked[i];
+  out.max = m.host_block_max[at];
+  out.argmax = m.host_block_arg[at];
+  for (int b = 1; b < m.stat_blocks; ++b)
+    if (m.host_block_max[at + b] > out.max) {
+      out.max = m.host_block_max[at + b];
+      out.argmax = m.host_block_arg[at + b];
+    }
+  if (out.temperature > 0.0F) {
+    out.sums = std::span<const double>(m.host_block_sum.data() + at,
+                                       static_cast<std::size_t>(m.stat_blocks));
+    for (const double v : out.sums)
+      out.total += v;
+  }
+  return out;
 }
 
 std::vector<float> GpuEngine::capped_logits(std::size_t i) const {

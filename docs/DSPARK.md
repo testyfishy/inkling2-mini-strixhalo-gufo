@@ -251,9 +251,10 @@ first draft: 1 of 12 kept below 0.3, 18 of 21 kept above 0.9). So:
   temperature and are verified by speculative sampling (BENCHMARKS.md, step 35), which keeps
   the output distributed exactly as without drafts.
 - **Controller.** Every drafted step is charged what it costs in plain steps (the drafter's
-  pass 0.20, the first extra row 0.42, each further row 0.25 at short context; less at depth,
-  where a plain step is longer) and compared with the tokens it produced. While drafting
-  loses, it pauses (8 steps, then 16, then 32) and probes again. It first read the clock
+  pass 0.22, the first extra row 0.45, each further row 0.31 at short context; less at depth,
+  where a plain step is longer; a tenth more when a sampled request refuses a draft) and
+  compared with the tokens it produced. While drafting gains less than 0.03 of a step, it
+  pauses (8 steps, then 16, then 32) and probes again. It first read the clock
   instead; that made the same request draft at different steps from run to run, and with
   that give different text (BENCHMARKS.md, step 34).
 

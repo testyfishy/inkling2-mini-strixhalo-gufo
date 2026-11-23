@@ -464,6 +464,25 @@ void Dot2Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
 void FloatBench(const float* w, const float* xt, int rows, int cols, int batch,
                 float* y, hipStream_t stream);
 
+/// What drawing a token from a row of logits needs, per block of 1,024
+/// tokens: the largest logit and its first token, and the sum of
+/// exp((logit - the row's largest) * inv_temp) in FP64 (rows with
+/// inv_temp = 0 get no sums). A row may leave one token out.
+inline constexpr int kStatBlock = 1024;
+struct RowStatsArgs {
+  const float* logits;  // rows of `stride` values
+  int stride;
+  int vocab;   // tokens that count, at most 256 blocks
+  int rows;
+  int blocks;  // per row
+  const double* inv_temp;      // per row
+  const std::int32_t* masked;  // per row: the token left out, or -1
+  float* block_max;            // rows * blocks
+  std::uint32_t* block_arg;
+  double* block_sum;
+};
+void RowStats(const RowStatsArgs& args, hipStream_t stream);
+
 /// The model's soft cap on its logits, in place: x = cap * tanh(x / cap).
 void SoftCap(float* x, std::size_t count, float cap, hipStream_t stream);
 

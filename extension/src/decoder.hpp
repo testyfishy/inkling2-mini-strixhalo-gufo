@@ -196,6 +196,24 @@ public:
   [[nodiscard]] const float* logits(std::size_t i) const;
   /// A copy of them.
   [[nodiscard]] std::vector<float> capped_logits(std::size_t i) const;
+
+  /// What the device worked out about a row of logits for drawing from it
+  /// (see gpu::RowStatsArgs): `sums` is empty when the session had no
+  /// temperature set for the step.
+  static constexpr std::size_t kStatBlock = 1024;
+  struct RowStats {
+    bool valid{false};
+    float temperature{0.0F};
+    std::int32_t masked{-1};
+    float max{0.0F};
+    std::uint32_t argmax{0};
+    double total{0.0};
+    std::span<const double> sums;  // per block of 1,024 tokens
+  };
+  /// The temperature the session's next rows are drawn at (0: only the
+  /// largest logit is wanted) and a token its rows leave out (-1: none).
+  void SetDraw(std::uint32_t session, float temperature, std::int32_t masked);
+  [[nodiscard]] RowStats row_stats(std::size_t i) const;
   /// The most likely next token of run `i`.
   [[nodiscard]] std::uint32_t argmax(std::size_t i) const;
 
