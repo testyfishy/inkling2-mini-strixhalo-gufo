@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,9 +45,10 @@ public:
     /// lets that layer see the whole context; a window bounds its cost and
     /// memory, and only proposals depend on it.
     std::uint32_t draft_window{8192};
-    /// The drafter scores a shortlist of this many tokens instead of the
-    /// whole vocabulary: the tokens of the context and the tokens the model
-    /// itself found likely at recent steps. 0 scores the whole vocabulary.
+    /// The drafter scores a shortlist of this many tokens per session instead
+    /// of the whole vocabulary: the tokens of the context and the tokens the
+    /// model itself found likely at recent steps. 0 scores the whole
+    /// vocabulary.
     std::uint32_t draft_vocab{32768};
   };
 
@@ -72,7 +74,12 @@ public:
   /// forward: afterwards `Accept` keeps the first rows of a session's run and
   /// drops the rest, which is how drafted tokens are verified. The next step
   /// of a session overwrites whatever the dropped rows stored.
-  void Step(const std::vector<Row>& rows, Head head, bool tentative = false);
+  ///
+  /// With a drafter, a step puts its rows' tokens on the session's shortlist
+  /// and, unless `list_likely` is false, the tokens the model finds likely
+  /// after each row that has logits.
+  void Step(const std::vector<Row>& rows, Head head, bool tentative = false,
+            bool list_likely = true);
   /// After a tentative step, keeps the first `rows_kept` rows of `session`'s
   /// run (0 keeps none).
   void Accept(std::uint32_t session, std::uint32_t rows_kept);
@@ -93,6 +100,20 @@ public:
                                               std::uint32_t anchor,
                                               int max_tokens,
                                               float min_confidence);
+
+  /// Empties a session's shortlist, and puts tokens on it in order. What a
+  /// draft proposes depends on the list, so a caller that wants a request to
+  /// decode the same way every time starts it from the same list: empty,
+  /// then the context's tokens.
+  void ResetDraftList(std::uint32_t session);
+  /// Tokens on the session's shortlist (a diagnostic).
+  [[nodiscard]] std::size_t draft_list_size(std::uint32_t session) const;
+  void ListDraftTokens(std::uint32_t session,
+                       std::span<const std::uint32_t> tokens);
+
+  /// Test aid: Reset, and every cached key and value of the session zeroed,
+  /// as in a new engine.
+  void Scrub(std::uint32_t session);
 
   /// Forgets a session's context: its next row is position 0 again.
   void Reset(std::uint32_t session);
@@ -118,8 +139,9 @@ public:
     std::uint32_t heads{0};  // key/value heads
     /// The convolution histories of all visits, one block per session.
     std::size_t history_bytes{0};
-    /// The keys, and equally the values, of one sliding-window visit: a ring
-    /// that is copied whole.
+    /// The keys, and equally the values, of one sliding-window visit as a
+    /// cache copies them: the window before the session's position, packed
+    /// (`PackRing`, `RingStage`).
     std::size_t ring_bytes{0};
     /// A full-attention visit, per head: keys are one row per position,
     /// values one block per 1,024 positions.
@@ -131,9 +153,15 @@ public:
   };
   [[nodiscard]] StateLayout Layout() const;
   [[nodiscard]] void* History(std::uint32_t session) const;
-  /// A sliding-window visit's key ring or value ring.
-  [[nodiscard]] void* Ring(std::uint32_t session, std::uint32_t visit,
-                           bool values) const;
+  /// A sliding-window visit's window as a contiguous buffer: `ring_bytes` of
+  /// keys, then as many of values. `PackRing` fills it from the ring at the
+  /// session's position; `UnpackRing` puts it back for a session that will
+  /// be at `position`. Both are queued; `Synchronize` waits for them.
+  [[nodiscard]] void* RingStage(std::uint32_t session,
+                                std::uint32_t visit) const;
+  void PackRing(std::uint32_t session, std::uint32_t visit);
+  void UnpackRing(std::uint32_t session, std::uint32_t visit,
+                  std::uint32_t position);
   /// A full-attention visit's keys (first row) or values (first block) of one
   /// head.
   [[nodiscard]] void* Full(std::uint32_t session, std::uint32_t visit,
@@ -148,10 +176,10 @@ public:
   [[nodiscard]] std::uint32_t max_batch() const;
   [[nodiscard]] std::uint32_t sessions() const;
 
-  /// Raw logits (before the soft cap) of run `i` of the last step, one per
-  /// vocabulary entry.
+  /// The logits of run `i` of the last step, one per vocabulary entry, with
+  /// the model's soft cap applied (on the device).
   [[nodiscard]] const float* logits(std::size_t i) const;
-  /// The soft-capped logits of run `i`.
+  /// A copy of them.
   [[nodiscard]] std::vector<float> capped_logits(std::size_t i) const;
   /// The most likely next token of run `i`.
   [[nodiscard]] std::uint32_t argmax(std::size_t i) const;

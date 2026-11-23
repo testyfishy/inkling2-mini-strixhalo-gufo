@@ -3104,6 +3104,63 @@ __launch_bounds__(kBenchThreads) __global__ void FloatBenchKernel(
       y[static_cast<std::size_t>(blockIdx.x) * kGemmGroup + b] = sh[b][0];
 }
 
+__global__ void SoftCapKernel(float* x, std::size_t count, float cap) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count)
+    x[i] = cap * tanhf(x[i] / cap);
+}
+
+// One block per (visit, run), a thread per key/value element.
+__launch_bounds__(kHK) __global__ void ClearAheadKernel(ClearAheadArgs a) {
+  const int j = threadIdx.x;
+  const int visit = blockIdx.x / a.runs, run = blockIdx.x % a.runs;
+  const RowState row =
+      a.rows[static_cast<std::size_t>(visit) * a.max_batch + a.ends[run]];
+  const std::size_t head = j / kHD, dim = j % kHD;
+  for (int d = 1; d <= a.ahead; ++d) {
+    const std::size_t p = static_cast<std::size_t>(row.pos) + d;
+    if (row.layout == 1) {
+      if (p >= static_cast<std::size_t>(row.cap))
+        break;
+      row.kh[(head * row.cap + p) * kHD + dim] = 0;
+      row.vh[((head * row.chunk_cap + p / kT) * kHD + dim) * kT + p % kT] = 0;
+    } else {
+      const std::size_t slot = p % row.cap;
+      row.kh[slot * kHK + j] = 0;
+      row.vh[static_cast<std::size_t>(j) * row.cap + slot] = 0;
+    }
+  }
+}
+
+// One thread per (window entry, key/value element).
+__global__ void RingWindowKernel(RingWindowArgs a) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int w = static_cast<int>(idx / kHK), j = static_cast<int>(idx % kHK);
+  if (w >= a.window)
+    return;
+  const int p = a.position - a.window + w;
+  const std::size_t at = static_cast<std::size_t>(w) * kHK + j;
+  if (p < 0) {
+    if (!a.unpack) {
+      a.stage_k[at] = 0;
+      a.stage_v[at] = 0;
+    }
+    return;
+  }
+  const std::size_t slot = static_cast<std::size_t>(p % a.cap);
+  std::uint16_t* key = a.kh + slot * kHK + j;
+  std::uint16_t* value = a.vh + static_cast<std::size_t>(j) * a.cap + slot;
+  if (a.unpack) {
+    *key = a.stage_k[at];
+    *value = a.stage_v[at];
+  } else {
+    a.stage_k[at] = *key;
+    a.stage_v[at] = *value;
+  }
+}
+
 inline int Blocks(std::size_t items, int per_block) {
   return static_cast<int>((items + per_block - 1) / per_block);
 }
@@ -3430,6 +3487,19 @@ void Final(const FinalArgs& args, hipStream_t stream) {
 void Copy(const CopyArgs& args, hipStream_t stream) {
   CopyKernel<<<Blocks(std::size_t(args.batch) * kE, 256), 256, 0, stream>>>(
       args);
+}
+
+void SoftCap(float* x, std::size_t count, float cap, hipStream_t stream) {
+  SoftCapKernel<<<Blocks(count, 256), 256, 0, stream>>>(x, count, cap);
+}
+
+void ClearAhead(const ClearAheadArgs& args, hipStream_t stream) {
+  ClearAheadKernel<<<args.visits * args.runs, kHK, 0, stream>>>(args);
+}
+
+void RingWindow(const RingWindowArgs& args, hipStream_t stream) {
+  RingWindowKernel<<<Blocks(std::size_t(args.window) * kHK, 256), 256, 0,
+                     stream>>>(args);
 }
 
 void SetWmmaDirect(int bits) {

@@ -142,7 +142,49 @@ struct GpuEngine::Impl {
     // head's feature of the last kept row (kE floats). One allocation.
     std::uint8_t* draft_state{};
     bool draft_ready{false};
+    // The windows of the sliding-window visits, packed for a cache: per such
+    // visit, in order, 2 * kRingWindowBytes.
+    std::uint16_t* ring_stage{};
+    // The shortlist of the vocabulary the drafter's head scores for this
+    // session. Host side: where each token is, what each slot holds, which
+    // slots were asked for again since the clock hand passed, and the
+    // entries not yet copied to the device. Device side: the head's matrices
+    // for the listed tokens.
+    struct Shortlist {
+      int used{0}, hand{0};
+      std::vector<std::int32_t> slot_of;
+      std::vector<std::uint32_t> token_of;
+      std::vector<std::uint8_t> touched;
+      std::vector<gpu::DraftListEntry> pending;
+      std::uint16_t *output{}, *m{};
+      float* bias{};
+      std::uint32_t* ids{};
+    } list;
   };
+  static constexpr std::size_t kRingWindowBytes = std::size_t{1024} * kHK * 2;
+  // Positions zeroed after the last row of a step of several rows: the tile
+  // of 64 the attention kernels stage.
+  static constexpr int kClearAhead = 64;
+  std::vector<int> ring_index;  // per visit: its place among the ring visits
+
+  void RingWindow(std::uint32_t index, std::uint32_t visit,
+                  std::uint32_t position, bool unpack) {
+    Session& session = sessions.at(index);
+    const Slot& slot = session.slots.at(visit);
+    if (ring_index.at(visit) < 0)
+      throw std::runtime_error("inkling2 gpu: not a sliding-window visit");
+    gpu::RingWindowArgs a{};
+    a.kh = slot.kh;
+    a.vh = slot.vh;
+    a.cap = slot.cap;
+    a.position = static_cast<int>(position);
+    a.window = 1024;
+    a.stage_k = session.ring_stage +
+                std::size_t(ring_index[visit]) * (kRingWindowBytes / 2) * 2;
+    a.stage_v = a.stage_k + kRingWindowBytes / 2;
+    a.unpack = unpack;
+    gpu::RingWindow(a, stream);
+  }
 
   // The drafter on the device.
   struct DraftLayer {
@@ -169,19 +211,11 @@ struct GpuEngine::Impl {
     std::uint32_t* tokens;
     // FP16 copies of the inputs of a block's products.
     std::uint16_t *a_h, *o_h, *gate_h, *h_h;
-    // The shortlist of the vocabulary the head scores (slots == 0: none).
-    // Host side: where each token is, what each slot holds, which slots were
-    // asked for again since the clock hand passed, and the entries not yet
-    // copied to the device.
-    int slots{0}, used{0}, hand{0};
-    std::vector<std::int32_t> slot_of;
-    std::vector<std::uint32_t> token_of;
-    std::vector<std::uint8_t> touched;
-    std::vector<gpu::DraftListEntry> pending;
-    std::uint16_t *list_output{}, *list_m{};
-    float* list_bias{};
-    std::uint32_t* list_ids{};
+    // Entries of a session's shortlist of the vocabulary (0: none), the
+    // staging for new entries, and the bias of an empty list.
+    int slots{0};
     gpu::DraftListEntry* list_entries{};
+    float* list_empty_bias{};
     std::size_t listed{0}, evicted{0};
     // INKLING2_DRAFT_PROFILE: seconds in the layers, the output matrix and
     // the slots, and calls.
@@ -205,7 +239,7 @@ struct GpuEngine::Impl {
   }
   std::unique_ptr<Draft> draft;
   const gpu::DraftRow* dev_draft_rows{};
-  std::size_t off_draft{0};
+  std::size_t off_draft{0}, off_ends{0};
   bool need_features{false};
 
   [[nodiscard]] std::uint16_t* DraftRing(const Session& session, int layer,
@@ -225,6 +259,8 @@ struct GpuEngine::Impl {
   // Each batch row's candidate histories for every visit, written by the rows
   // that may end a run; committing a row copies its candidate to its session.
   float* hist_candidates{};
+  std::size_t hist_slots{0};
+  std::vector<std::uint32_t> hist_slot_of;  // per batch row of the step
 
   const Model& m;
   const Config& c;
@@ -654,10 +690,16 @@ struct GpuEngine::Impl {
     // A sliding-window ring must keep the window of the earliest row of a
     // batch while the latest row of the same session is stored.
     // (A multiple of 64, for the FP16 copies.)
-    const int swa_cap =
-        static_cast<int>((c.n_swa + opt.max_batch + 63) / 64 * 64);
+    // And the positions a step clears after its last row (kClearAhead).
+    const int swa_cap = static_cast<int>(
+        (c.n_swa + opt.max_batch + kClearAhead + 63) / 64 * 64);
     sessions.resize(opt.sessions);
+    int rings = 0;
+    for (std::uint32_t s = 0; s < c.visits(); ++s)
+      ring_index.push_back(c.is_swa[Physical(s)] ? rings++ : -1);
     for (Session& session : sessions) {
+      session.ring_stage = static_cast<std::uint16_t*>(
+          Alloc(std::size_t(rings) * 2 * kRingWindowBytes, true));
       session.hist = Floats(kHistFloats * c.visits(), true);
       session.slots.resize(c.visits());
       for (std::uint32_t s = 0; s < c.visits(); ++s) {
@@ -678,7 +720,11 @@ struct GpuEngine::Impl {
     }
 
     const std::size_t B = opt.max_batch;
-    hist_candidates = Floats(B * c.visits() * kHistFloats);
+    // Only a row that may end its session's run stores candidates: the last
+    // row of each run, or every row of a tentative step.
+    hist_slots = std::min<std::size_t>(B, std::max<std::size_t>(256, opt.sessions));
+    hist_candidates = Floats(hist_slots * c.visits() * kHistFloats);
+    hist_slot_of.assign(B, 0);
     cur = Floats(B * kE);
     input = Floats(B * kE);
     in = Floats(B * 3 * kE);
@@ -792,7 +838,8 @@ struct GpuEngine::Impl {
     off_identity = off_heads + 4 * heads_cap;
     off_groups = off_identity + 4 * B;
     off_draft = (off_groups + sizeof(gpu::AttnGroup) * B + 15) / 16 * 16;
-    host_staging.resize(off_draft + sizeof(gpu::DraftRow) * B);
+    off_ends = off_draft + sizeof(gpu::DraftRow) * B;
+    host_staging.resize(off_ends + 4 * B);
     need_features = opt.capture_features || opt.drafter != nullptr;
     for (std::size_t b = 0; b < B; ++b) {
       const std::int32_t index = static_cast<std::int32_t>(b);
@@ -971,63 +1018,84 @@ struct GpuEngine::Impl {
     (void)hipFree(product);
     if (d.slots > 0) {
       const std::size_t S = static_cast<std::size_t>(d.slots);
-      d.slot_of.assign(c.n_vocab, -1);
-      d.token_of.assign(S, 0);
-      d.touched.assign(S, 0);
-      d.list_output = static_cast<std::uint16_t*>(Alloc(S * kE * 2, true));
-      d.list_m =
-          static_cast<std::uint16_t*>(Alloc(S * gpu::kDraftRank * 2, true));
       // An empty slot can never be the best.
       const std::vector<float> lowest(S, -3.0e38f);
-      d.list_bias =
+      d.list_empty_bias =
           static_cast<float*>(Upload(lowest.data(), lowest.size() * 4));
-      d.list_ids = static_cast<std::uint32_t*>(Alloc(S * 4, true));
       d.list_entries = static_cast<gpu::DraftListEntry*>(
           Alloc(kListBatch * sizeof(gpu::DraftListEntry)));
-      // The matrix kernel finds a job's FP16 weights by its pointer.
-      half_of[d.list_output] = d.list_output;
+      for (Session& session : sessions) {
+        Session::Shortlist& list = session.list;
+        list.slot_of.assign(c.n_vocab, -1);
+        list.token_of.assign(S, 0);
+        list.touched.assign(S, 0);
+        list.output = static_cast<std::uint16_t*>(Alloc(S * kE * 2, true));
+        list.m =
+            static_cast<std::uint16_t*>(Alloc(S * gpu::kDraftRank * 2, true));
+        list.bias = static_cast<float*>(Upload(lowest.data(), lowest.size() * 4));
+        list.ids = static_cast<std::uint32_t*>(Alloc(S * 4, true));
+        // The matrix kernel finds a job's FP16 weights by its pointer.
+        half_of[list.output] = list.output;
+      }
     }
   }
 
   static constexpr std::size_t kListBatch = 4096;
 
-  // Puts a token on the shortlist. A full list gives up the slot the clock
-  // hand reaches first that was not asked for again since its last pass.
-  void List(std::uint32_t token) {
+  // Empties a session's shortlist.
+  void ResetList(Session& session) {
+    if (!draft || draft->slots == 0)
+      return;
+    Session::Shortlist& list = session.list;
+    list.used = list.hand = 0;
+    std::fill(list.slot_of.begin(), list.slot_of.end(), -1);
+    std::fill(list.touched.begin(), list.touched.end(), 0);
+    list.pending.clear();
+    Check(hipMemcpyAsync(list.bias, draft->list_empty_bias,
+                         std::size_t(draft->slots) * 4, hipMemcpyDeviceToDevice,
+                         stream),
+          "clear shortlist");
+  }
+
+  // Puts a token on a session's shortlist. A full list gives up the slot the
+  // clock hand reaches first that was not asked for again since its last
+  // pass.
+  void List(Session& session, std::uint32_t token) {
     Draft& d = *draft;
-    const std::int32_t have = d.slot_of[token];
+    Session::Shortlist& list = session.list;
+    const std::int32_t have = list.slot_of[token];
     if (have >= 0) {
-      d.touched[have] = 1;
+      list.touched[have] = 1;
       return;
     }
     int slot;
-    if (d.used < d.slots) {
-      slot = d.used++;
+    if (list.used < d.slots) {
+      slot = list.used++;
     } else {
-      while (d.touched[d.hand]) {
-        d.touched[d.hand] = 0;
-        d.hand = (d.hand + 1) % d.slots;
+      while (list.touched[list.hand]) {
+        list.touched[list.hand] = 0;
+        list.hand = (list.hand + 1) % d.slots;
       }
-      slot = d.hand;
-      d.hand = (d.hand + 1) % d.slots;
-      d.slot_of[d.token_of[slot]] = -1;
+      slot = list.hand;
+      list.hand = (list.hand + 1) % d.slots;
+      list.slot_of[list.token_of[slot]] = -1;
       ++d.evicted;
     }
-    d.token_of[slot] = token;
-    d.slot_of[token] = slot;
-    d.pending.push_back({slot, token});
+    list.token_of[slot] = token;
+    list.slot_of[token] = slot;
+    list.pending.push_back({slot, token});
     ++d.listed;
   }
 
   // The tokens the model finds likely after a row: those within a margin of
-  // the best logit, at most kListPerRow of them.
+  // the best (soft-capped) logit, at most kListPerRow of them.
   static constexpr std::size_t kListPerRow = 192;
-  void ListLikely(const float* raw) {
+  void ListLikely(Session& session, const float* raw) {
     const std::size_t n = c.n_vocab;
     float top = raw[0];
     for (std::size_t i = 1; i < n; ++i)
       top = std::max(top, raw[i]);
-    float floor = top - 12.0f;
+    const float floor = top - 7.0f;
     likely.clear();
     for (std::size_t i = 0; i < n; ++i)
       if (raw[i] > floor)
@@ -1040,25 +1108,28 @@ struct GpuEngine::Impl {
       likely.resize(kListPerRow);
     }
     for (const std::uint32_t token : likely)
-      List(token);
+      List(session, token);
   }
   std::vector<std::uint32_t> likely;
 
-  // Copies the shortlist's new entries to the device.
-  void FlushList() {
+  // Copies a shortlist's new entries to the device.
+  void FlushList(Session& session) {
     Draft& d = *draft;
+    Session::Shortlist& list = session.list;
     std::size_t at = 0;
     std::vector<gpu::DraftListEntry> batch;
-    while (at < d.pending.size()) {
+    while (at < list.pending.size()) {
       batch.clear();
-      for (; at < d.pending.size() && batch.size() < kListBatch; ++at) {
-        const gpu::DraftListEntry& entry = d.pending[at];
+      for (; at < list.pending.size() && batch.size() < kListBatch; ++at) {
+        const gpu::DraftListEntry& entry = list.pending[at];
         // An entry whose slot was given to another token since is stale.
-        if (d.token_of[entry.slot] == entry.token)
+        if (list.token_of[entry.slot] == entry.token)
           batch.push_back(entry);
       }
       if (batch.empty())
         continue;
+      // The staging is shared: nothing may still be reading it.
+      Check(hipStreamSynchronize(stream), "synchronize");
       Check(hipMemcpy(d.list_entries, batch.data(),
                       batch.size() * sizeof(gpu::DraftListEntry),
                       hipMemcpyHostToDevice),
@@ -1070,15 +1141,15 @@ struct GpuEngine::Impl {
       a.m = d.m;
       a.m_bias = d.m_bias;
       a.vocab_stride = static_cast<int>(c.n_vocab_padded);
-      a.list_output = d.list_output;
-      a.list_m = d.list_m;
-      a.list_bias = d.list_bias;
-      a.list_ids = d.list_ids;
+      a.list_output = list.output;
+      a.list_m = list.m;
+      a.list_bias = list.bias;
+      a.list_ids = list.ids;
       a.slots = d.slots;
       gpu::DraftListFill(a, stream);
       Check(hipStreamSynchronize(stream), "synchronize");
     }
-    d.pending.clear();
+    list.pending.clear();
   }
 
   // What the drafter reads of the step's rows, into their sessions' rings.
@@ -1152,7 +1223,7 @@ struct GpuEngine::Impl {
     init.tokens = d.tokens;
     init.alive = d.alive;
     if (d.slots > 0)
-      FlushList();
+      FlushList(session);
     auto mark = std::chrono::steady_clock::now();
     const auto lap = [&](int part) {
       if (!draft_profile)
@@ -1219,8 +1290,8 @@ struct GpuEngine::Impl {
     const int vocab = static_cast<int>(c.n_vocab_padded);
     head.jobs[0] = {output, d.h + kE, kE, d.base, vocab, vocab, kE};
     if (d.slots > 0)
-      head.jobs[0] = {d.list_output, d.h + kE, kE,     d.base,
-                      d.slots,       d.slots,  kE};
+      head.jobs[0] = {session.list.output, d.h + kE, kE,     d.base,
+                      d.slots,             d.slots,  kE};
     head.count = 1;
     head.batch = max_tokens;
     head.single_threads = head_threads;
@@ -1252,10 +1323,10 @@ struct GpuEngine::Impl {
     slot.vocab = static_cast<int>(c.n_vocab);
     slot.vocab_stride = vocab;
     if (d.slots > 0) {
-      slot.m = d.list_m;
-      slot.m_bias = d.list_bias;
+      slot.m = session.list.m;
+      slot.m_bias = session.list.bias;
       slot.vocab = slot.vocab_stride = d.slots;
-      slot.ids = d.list_ids;
+      slot.ids = session.list.ids;
     }
     for (int i = 1; i <= max_tokens; ++i) {
       slot.slot = i;
@@ -1277,8 +1348,8 @@ struct GpuEngine::Impl {
                    "matrix %.2f, slots %.2f; shortlist %d of %d, %zu listed, "
                    "%zu given up\n",
                    1e3 * d.seconds[0] / d.calls, 1e3 * d.seconds[1] / d.calls,
-                   1e3 * d.seconds[2] / d.calls, d.used, d.slots, d.listed,
-                   d.evicted);
+                   1e3 * d.seconds[2] / d.calls, session.list.used, d.slots,
+                   d.listed, d.evicted);
     std::vector<DraftToken> out;
     for (int i = 1; i <= max_tokens; ++i) {
       if (!(confidence[i] >= min_confidence))
@@ -1980,6 +2051,7 @@ struct GpuEngine::Impl {
     session.pos = 0;
     session.pending_first = -1;
     session.draft_ready = false;
+    ResetList(session);
     Check(hipMemsetAsync(session.hist, 0, kHistFloats * c.visits() * 4, stream),
           "clear");
     Check(hipStreamSynchronize(stream), "synchronize");
@@ -2114,6 +2186,8 @@ struct GpuEngine::Impl {
     g.batch = 1;
     g.single_threads = head_threads;
     gpu::Gemm(g, stream);
+    if (c.logit_softcap != 0.0f)
+      gpu::SoftCap(logits, c.n_vocab_padded, c.logit_softcap, stream);
     Check(hipMemcpyAsync(host_logits.data(), logits, std::size_t{c.n_vocab} * 4,
                          hipMemcpyDeviceToHost, stream),
           "copy logits");
@@ -2127,7 +2201,8 @@ struct GpuEngine::Impl {
   // Copies batch row `b`'s candidate histories into its session.
   void CommitHistory(Session& session, std::size_t b) {
     Check(hipMemcpyAsync(session.hist,
-                         hist_candidates + b * c.visits() * kHistFloats,
+                         hist_candidates +
+                             hist_slot_of[b] * c.visits() * kHistFloats,
                          kHistFloats * c.visits() * 4, hipMemcpyDeviceToDevice,
                          stream),
           "commit histories");
@@ -2147,7 +2222,8 @@ struct GpuEngine::Impl {
     session.pending_first = -1;
   }
 
-  void Step(const std::vector<Row>& rows, Head head, bool tentative) {
+  void Step(const std::vector<Row>& rows, Head head, bool tentative,
+            bool list_likely) {
     if (rows.empty() || rows.size() > opt.max_batch)
       throw std::runtime_error("inkling2 gpu: batch size out of range");
     batch = static_cast<int>(rows.size());
@@ -2174,6 +2250,7 @@ struct GpuEngine::Impl {
         heads.push_back(static_cast<std::int32_t>(b));
     }
 
+    std::size_t hist_next = 0;
     auto* states = reinterpret_cast<gpu::RowState*>(host_staging.data());
     auto* tokens =
         reinterpret_cast<std::uint32_t*>(host_staging.data() + off_tokens);
@@ -2187,6 +2264,13 @@ struct GpuEngine::Impl {
         throw std::runtime_error("inkling2 gpu: context is full");
       tokens[b] = rows[b].token;
       max_pos = b == 0 ? pos : std::max(max_pos, pos);
+      hist_slot_of[b] = 0;
+      if (last[b] || tentative) {
+        if (hist_next >= hist_slots)
+          throw std::runtime_error(
+              "inkling2 gpu: too many rows may end a run in one step");
+        hist_slot_of[b] = static_cast<std::uint32_t>(hist_next++);
+      }
       const float ratio = std::max(
           1.0f, (pos + 1.0f) / static_cast<float>(c.log_scale_floor));
       const float tau = 1.0f + c.log_scale_alpha * std::log(ratio);
@@ -2199,7 +2283,7 @@ struct GpuEngine::Impl {
         for (int k = 0; k < 4; ++k) {
           state.hist_in[k] = session.hist + s * kHistFloats + kHistOffset[k];
           state.hist_out[k] = hist_candidates +
-                              (b * c.visits() + s) * kHistFloats +
+                              (hist_slot_of[b] * c.visits() + s) * kHistFloats +
                               kHistOffset[k];
         }
         state.cap = slot.cap;
@@ -2264,9 +2348,27 @@ struct GpuEngine::Impl {
                             static_cast<std::int32_t>(end - b)};
       b = end;
     }
+    // The batch row that ends each run.
+    auto* ends =
+        reinterpret_cast<std::int32_t*>(host_staging.data() + off_ends);
+    int n_runs = 0;
+    for (std::size_t b = 0; b < rows.size(); ++b)
+      if (last[b])
+        ends[n_runs++] = static_cast<std::int32_t>(b);
     Check(hipMemcpyAsync(staging, host_staging.data(), host_staging.size(),
                          hipMemcpyHostToDevice, stream),
           "copy step inputs");
+    if (rows.size() > static_cast<std::size_t>(n_runs)) {
+      gpu::ClearAheadArgs ahead{};
+      ahead.rows = row_states;
+      ahead.ends = reinterpret_cast<const std::int32_t*>(
+          static_cast<const std::uint8_t*>(staging) + off_ends);
+      ahead.runs = n_runs;
+      ahead.visits = static_cast<int>(c.visits());
+      ahead.max_batch = static_cast<int>(opt.max_batch);
+      ahead.ahead = kClearAhead;
+      gpu::ClearAhead(ahead, stream);
+    }
 
     attn_stats_now = false;
     if (attn_stats_every > 0) {
@@ -2391,6 +2493,9 @@ struct GpuEngine::Impl {
           Wmma(g, final_x, kE, xh_head) && head_tiles >= 0)
         g.wmma_tiles = head_tiles;
       gpu::Gemm(g, stream);
+      if (c.logit_softcap != 0.0f)
+        gpu::SoftCap(logits, n_heads * c.n_vocab_padded, c.logit_softcap,
+                     stream);
       Check(hipMemcpyAsync(host_logits.data(), logits,
                            n_heads * c.n_vocab_padded * 4,
                            hipMemcpyDeviceToHost, stream),
@@ -2408,9 +2513,11 @@ struct GpuEngine::Impl {
 
     if (draft && draft->slots > 0) {
       for (const Row& row : rows)
-        List(row.token);
-      for (std::size_t i = 0; i < n_heads; ++i)
-        ListLikely(host_logits.data() + i * c.n_vocab_padded);
+        List(sessions[row.session], row.token);
+      if (list_likely)
+        for (std::size_t i = 0; i < n_heads; ++i)
+          ListLikely(sessions[rows[heads[i]].session],
+                     host_logits.data() + i * c.n_vocab_padded);
     }
     for (std::size_t b = 0; b < rows.size(); ++b)
       if (last[b]) {
@@ -2430,8 +2537,9 @@ GpuEngine::GpuEngine(const Model& model, const Options& options)
     : impl_(std::make_unique<Impl>(model, options)) {}
 GpuEngine::~GpuEngine() = default;
 
-void GpuEngine::Step(const std::vector<Row>& rows, Head head, bool tentative) {
-  impl_->Step(rows, head, tentative);
+void GpuEngine::Step(const std::vector<Row>& rows, Head head, bool tentative,
+                     bool list_likely) {
+  impl_->Step(rows, head, tentative, list_likely);
 }
 
 void GpuEngine::Accept(std::uint32_t session, std::uint32_t rows_kept) {
@@ -2465,7 +2573,7 @@ GpuEngine::StateLayout GpuEngine::Layout() const {
     const bool ring = impl.c.is_swa[impl.Physical(s)];
     layout.ring.push_back(ring);
     if (ring)
-      layout.ring_bytes = std::size_t(session.slots[s].cap) * kHK * 2;
+      layout.ring_bytes = Impl::kRingWindowBytes;
     else
       layout.full_capacity = static_cast<std::uint32_t>(session.slots[s].cap);
   }
@@ -2474,6 +2582,35 @@ GpuEngine::StateLayout GpuEngine::Layout() const {
 
 void* GpuEngine::DraftState(std::uint32_t session) const {
   return impl_->sessions.at(session).draft_state;
+}
+
+void GpuEngine::Scrub(std::uint32_t session) {
+  Impl& impl = *impl_;
+  impl.Reset(session);
+  for (const Impl::Slot& slot : impl.sessions.at(session).slots) {
+    const std::size_t bytes = std::size_t(slot.cap) * kHK * 2;
+    Check(hipMemset(slot.kh, 0, bytes), "clear");
+    Check(hipMemset(slot.vh, 0, bytes), "clear");
+  }
+}
+
+void GpuEngine::ResetDraftList(std::uint32_t session) {
+  impl_->ResetList(impl_->sessions.at(session));
+}
+
+void GpuEngine::ListDraftTokens(std::uint32_t session,
+                                std::span<const std::uint32_t> tokens) {
+  Impl& impl = *impl_;
+  if (!impl.draft || impl.draft->slots == 0)
+    return;
+  Impl::Session& state = impl.sessions.at(session);
+  for (const std::uint32_t token : tokens)
+    if (token < impl.c.n_vocab)
+      impl.List(state, token);
+}
+
+std::size_t GpuEngine::draft_list_size(std::uint32_t session) const {
+  return static_cast<std::size_t>(impl_->sessions.at(session).list.used);
 }
 
 bool GpuEngine::has_drafter() const {
@@ -2491,10 +2628,22 @@ void* GpuEngine::History(std::uint32_t session) const {
   return impl_->sessions.at(session).hist;
 }
 
-void* GpuEngine::Ring(std::uint32_t session, std::uint32_t visit,
-                      bool values) const {
-  const auto& slot = impl_->sessions.at(session).slots.at(visit);
-  return values ? slot.vh : slot.kh;
+void* GpuEngine::RingStage(std::uint32_t session, std::uint32_t visit) const {
+  const Impl& impl = *impl_;
+  const int ring = impl.ring_index.at(visit);
+  if (ring < 0)
+    throw std::runtime_error("inkling2 gpu: not a sliding-window visit");
+  return impl.sessions.at(session).ring_stage +
+         std::size_t(ring) * Impl::kRingWindowBytes;
+}
+
+void GpuEngine::PackRing(std::uint32_t session, std::uint32_t visit) {
+  impl_->RingWindow(session, visit, impl_->sessions.at(session).pos, false);
+}
+
+void GpuEngine::UnpackRing(std::uint32_t session, std::uint32_t visit,
+                           std::uint32_t position) {
+  impl_->RingWindow(session, visit, position, true);
 }
 
 void* GpuEngine::Full(std::uint32_t session, std::uint32_t visit,
@@ -2546,17 +2695,11 @@ const float* GpuEngine::logits(std::size_t i) const {
 }
 
 std::vector<float> GpuEngine::capped_logits(std::size_t i) const {
-  const float* raw = logits(i);
-  std::vector<float> out(raw, raw + impl_->c.n_vocab);
-  const float cap = impl_->c.logit_softcap;
-  if (cap != 0.0f)
-    for (float& x : out)
-      x = cap * std::tanh(x / cap);
-  return out;
+  const float* capped = logits(i);
+  return std::vector<float>(capped, capped + impl_->c.n_vocab);
 }
 
 std::uint32_t GpuEngine::argmax(std::size_t i) const {
-  // The soft cap is monotonic, so the raw logits give the same argmax.
   const float* raw = logits(i);
   return static_cast<std::uint32_t>(
       std::max_element(raw, raw + impl_->c.n_vocab) - raw);

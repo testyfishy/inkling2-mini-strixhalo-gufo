@@ -451,6 +451,42 @@ void Dot2Bench(const std::uint32_t* w, const std::uint32_t* xt, int rows,
 void FloatBench(const float* w, const float* xt, int rows, int cols, int batch,
                 float* y, hipStream_t stream);
 
+/// The model's soft cap on its logits, in place: x = cap * tanh(x / cap).
+void SoftCap(float* x, std::size_t count, float cap, hipStream_t stream);
+
+/// Zeroes the cached keys and values of the `ahead` positions after the last
+/// row of each run of a step, in every layer visit. The kernels for steps of
+/// several rows read their keys and values in tiles, and a tile reaches past
+/// the last row; what lies there gets no weight, but the last bits of a
+/// row's result were seen to depend on it. With those positions always zero,
+/// a step gives the same bits whatever the session held before.
+struct ClearAheadArgs {
+  const RowState* rows;        // visits blocks of max_batch rows
+  const std::int32_t* ends;    // the batch row that ends each run
+  int runs;
+  int visits;
+  int max_batch;
+  int ahead;
+};
+void ClearAhead(const ClearAheadArgs& args, hipStream_t stream);
+
+/// The live window of a sliding-window ring, the `window` positions before
+/// `position`, copied to or from a contiguous buffer: window entry w holds
+/// position `position - window + w` (zeros when that is before the start),
+/// keys at stage_k[w * kHK + j] and values at stage_v[w * kHK + j], j = head *
+/// kHD + dimension. The ring's layout is RowState's layout 0.
+struct RingWindowArgs {
+  std::uint16_t* kh;
+  std::uint16_t* vh;
+  int cap;
+  int position;
+  int window;
+  std::uint16_t* stage_k;
+  std::uint16_t* stage_v;
+  bool unpack;  // buffer to ring, otherwise ring to buffer
+};
+void RingWindow(const RingWindowArgs& args, hipStream_t stream);
+
 /// Experiment switch, see g_direct in decode.hip.
 void SetWmmaDirect(int bits);
 

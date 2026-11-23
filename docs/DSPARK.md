@@ -200,10 +200,11 @@ What the engine does:
 - **The head's correction is precomputed.** `output . (h + hidden_out . latent + bias)` is
   linear, so `output . hidden_out` (200K x 256) is computed once at load and a slot reads that
   instead of the whole output matrix.
-- **The head scores a shortlist, not the vocabulary.** 32,768 entries
-  (`INKLING2_DRAFT_VOCAB`; 0 = everything): the tokens of the context and, after every step
-  of the main model, the tokens within 12 of its best logit (at most 192 per row). A full
-  list gives up entries that were not asked for again. Measured before building it, on 400
+- **The head scores a shortlist, not the vocabulary.** 32,768 entries per session
+  (`INKLING2_DRAFT_VOCAB`; 0 = everything): the tokens of the context and, after every
+  decode step of the main model, the tokens within 7 of its best capped logit (at most 192
+  per row). A full list gives up entries that were not asked for again. The list is rebuilt
+  at the start of each request, so that a request drafts the same way every time. Measured before building it, on 400
   generated tokens of three prompts: with the 256 most likely tokens of each earlier step
   listed, the next token was on the list in 99.5% to 99.7% of steps after the first 32, with
   6,000 to 19,000 tokens listed.
@@ -244,9 +245,12 @@ first draft: 1 of 12 kept below 0.3, 18 of 21 kept above 0.9). So:
 - **Gate.** A first draft is tried when its probability is at least 0.5 (0.6 when sampling);
   each further one while the product of the probabilities so far is at least 0.45 (0.5). The
   head stops at the first slot below the gate.
-- **Controller.** Every drafted step is compared with what plain steps would have produced in
-  the same time, from the clock. While drafting loses, it pauses (8 steps, then 16, then 32)
-  and probes again. One step in 64 is plain so the cost of a plain step stays known.
+- **Controller.** Every drafted step is charged what it costs in plain steps (the drafter's
+  pass 0.20, the first extra row 0.42, each further row 0.25 at short context; less at depth,
+  where a plain step is longer) and compared with the tokens it produced. While drafting
+  loses, it pauses (8 steps, then 16, then 32) and probes again. It first read the clock
+  instead; that made the same request draft at different steps from run to run, and with
+  that give different text (BENCHMARKS.md, step 34).
 
 Development driver, fixed gate of 0.6 on every slot, short context (plain: 24.8 tokens/s):
 
@@ -256,8 +260,9 @@ Development driver, fixed gate of 0.6 on every slot, short context (plain: 24.8 
 | Request B (short function) | 31.6 | 20.4 |
 | Encyclopedia prose | 31.9 | 20.3 |
 
-Through the server, with gate and controller, thinking on, 700 tokens per request
-(`decode_tps` of the server's log, without and with the drafter):
+Through the server, with gate and the first, clock-based controller, thinking on, 700 tokens
+per request (`decode_tps` of the server's log, without and with the drafter; the figures
+after step 34 are in BENCHMARKS.md):
 
 | Request | Greedy | Default sampling |
 |---|---:|---:|

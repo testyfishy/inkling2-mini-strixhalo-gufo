@@ -889,6 +889,73 @@ GPU: about 8e12 multiply-adds per second in the experts and projections and 10e1
 attention, against 27e12 with every operand in registers. Each product here needs an operand
 from shared memory, and that read costs about as much as the product.
 
+## The same request gives the same text; smaller checkpoints, 2026-11-22
+
+Step 34. With the drafter on, two identical temperature-0 requests could give different
+text: one decoded from an empty session and one from a cache checkpoint parted ways after a
+few hundred tokens. Without the drafter they never did. Three causes, found in this order:
+
+1. **The controller read the clock.** Whether a step drafted depended on measured times. It
+   now charges every drafted step a fixed cost in plain steps (the measurements of
+   DSPARK.md), so a request drafts at the same steps every time.
+2. **The drafter's shortlist carried over** from earlier requests, and was shared between
+   sessions. It is now per session and rebuilt at the start of each request: the prompt's
+   tokens in order, then the likely tokens of each decode step.
+3. **A step of several rows depended, in its last bits, on what lay in the cache after its
+   last row.** Found with a per-step trace: of an 8-row verification step, the first seven
+   rows' logits were bit-identical between the two runs and the last row's were not. The
+   multi-row attention kernels read keys and values in tiles of 64 positions; a tile reaches
+   past the last row, and although those positions get no weight, the row's result moved in
+   the seventh digit with their content (reproduced in the development driver:
+   `INKLING2_STALE_TEST`, which runs a step once over leftovers and once over zeroed caches;
+   it showed the effect when the last row's position was even, traced to the values of the
+   one position after it in a sliding-window ring). The batched kernels were checked against
+   the per-row F32 reference on such steps and are right to the usual 3e-4, so this was not
+   a wrong result, only one that was not reproducible. Every step of several rows now zeroes
+   the 64 positions after its last row in every cache first (one launch, about 13 MB of
+   writes), and the rings hold 64 more positions for that.
+
+After that: a cold request, the same request from a RAM checkpoint, from a disk checkpoint
+after a server restart, and in a freshly started server give identical text, greedy (a
+33,851-token prompt, and a 46-token prompt with 700 generated tokens) and sampled with a seed.
+
+A side effect worth more than the repeatability: steps that verify drafts now reproduce plain
+generation in the driver's test with given drafts. On the prose prompt, 1, 3 and 7 drafts per
+step: every draft kept (48 of 48, 72 of 72, 84 of 84), output equal to plain generation, at
+35.4, 48.3 and 74.1 tokens/s. Before, the same test lost agreement after a token or two (3 of
+93 drafts kept with one draft per step), which had been put down to near-ties between
+kernels.
+
+**Checkpoints.** A checkpoint stored every sliding-window ring whole: 40 rings of 12.6 MB at
+2,048 rows per step, 503 MB, although a later row can only read the 1,024 positions before the
+frontier. The adapter now packs that window (a kernel, before a capture) and unpacks it
+(after a restore): 168 MB. A checkpoint's fixed part, drafter state included, went from 577
+MB to 233 MB, and no longer grows with the step size. Restoring 33,851 tokens takes 16 to 30
+ms from RAM and about 300 ms from disk.
+
+Also: the scratch for the convolution histories that a step's rows may leave was allocated
+per row (7.9 GB at 2,048 rows per step) and is now per row that can end a run (1 GB).
+
+**The soft cap on the device.** The model caps its logits with 30 tanh(x / 30). That ran on
+the host for every row with logits, over 200,058 entries. As a kernel before the copy it
+costs nothing measurable: plain generation through the server went from 24.0 to 25.0
+tokens/s greedy and from 22.4 to 23.4 sampled. KLD against llama.cpp unchanged (0.001469).
+
+The drafter through the server after all of this (thinking on, 700 tokens; plain -> with
+the drafter):
+
+| Request | Greedy | Default sampling |
+|---|---:|---:|
+| A Python module with tests | 25.0 -> 32.0 | 23.4 -> 27.4 |
+| TCP against UDP, concise | 24.9 -> 26.8 | 23.5 -> 22.9 |
+| How tides work, 300 words | 24.7 -> 25.2 | 23.4 -> 23.5 |
+| Code asked after 39,963 tokens of C++ source (500 tokens) | 23.2 -> 35.3 | 19.3 -> 31.7 |
+| Code asked after 119,922 tokens of source | 17.2 -> 24.9 | 14.4 -> 29.3 |
+| A summary of 100,024 tokens of prose (300 tokens) | 15.9 -> 16.7 | |
+
+Prompt speed through the server on those requests: 1,147 tokens/s for the 39,963-token
+prompt and 988 for the 100,024-token one (step 25: 804 and 555).
+
 ## Not measured yet
 
 - Output quality beyond that smoke test (no perplexity or logit comparison yet).

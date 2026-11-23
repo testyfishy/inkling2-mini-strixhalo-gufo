@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,7 +45,7 @@ namespace sampling = gufo::sampling;
 using cache::Rows;
 using cache::TransferResult;
 
-constexpr std::string_view kStateAbi = "inkling2-native-fp16-v2";
+constexpr std::string_view kStateAbi = "inkling2-native-fp16-v3";
 constexpr std::size_t kMetaBytes = 64;
 constexpr Rows kValueBlock = 1024;  // positions per block of values
 
@@ -67,8 +66,10 @@ static_assert(sizeof(Meta) <= kMetaBytes);
 //
 //   frame    private  position, the logits of the next token, the convolution
 //                     histories
-//   ring     private  one per sliding-window visit: its key ring and value
-//                     ring, whole
+//   ring     private  one per sliding-window visit: the keys and the values
+//                     of the 1,024 positions before the frontier, which is
+//                     all a later row can read; packed from the ring before
+//                     a capture and put back after a restore
 //   tail     private  one per full-attention visit: per head, the block of
 //                     values that is still being filled
 //   keys     rows     per full-attention visit and head: one row per position
@@ -472,8 +473,7 @@ std::vector<Adapter::Piece> Adapter::PrivatePieces(State& state,
       add(engine_->History(state.session), layout_.history_bytes);
       break;
     case PartKind::kRing:
-      add(engine_->Ring(state.session, part.visit, false), layout_.ring_bytes);
-      add(engine_->Ring(state.session, part.visit, true), layout_.ring_bytes);
+      add(engine_->RingStage(state.session, part.visit), 2 * layout_.ring_bytes);
       break;
     case PartKind::kTail: {
       // A frontier on a block boundary has no partial block: zeros.
@@ -534,6 +534,8 @@ cache::Completion Adapter::CapturePrivatePiece(const cache::Slot& slot,
     std::memcpy(host_meta.data(), &meta, sizeof(meta));
     pieces.front().pointer = host_meta.data();
   }
+  if (part.kind == PartKind::kRing)
+    engine_->PackRing(state.session, part.visit);
   engine_->Synchronize();
   return Transfer(
       state, false, stream, [&](gufo::hip::TransferStream& transfer) {
@@ -726,6 +728,10 @@ bool Adapter::Validate(cache::Slot& slot,
       meta.position != target || meta.has_logits > 1)
     return refuse();
   try {
+    for (const Part& part : parts_)
+      if (part.kind == PartKind::kRing)
+        engine_->UnpackRing(state.session, part.visit, meta.position);
+    engine_->Synchronize();
     engine_->SetPosition(state.session, meta.position);
   } catch (const std::exception&) {
     return refuse();
@@ -782,42 +788,50 @@ using Lookup = gufo::speculative::PromptLookup<std::uint32_t>;
 constexpr std::size_t kFirstDrafts = 4;
 constexpr std::size_t kMostDrafts = 16;
 
-// Whether proposing tokens with the drafter pays, decided from the clock.
-// A step with drafts costs the drafter's pass and a larger verification
-// step; when too few drafts are kept, that is slower than plain steps. The
-// controller compares each drafted step with what plain steps would have
-// produced in the same time and pauses drafting while it loses, for longer
-// each time, so text the drafter cannot predict costs a few percent at most.
+// Whether proposing tokens with the drafter pays. A step with drafts costs
+// the drafter's pass and a larger verification step; when too few drafts are
+// kept, that is slower than plain steps. The controller charges each drafted
+// step what it costs in plain steps, by the measurements in docs/DSPARK.md,
+// and compares that with the tokens it produced; while drafting loses, it
+// pauses, for longer each time, so text the drafter cannot predict costs a
+// few percent at most. It never looks at the clock: a request decoded twice
+// drafts at the same steps, and gives the same text.
 struct DraftControl {
-  double plain_ms{0};  // a plain step, smoothed
-  double gain{0.3};    // tokens gained per drafted step, smoothed
-  int pause{0}, next_pause{8}, since_plain{0};
+  double gain{0.3};  // tokens gained per drafted step, smoothed
+  int pause{0}, next_pause{8};
   // Counts for INKLING2_SERVE_DRAFT_LOG.
   std::size_t steps{0}, calls{0}, empty{0}, pauses{0}, drafted{0}, kept{0};
 
-  // Whether this step may draft. The first step, and one in 64, is plain so
-  // that the cost of a plain step is known.
   [[nodiscard]] bool Allows() {
     ++steps;
-    if (plain_ms <= 0 || since_plain >= 64)
-      return false;
     if (pause > 0) {
       --pause;
       return false;
     }
     return true;
   }
-  void Plain(double ms) {
-    plain_ms = plain_ms > 0 ? 0.8 * plain_ms + 0.2 * ms : ms;
-    since_plain = 0;
+  // What a step that asked the drafter and verified `drafts` of its
+  // proposals costs, in plain steps, at `position` tokens of context. Short
+  // context, through the server (a verified row also costs the host a
+  // sample): the drafter's pass 0.20, the first extra row 0.42, each further
+  // row 0.25. At 100,000 tokens a plain step is half again as long and the
+  // same work is 0.13, 0.32 and 0.16 of it.
+  [[nodiscard]] static double Cost(std::size_t drafts, std::size_t position) {
+    const double depth =
+        std::min(1.0, static_cast<double>(position) / 100000.0);
+    const double pass = 0.20 - 0.07 * depth;
+    if (drafts == 0)
+      return 1.0 + pass;
+    return 1.0 + pass + (0.42 - 0.10 * depth) +
+           (0.25 - 0.09 * depth) * static_cast<double>(drafts - 1);
   }
-  void Drafted(std::size_t tokens, std::size_t drafts, double ms) {
-    ++since_plain;
+  void Drafted(std::size_t tokens, std::size_t drafts, std::size_t position) {
     ++calls;
     empty += drafts == 0 ? 1 : 0;
     drafted += drafts;
     kept += tokens - 1;
-    gain = 0.9 * gain + 0.1 * (static_cast<double>(tokens) - ms / plain_ms);
+    gain = 0.9 * gain +
+           0.1 * (static_cast<double>(tokens) - Cost(drafts, position));
     if (gain < 0) {
       pause = next_pause;
       next_pause = std::min(2 * next_pause, 32);
@@ -1114,6 +1128,10 @@ public:
     if (engine_->position(s.session()) != prefix.size())
       throw std::logic_error("inkling2: reused prefix does not match");
     s.tokens.assign(prefix.begin(), prefix.end());
+    // The drafter's shortlist starts every request the same way: the
+    // context's tokens, in order.
+    engine_->ResetDraftList(s.session());
+    engine_->ListDraftTokens(s.session(), s.tokens);
     s.output = OutputAfter(prefix);
     s.no_thinking = NoThinking(prefix);
     if (s.slot().has_logits)
@@ -1149,8 +1167,10 @@ public:
       rows.push_back({s.session(), prompt[i]});
     }
     s.slot().has_logits = false;
-    engine_->Step(rows,
-                  final ? GpuEngine::Head::kLast : GpuEngine::Head::kNone);
+    if (offset == 0)
+      engine_->ResetDraftList(s.session());
+    engine_->Step(rows, final ? GpuEngine::Head::kLast : GpuEngine::Head::kNone,
+                  false, false);
     s.no_thinking = NoThinking(prompt.first(end));
     if (final)
       KeepLogits(&s);
@@ -1218,12 +1238,6 @@ public:
         s.tokens.size() != position || position + 2 > max_context_ ||
         !s.slot().has_logits)
       return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
-    const auto start = std::chrono::steady_clock::now();
-    const auto elapsed_ms = [&] {
-      return std::chrono::duration<double, std::milli>(
-                 std::chrono::steady_clock::now() - start)
-          .count();
-    };
     const bool sampled = config.uses_random_sampling();
     bool lookup_step = false;
     if (lookup_) {
@@ -1231,12 +1245,8 @@ public:
       lookup_step = s.lookup.Step(position);
     }
     const bool model_step = drafter_ && s.control.Allows();
-    if (!lookup_step && !model_step) {
-      auto step = ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
-      if (step.selections.size() == 1 && !step.stop)
-        s.control.Plain(elapsed_ms());
-      return step;
-    }
+    if (!lookup_step && !model_step)
+      return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
 
     ext::TextDecodeStep step;
     auto first = SelectNext(state, sampler);
@@ -1292,9 +1302,11 @@ public:
     if (drafts.empty()) {
       Advance(state, anchor);
       if (proposed)
-        Drafted(s, 1, 0, elapsed_ms());
-      else
-        s.control.Plain(elapsed_ms());
+        Drafted(s, 1, 0, position);
+      if (draft_trace_)
+        std::fprintf(stderr, "inkling2 trace: at %u anchor %u %s listed %zu%c",
+                     position, anchor, proposed ? "no draft" : "plain",
+                     engine_->draft_list_size(s.session()), 10);
       return step;
     }
 
@@ -1307,11 +1319,19 @@ public:
     s.slot().has_logits = false;
     engine_->Step(rows, GpuEngine::Head::kAll, true);
     const std::size_t kept = Verify(s, sampler, anchor, drafts, 0, &step);
+    if (draft_trace_) {
+      std::fprintf(stderr, "inkling2 trace: at %u anchor %u %s", position, anchor,
+                   copied ? "copied" : "drafted");
+      for (const std::uint32_t draft : drafts)
+        std::fprintf(stderr, " %u", draft);
+      std::fprintf(stderr, " kept %zu listed %zu%c", kept,
+                   engine_->draft_list_size(s.session()), 10);
+    }
     step.draft_rounds = 1;
     if (copied) {
       Copied(s, match, drafts.size(), kept, &step);
     } else {
-      Drafted(s, 1 + kept, drafts.size(), elapsed_ms());
+      Drafted(s, 1 + kept, drafts.size(), position);
       step.draft_tokens = drafts.size();
       step.draft_accepted_tokens = kept;
     }
@@ -1518,16 +1538,15 @@ private:
     step->lookup_accepted_tokens = kept;
   }
   void Drafted(State& s, std::size_t tokens, std::size_t drafts,
-               double ms) const {
+               std::size_t position) const {
     DraftControl& c = s.control;
-    c.Drafted(tokens, drafts, ms);
+    c.Drafted(tokens, drafts, position);
     if (draft_log_ && c.calls % 64 == 0)
       std::fprintf(stderr,
                    "inkling2 draft: %zu steps, %zu draft calls (%zu without a "
-                   "draft), %zu of %zu drafts kept, %zu pauses, plain step "
-                   "%.1f ms, gain %.2f%c",
+                   "draft), %zu of %zu drafts kept, %zu pauses, gain %.2f%c",
                    c.steps, c.calls, c.empty, c.kept, c.drafted, c.pauses,
-                   c.plain_ms, c.gain, 10);
+                   c.gain, 10);
   }
   void KeepLogits(State* s, std::size_t run = 0) const {
     const std::vector<float> capped = engine_->capped_logits(run);
@@ -1724,7 +1743,7 @@ private:
       identity << "drafter=" << drafter_id_ << '\n'
                << "drafter_window=" << draft_window_ << '\n';
     identity << "state_abi=" << kStateAbi << '\n'
-             << "payload_layout=inkling2-rings-whole-v1\n"
+             << "payload_layout=inkling2-ring-windows-v1\n"
              << "context_tokens=" << max_context_ << '\n'
              << "prefill_rows=" << max_batch_ << '\n';
     const std::string canonical = identity.str();
@@ -1745,6 +1764,7 @@ private:
   float draft_first_{EnvInt("INKLING2_DRAFT_FIRST", 0) / 100.0F};
   float draft_chain_{EnvInt("INKLING2_DRAFT_CHAIN", 0) / 100.0F};
   bool draft_log_{EnvInt("INKLING2_SERVE_DRAFT_LOG", 0) != 0};
+  bool draft_trace_{EnvInt("INKLING2_SERVE_DRAFT_TRACE", 0) != 0};
   // Most sessions decoded in one step (INKLING2_SERVE_BATCH_WIDTH; 1 = each
   // session on its own).
   std::size_t batch_width_{std::min<std::size_t>(

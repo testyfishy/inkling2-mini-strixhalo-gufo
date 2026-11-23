@@ -749,6 +749,56 @@ int RunDecoder(const gufo::core::GgufReader& reader, const char* ids) {
                   generate * sessions / gen_seconds, generate / gen_seconds,
                   static_cast<double>(engine.launches() - launches_before) /
                       generate);
+      if (const int k = EnvInt("INKLING2_STALE_TEST", 0); k > 0 && sessions == 1) {
+        // A tentative step of k drafts after the prompt, once with whatever
+        // the generation above left in the caches beyond the prompt and once
+        // with the caches zeroed first: the logits of every row must be the
+        // same, since no row may read past its own position.
+        const std::vector<std::uint32_t>& truth = out[0];
+        std::vector<std::vector<std::uint64_t>> hashes;
+        for (int pass = 0; pass < 2; ++pass) {
+          if (pass == 0)
+            engine.Reset(0);
+          else
+            engine.Scrub(0);
+          for (std::size_t i = 0; i < n; i += prompt_batch) {
+            std::vector<inkling2::GpuEngine::Row> rows;
+            for (std::size_t j = i; j < std::min(n, i + prompt_batch); ++j)
+              rows.push_back({0, prompt_token(0, j)});
+            engine.Step(rows, i + prompt_batch >= n);
+          }
+          const int warm = EnvInt("INKLING2_STALE_WARM", 0);
+          for (int i = 0; i < warm; ++i)
+            engine.Step({{0, truth[static_cast<std::size_t>(i)]}}, true);
+          std::vector<inkling2::GpuEngine::Row> rows;
+          for (int d = 0; d <= k; ++d)
+            rows.push_back({0, truth[static_cast<std::size_t>(warm + d)]});
+          engine.Step(rows, inkling2::GpuEngine::Head::kAll, true);
+          std::vector<std::uint64_t> h;
+          for (std::size_t r = 0; r < rows.size(); ++r) {
+            const float* raw = engine.logits(r);
+            std::uint64_t hash = 1469598103934665603ull;
+            for (std::uint32_t j = 0; j < engine.vocab(); ++j) {
+              std::uint32_t bits;
+              std::memcpy(&bits, raw + j, 4);
+              hash = (hash ^ bits) * 1099511628211ull;
+            }
+            h.push_back(hash);
+          }
+          engine.Accept(0, 0);
+          hashes.push_back(h);
+        }
+        std::printf("stale test, %d rows at position %u: rows whose logits "
+                    "differ:",
+                    k + 1, engine.position(0));
+        int bad = 0;
+        for (std::size_t r = 0; r < hashes[0].size(); ++r)
+          if (hashes[0][r] != hashes[1][r]) {
+            std::printf(" %zu", r);
+            ++bad;
+          }
+        std::printf("%s%c", bad ? "" : " none", 10);
+      }
       if (const int k = EnvInt("INKLING2_VERIFY_TEST", 0); k > 0 && sessions == 1) {
         // Replay session 0 from scratch, verifying k "drafted" tokens per
         // step. Every third draft block is corrupted from its second token.

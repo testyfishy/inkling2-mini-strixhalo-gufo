@@ -115,6 +115,11 @@ What the runner does:
 - **Several sessions.** With `--sessions N`, requests that generate at the same time share
   one step of the engine (up to 8; `INKLING2_SERVE_BATCH_WIDTH`). Four requests at once ran
   at 39.8 tokens/s in all against 27.6 one at a time.
+- **Repeatable.** A request at temperature 0, or sampled with a seed, gives the same text
+  whether it starts from an empty session, a RAM checkpoint, a disk checkpoint after a
+  restart or a new server, with drafts on or off (checked; BENCHMARKS.md, step 34). Drafts
+  on and drafts off are two different, each repeatable, outputs: a step of several rows
+  rounds differently from a step of one.
 - **Continuation cache.** GUFO keeps checkpoints of a session and restores them when a later
   request shares a prefix. The adapter describes the engine's state to it: per full-attention
   layer visit and head, keys as one row per position and values as one row per 1,024 positions,
